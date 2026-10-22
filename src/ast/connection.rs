@@ -153,6 +153,47 @@ fn check_same_uid(stream: &UnixStream) -> std::io::Result<bool> {
     Ok(uid == our_uid)
 }
 
+/// Resolves only once the connection has had zero in-flight requests
+/// continuously for `idle_timeout` — not merely "zero in-flight at some
+/// point". Polls `in_flight` in memory only (never touches the socket),
+/// so it's always safe to race in a `tokio::select!` against a single,
+/// never-retried `wire::read_frame` call: if this future wins the race,
+/// the connection is closed outright (never another read attempt on the
+/// same, possibly partially-consumed stream), which is what keeps that
+/// race safe despite `read_frame` not being cancel-safe after it's
+/// consumed some bytes of a frame.
+async fn wait_until_continuously_idle(
+    idle_timeout: Duration,
+    in_flight: &Arc<Mutex<std::collections::HashSet<u64>>>,
+) {
+    let poll = idle_timeout
+        .div_f64(20.0)
+        .clamp(Duration::from_millis(1), Duration::from_secs(1));
+    loop {
+        while !in_flight
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_empty()
+        {
+            tokio::time::sleep(poll).await;
+        }
+        let became_idle_at = Instant::now();
+        loop {
+            tokio::time::sleep(poll.min(idle_timeout)).await;
+            if !in_flight
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_empty()
+            {
+                break; // went busy again — restart the outer loop
+            }
+            if became_idle_at.elapsed() >= idle_timeout {
+                return; // continuously idle for the whole window
+            }
+        }
+    }
+}
+
 async fn serve_reads(
     mut read_half: tokio::net::unix::OwnedReadHalf,
     tx: mpsc::Sender<Frame>,
@@ -254,31 +295,15 @@ async fn serve_reads(
     let in_flight_limit = Arc::new(Semaphore::new(config.max_in_flight));
 
     loop {
-        let nothing_in_flight = in_flight
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .is_empty();
-        let read_result = if nothing_in_flight {
-            match tokio::time::timeout(
-                config.idle_timeout,
-                wire::read_frame(&mut read_half, config.frame_limits),
-            )
-            .await
-            {
-                Ok(r) => r,
-                Err(_elapsed) => {
-                    tracing::debug!(
-                        idle_timeout = ?config.idle_timeout,
-                        "closing connection: no frame received within the idle timeout"
-                    );
-                    return;
-                }
+        let read_result = tokio::select! {
+            result = wire::read_frame(&mut read_half, config.frame_limits) => result,
+            _ = wait_until_continuously_idle(config.idle_timeout, &in_flight) => {
+                tracing::debug!(
+                    idle_timeout = ?config.idle_timeout,
+                    "closing connection: no frame received within the idle timeout"
+                );
+                return;
             }
-        } else {
-            // At least one request is still being worked on — don't
-            // treat "the client hasn't sent anything new" as idle while
-            // it's legitimately waiting on a response already requested.
-            wire::read_frame(&mut read_half, config.frame_limits).await
         };
 
         let frame = match read_result {
@@ -910,6 +935,16 @@ async fn send_streamed_result(
     let _ = send_raw(tx, MessageType::StreamEnd, correlation_id, &StreamEnd {}).await;
 }
 
+/// Reserved margin, in bytes, subtracted from `max_batch_output_bytes`
+/// before comparing against it — `BatchResult`'s own MessagePack map/array
+/// framing overhead (beyond the sum of its entries) is small but nonzero,
+/// so without this margin a batch whose entries sum to exactly the
+/// configured budget could still overflow `max_frame_len` once wrapped in
+/// the final `BatchResult`, discarding every result in the batch as one
+/// `RESULT_TOO_LARGE` error instead of the more precise per-entry handling
+/// this budget is supposed to provide.
+const BATCH_RESULT_FRAMING_OVERHEAD_BYTES: usize = 128;
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_batch(
     correlation_id: u64,
@@ -988,8 +1023,8 @@ fn spawn_batch(
             // "never ran" like a call after cancellation or budget
             // exhaustion would be).
             let entry_bytes = codec::encode(&entry).map(|b| b.len()).unwrap_or(0);
-            let exceeds_budget =
-                encoded_bytes_so_far.saturating_add(entry_bytes) > max_batch_output_bytes;
+            let exceeds_budget = encoded_bytes_so_far.saturating_add(entry_bytes)
+                > max_batch_output_bytes.saturating_sub(BATCH_RESULT_FRAMING_OVERHEAD_BYTES);
             if exceeds_budget {
                 entry = BatchResultEntry {
                     id,
@@ -2073,6 +2108,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn idle_timeout_re_arms_after_an_in_flight_request_completes() {
+        // Proves the specific bug: idle_timeout must restart counting from
+        // when the connection actually becomes idle, not just skip applying
+        // entirely because a request was in flight when the wait began.
+        let registry = registry_with(vec![Box::new(SlowTool {
+            sleep: Duration::from_millis(50),
+        })]);
+        let config = ConnectionConfig {
+            idle_timeout: Duration::from_millis(150),
+            ..Default::default()
+        };
+        let (mut client, _dir) = connected_pair_with_registry(registry, config).await;
+        do_hello(&mut client).await;
+
+        let invoke = Invoke {
+            tool: "test.slow".to_string(),
+            args: serde_json::json!({}),
+            deadline_ms: Some(5_000),
+            stream: None,
+        };
+        send_raw(
+            &mut client,
+            Frame {
+                msg_type: MessageType::Invoke as u8,
+                correlation_id: 1,
+                payload: codec::encode(&invoke).unwrap(),
+            },
+        )
+        .await;
+
+        // Consume the RESULT so the in-flight set becomes empty, then send
+        // nothing further — the connection should close on its own well
+        // within a generous test timeout, proving idle_timeout re-armed
+        // after the request completed rather than waiting forever.
+        let resp = recv_raw(&mut client).await;
+        assert_eq!(
+            MessageType::from_u8(resp.msg_type),
+            Some(MessageType::Result)
+        );
+
+        let closed = tokio::time::timeout(Duration::from_secs(2), async {
+            wire::read_frame(&mut client, FrameLimits::default()).await
+        })
+        .await
+        .expect("idle_timeout must re-arm once the in-flight request completes, not hang forever");
+        assert!(matches!(closed, Ok(None)));
+    }
+
+    #[tokio::test]
     async fn idle_connection_is_closed_after_the_configured_timeout() {
         // A connected-but-silent peer (past HELLO, never sends another
         // frame) must not hold its connection slot forever — proves
@@ -2273,6 +2357,49 @@ mod tests {
             MessageType::from_u8(resp.msg_type),
             Some(MessageType::Error) | Some(MessageType::StreamStart)
         ));
+    }
+
+    #[tokio::test]
+    async fn batch_output_budget_leaves_margin_for_batch_result_framing_overhead() {
+        // A single entry whose encoded size sits just under max_frame_len
+        // (within BatchResult's own framing overhead of it) must not make
+        // the final BatchResult overflow max_frame_len once wrapped — the
+        // whole batch would otherwise be replaced by a top-level
+        // RESULT_TOO_LARGE ERROR. The framing-overhead margin must turn
+        // that single entry into a per-entry ResultTooLarge instead.
+        let registry = registry_with(vec![Box::new(BigResultTool { result_bytes: 360 })]);
+        let config = ConnectionConfig {
+            frame_limits: FrameLimits { max_frame_len: 400 },
+            max_batch_output_bytes: 400,
+            ..Default::default()
+        };
+        let (mut client, _dir) = connected_pair_with_registry(registry, config).await;
+        do_hello(&mut client).await;
+
+        let batch = Batch {
+            calls: vec![BatchInvoke {
+                id: 0,
+                tool: "test.big_result".to_string(),
+                args: serde_json::json!({}),
+                deadline_ms: None,
+            }],
+        };
+        send_raw(
+            &mut client,
+            Frame {
+                msg_type: MessageType::Batch as u8,
+                correlation_id: 1,
+                payload: codec::encode(&batch).unwrap(),
+            },
+        )
+        .await;
+
+        let resp = recv_raw(&mut client).await;
+        assert_eq!(
+            MessageType::from_u8(resp.msg_type),
+            Some(MessageType::BatchResult),
+            "the whole batch was rejected outright instead of returning a BatchResult"
+        );
     }
 
     #[tokio::test]

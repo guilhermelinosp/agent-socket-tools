@@ -256,7 +256,17 @@ impl IncrementalBytes for Utf8FileChunkReader {
             combined.extend_from_slice(&buf);
 
             if n == 0 {
-                // EOF. Any leftover here is a genuinely incomplete/invalid
+                // Real EOF. If `remaining` is still nonzero, the file
+                // shrank on disk between the initial `fstat` and this
+                // read — a genuine error, not a clean end of stream: the
+                // caller was promised `remaining` more bytes and isn't
+                // getting them.
+                if self.remaining > 0 {
+                    return Err(ToolError::Failed(
+                        "file size changed during streaming (file is shorter than expected)".into(),
+                    ));
+                }
+                // Any leftover here is a genuinely incomplete/invalid
                 // trailing sequence — there's no more data coming to
                 // complete it.
                 if combined.is_empty() {
@@ -527,6 +537,22 @@ mod tests {
         fs::write(dir.path().join("big.txt"), &past_invoke_cap).unwrap();
         assert!(tool.invoke(json!({"path": "big.txt"})).is_err());
         assert!(tool.open_stream(json!({"path": "big.txt"})).is_ok());
+    }
+
+    #[test]
+    fn open_stream_reports_an_error_if_the_file_shrinks_during_streaming() {
+        let (dir, tool) = tool_with_fixture();
+        let path = dir.path().join("shrinking.txt");
+        fs::write(&path, "x".repeat(1000)).unwrap();
+
+        let mut opened = tool.open_stream(json!({"path": "shrinking.txt"})).unwrap();
+        // Consume a bit, then shrink the file out from under the open
+        // reader — simulating a concurrent truncation.
+        let _ = opened.reader.next_chunk(100).unwrap();
+        fs::write(&path, "x".repeat(10)).unwrap();
+
+        let err = drain(opened.reader.as_mut(), 4096).unwrap_err();
+        assert!(matches!(err, ToolError::Failed(_)));
     }
 
     #[test]

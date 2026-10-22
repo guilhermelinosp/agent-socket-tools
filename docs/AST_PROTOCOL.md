@@ -95,11 +95,12 @@ JSON and CBOR by measurement (`benches/serialization.rs`, this machine,
 | Encoded size, `Invoke` | 91 B | 75 B | 76 B |
 | Encoded size, `Result` (~4KiB) | 4011 B | 4001 B | 4002 B |
 
-MessagePack and CBOR are close on small, mostly-numeric/control messages
-— JSON is even marginally *faster to encode* there, though slower to
-decode — but MessagePack decisively wins once a message carries real
-content (the `Result` row, which is what an actual tool's output usually
-looks like), and consistently beats CBOR on both encode and decode.
+MessagePack and CBOR are close to each other on small, mostly-numeric/
+control messages — JSON is clearly faster to encode there (74.7ns vs
+142.8ns, ~1.9x), though slower to decode (174.1ns vs 131.9ns) — but
+MessagePack decisively wins once a message carries real content (the
+`Result` row, which is what an actual tool's output usually looks
+like), and consistently beats CBOR on both encode and decode.
 Named-field maps (rather than positional arrays) cost a modest amount of
 size for a real benefit: the wire format stays self-describing and
 tolerant of additive/reordered fields, which matters far more for a spec
