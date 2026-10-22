@@ -363,7 +363,8 @@ envelope.
 - When `deadline_ms` is absent, `--default-deadline-ms` applies (default 10000). There is no "no deadline" mode.
 - A streamed `INVOKE` has one budget covering the stream open and every chunk read. Exceeding it sends `ERROR{DEADLINE_EXCEEDED}` mid-stream.
 - The effective deadline is the requested (or default) value clamped to `--max-deadline-ms` (default 60000). It applies to each `INVOKE`, to each call of a `BATCH`, and to streams.
-- An effective deadline of 0 ms is answered `DEADLINE_EXCEEDED` at once. The tool is not started and no execution slot is taken.
+- An effective deadline of 0 ms is answered `DEADLINE_EXCEEDED` at once. The tool is not started and no execution slot is taken. **Behavior change:** earlier versions started the tool anyway with a 0 ms deadline; it now never runs.
+- A `deadline_ms` above `--max-deadline-ms` is reduced to that maximum silently. The client gets no notice of the reduction. The only visible sign is `DEADLINE_EXCEEDED` when the call runs past the reduced value.
 - The deadline is a **response** deadline: the client receives `DEADLINE_EXCEEDED` when it expires, even if the tool is still running.
 
 **Cancellation**
@@ -379,12 +380,15 @@ envelope.
 - Each tool execution runs on a blocking thread and takes one of the server-wide `--max-blocking-tasks` slots (default 64). The slot is held until the tool actually returns, even after its caller was answered `DEADLINE_EXCEEDED` or `CANCELLED`.
 - While every slot is taken, new executions (`INVOKE`, `BATCH` calls, stream opens and chunk reads) fail with `RESOURCE_EXHAUSTED` without starting.
 - Rust cannot stop a running thread, and the server does not try. A tool that ignores its token keeps its slot until its own code returns, so tools must stay short and bounded, or check the token.
+- A `BATCH` never keeps more than one blocking execution alive. Its calls run one at a time, and a call waits for the previous call's tool to return before it starts. The wait is bounded by the call's own deadline; a call that cannot start in time gets `DEADLINE_EXCEEDED` and its tool is never started. A call's total time can therefore reach its deadline for the wait plus its deadline for the run.
 
 **Disconnects and shutdown**
 
-- A clean end of the peer's stream (FIN, half-close) between frames drains: the connection stays open and each in-flight request still gets its response, until its terminal frame or its deadline. A non-cooperative tool therefore keeps the connection open until it returns or its deadline expires.
+- A clean end of the peer's stream (FIN, half-close) between frames drains and does **not** cancel: the connection stays open and each in-flight request still gets its response, until its terminal frame or its deadline. A non-cooperative tool therefore keeps the connection open until it returns or its deadline expires.
+- After a clean end of stream, the first failed write (a write error or a write timeout) cancels the connection's remaining in-flight requests. Their terminal frames are then attempted as usual.
+- **Known limit:** a Unix socket cannot tell a half-close from a full close until a write fails. If the peer has vanished completely, the server does not notice until it writes. Work for that connection continues until it completes or its deadline expires, bounded by `--max-deadline-ms` and the slots. The first failed write then cancels the rest.
 - A read error (including a reset), an invalid or truncated frame, a failed write, or a write timeout ends the connection. Its in-flight requests are cancelled (token set, `CANCELLED` sent when the caller is still waiting), and their slots are released when their tools return.
-- On `SIGINT`/`SIGTERM` the server stops accepting, cancels the in-flight requests of every connection, waits up to `--shutdown-grace-secs` (default 5) for connections to close, and exits. Tools still running at that point are abandoned with the process.
+- On `SIGINT`/`SIGTERM` the server stops accepting and cancels the in-flight requests of every connection. That includes connections that are half-closed and already past their clean end of stream. It then waits up to `--shutdown-grace-secs` (default 5) for connections to close, and exits. Tools still running at that point are abandoned with the process.
 
 ## Error model
 

@@ -67,8 +67,10 @@ pub trait Tool: Send + Sync {
     fn invoke(&self, args: Value) -> Result<Value, ToolError>;
 
     /// Like [`Tool::invoke`], but also receives the request's
-    /// [`CancelToken`]. The server always calls this method, so an override
-    /// is how a tool becomes cancellable.
+    /// [`CancelToken`]. The `ast-server` calls this method; other front-ends
+    /// (e.g. `mcp-server`, `mcp-like-server`) call `invoke` directly and offer
+    /// no cancellation. So an override is how a tool becomes cancellable on
+    /// the `ast-server` path.
     ///
     /// A tool that runs long MUST check `cancel.is_cancelled()` at its
     /// checkpoints and return early once it is set. A tool that ignores the
