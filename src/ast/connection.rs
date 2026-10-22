@@ -2171,6 +2171,124 @@ mod tests {
         assert_eq!(err.code, ErrorCode::ResourceExhausted);
     }
 
+    /// Sends `requests` sequential `system.noop` INVOKEs, each one only after
+    /// the previous terminal frame arrived, so the client never has more than
+    /// one request outstanding. Every one must be answered with RESULT.
+    async fn assert_sequential_requests_are_never_rejected(
+        config: ConnectionConfig,
+        requests: u64,
+    ) {
+        let registry = registry_with(vec![Box::new(NoopTool)]);
+        let (mut client, _dir) = connected_pair_with_registry(registry, config).await;
+        do_hello(&mut client).await;
+        for id in 1..=requests {
+            send_invoke(&mut client, id, "system.noop", Some(5_000)).await;
+            let frame = recv_within(&mut client).await;
+            assert_eq!(
+                frame.correlation_id, id,
+                "terminal frame for the wrong request"
+            );
+            match MessageType::from_u8(frame.msg_type) {
+                Some(MessageType::Result) => {}
+                Some(MessageType::Error) => {
+                    let err: ErrorPayload = codec::decode(&frame.payload).unwrap();
+                    panic!(
+                        "request {id} was refused with {:?}: {}",
+                        err.code, err.message
+                    );
+                }
+                other => panic!("request {id}: unexpected message type {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn client_at_the_advertised_limit_is_never_rejected() {
+        // max_in_flight = 1 is the limit the client is told about; blocking
+        // slots are left at their default so only the in-flight permit matters.
+        let config = ConnectionConfig {
+            max_in_flight: 1,
+            ..Default::default()
+        };
+        assert_sequential_requests_are_never_rejected(config, 5_000).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn client_at_the_blocking_limit_is_never_rejected() {
+        // Isolates the blocking-slot permit: one blocking slot, in-flight
+        // limit left at its default.
+        let config = ConnectionConfig::default().with_max_blocking_tasks(1);
+        assert_sequential_requests_are_never_rejected(config, 5_000).await;
+    }
+
+    #[tokio::test]
+    async fn slow_reader_cannot_make_the_server_accept_unbounded_requests() {
+        // Large results fill the socket buffer as soon as the client stops
+        // reading, so the server's writer stalls and the output queue fills.
+        let registry = registry_with(vec![Box::new(BigResultTool {
+            result_bytes: 256 * 1024,
+        })]);
+        let config = ConnectionConfig {
+            max_in_flight: 4,
+            ..Default::default()
+        };
+        const REQUESTS: u64 = 200;
+        let (mut client, _dir) = connected_pair_with_registry(registry, config).await;
+        do_hello(&mut client).await;
+        let (mut read_half, mut write_half) = client.into_split();
+
+        let sender = tokio::spawn(async move {
+            for id in 1..=REQUESTS {
+                let invoke = Invoke {
+                    tool: "test.big_result".to_string(),
+                    args: serde_json::json!({}),
+                    deadline_ms: Some(10_000),
+                    stream: None,
+                };
+                let frame = Frame {
+                    msg_type: MessageType::Invoke as u8,
+                    correlation_id: id,
+                    payload: codec::encode(&invoke).unwrap(),
+                };
+                wire::write_frame(&mut write_half, &frame).await.unwrap();
+            }
+            write_half
+        });
+
+        // Do not read yet: let the server take in as many requests as it will.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let mut accepted = 0u64;
+        let mut refused = 0u64;
+        tokio::time::timeout(Duration::from_secs(20), async {
+            for _ in 0..REQUESTS {
+                let frame = read_frame(&mut read_half, FrameLimits::default())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                match MessageType::from_u8(frame.msg_type) {
+                    Some(MessageType::Result) => accepted += 1,
+                    Some(MessageType::Error) => {
+                        let err: ErrorPayload = codec::decode(&frame.payload).unwrap();
+                        assert_eq!(err.code, ErrorCode::ResourceExhausted);
+                        refused += 1;
+                    }
+                    other => panic!("unexpected message type {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("every request must receive exactly one terminal frame");
+        sender.abort();
+
+        assert_eq!(accepted + refused, REQUESTS);
+        assert!(refused > 0, "a slow reader must eventually hit the limit");
+        assert!(
+            accepted <= 4 + 64 + 8,
+            "server accepted {accepted} requests from a client that was not reading"
+        );
+    }
+
     #[tokio::test]
     async fn result_exceeding_max_frame_len_is_bounded_not_sent_oversized() {
         let registry = registry_with(vec![Box::new(BigResultTool { result_bytes: 1000 })]);
