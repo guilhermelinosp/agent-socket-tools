@@ -241,6 +241,26 @@ Shared across both modes:
   succeeded or fully failed.
 - **Ordering**: `STREAM_CHUNK.sequence` is 0-indexed and strictly
   increasing with no gaps or reordering in either mode.
+- **Totals (normative)**: `StreamStart.total_bytes` is a promise, not a
+  hint. A conforming server MUST send `STREAM_CHUNK.data` whose lengths
+  sum to exactly `total_bytes` before `STREAM_END`. A conforming client
+  MUST treat any divergence as a protocol error: a `sequence` that is not
+  the next expected value, or a `STREAM_END` arriving when the received
+  byte count differs from `total_bytes`. The Rust and Python clients in
+  this repository both do this (`StreamProtocolViolation` in Rust,
+  `AstProtocolError("stream protocol violation: ...")` in Python).
+  `total_chunks` remains only an estimate: UTF-8 boundary handling in
+  mode 2 can change the real chunk count.
+- **Consuming a stream without aggregating it (Rust)**:
+  `AstClient::invoke_stream_chunks` returns a `StreamHandle` whose
+  `start()` exposes the `STREAM_START` (including `raw` metadata) and
+  whose `next_chunk()` yields each validated chunk as it arrives, until
+  `Ok(None)` after `STREAM_END`. `invoke_stream` is the aggregating form
+  of the same handle, so both share one validation path. Dropping a
+  handle before the stream ends deregisters it and sends a best-effort
+  `CANCEL`, so the connection stays usable. A held-but-unread handle
+  backs up the client's reader for that connection until it is read or
+  dropped.
 - **Chunk size**: `ast-server --stream-chunk-bytes` (default 64 KiB)
   targets a per-chunk size; the last chunk is typically smaller.
   Clamped down automatically at connection start if it wouldn't fit
@@ -274,7 +294,7 @@ names and optionality are exactly as declared there via `serde`).
 | `CANCEL` | `Cancel` | `target_correlation_id: u64` |
 | `BATCH` | `Batch` | `calls: Vec<BatchInvoke>` — each `{id: u64, tool: String, args: <JSON>, deadline_ms: Option<u64>}` |
 | `BATCH_RESULT` | `BatchResult` | `results: Vec<BatchResultEntry>` — each `{id: u64, status: "ok" \| "error", value / code+message}` |
-| `STREAM_START` | `StreamStart` | `total_chunks: u32`, `total_bytes: u64` (informational — see "Chunked streaming"), `raw: Option<RawStreamInfo>` (present only for genuine incremental streaming — `{metadata: <JSON>, field_name: String}`) |
+| `STREAM_START` | `StreamStart` | `total_chunks: u32` (estimate only), `total_bytes: u64` (exact: the chunks must sum to it — see "Chunked streaming"), `raw: Option<RawStreamInfo>` (present only for genuine incremental streaming — `{metadata: <JSON>, field_name: String}`) |
 | `STREAM_CHUNK` | `StreamChunk` | `sequence: u32`, `data: bytes` (a MessagePack `bin`, not an array — see `src/ast/message.rs`'s `serde_bytes` usage) |
 | `STREAM_END` | `StreamEnd` | *(empty)* |
 
@@ -664,7 +684,8 @@ Defaults are for `ast-server`. Values marked *fixed* are constants in the code a
 
 ## Known limitations
 
-- Streaming: `total_bytes` is only used for a size-ceiling check on the Rust client, which still preallocates up to `max_stream_bytes` (default 256 MiB) per in-flight stream when the server declares that much; a hostile server can therefore make a client reserve that much per concurrent stream.
+- Streaming: the Rust client's `invoke_stream` still preallocates up to the declared `total_bytes` (after checking it against `max_stream_bytes`, default 256 MiB) per in-flight stream; a hostile server can therefore make a client reserve that much per concurrent stream. The incremental `StreamHandle` API does not preallocate, and the Python client's `invoke_stream` does not either.
+- Streaming totals in mode 2 come from the tool's `total_bytes_hint()`. A tool that returns `None` makes the server send `total_bytes: 0` with non-empty chunks, which conforming clients now reject as a protocol violation. No current tool does this (`filesystem.read` always reports its size), but a future one must report an exact total before it can use genuine streaming.
 - Backpressure is bounded by frame count (the per-connection outgoing channel holds 64 frames), not bytes: with large `max_frame_bytes`, worst-case queued memory per connection is up to 64 × `max_frame_bytes`.
 - BATCH has no aggregate server-side deadline: each call honors its own deadline, so a 100-call batch can run for the sum of its calls' deadlines. The client now sends a best-effort CANCEL when its own timeout fires.
 - BATCH serializes each entry twice (once to measure the running budget, once in the final BatchResult); unmeasured, a possible CPU optimization.

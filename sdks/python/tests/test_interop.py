@@ -16,13 +16,30 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from ast_client import AstClient, AstServerError  # noqa: E402
+from ast_client import (  # noqa: E402
+    AST_PROTOCOL_VERSION,
+    TYPE_ERROR,
+    TYPE_HELLO,
+    TYPE_HELLO_ACK,
+    TYPE_STREAM_CHUNK,
+    TYPE_STREAM_END,
+    TYPE_STREAM_START,
+    AstClient,
+    AstProtocolError,
+    AstServerError,
+    Frame,
+    _pack,
+    encode_frame,
+    read_frame,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
@@ -167,3 +184,109 @@ def test_invoke_stream_of_an_unknown_tool_reports_the_same_error_invoke_would(se
         with pytest.raises(AstServerError) as exc_info:
             client.invoke_stream("does.not.exist")
     assert exc_info.value.code == "TOOL_NOT_FOUND"
+
+
+def test_filesystem_read_without_path_is_invalid_arguments(server):
+    with AstClient.connect(str(server)) as client:
+        with pytest.raises(AstServerError) as exc_info:
+            client.invoke("filesystem.read", {})
+    assert exc_info.value.code == "INVALID_ARGUMENTS"
+
+
+def test_batch_over_the_call_limit_is_invalid_message(server):
+    calls = [{"id": i, "tool": "system.info", "args": {}} for i in range(101)]
+    with AstClient.connect(str(server)) as client:
+        with pytest.raises(AstServerError) as exc_info:
+            client.batch(calls)
+    assert exc_info.value.code == "INVALID_MESSAGE"
+
+
+def test_cancel_of_an_unknown_id_leaves_the_connection_usable(server):
+    with AstClient.connect(str(server)) as client:
+        client.cancel(999999)  # fire-and-forget: nothing to unknown ids
+        client.ping()  # the next exchange must still be well-formed
+
+
+@contextmanager
+def _fake_server(frames_to_send):
+    """A fake AST server on a Unix socket. It accepts one connection,
+    answers HELLO with an ok HELLO_ACK, reads the INVOKE, then sends each
+    ``(msg_type, payload_dict)`` in ``frames_to_send`` tagged with the
+    INVOKE's correlation_id. It keeps the socket open until the client
+    closes, so the client's next read fails only on the test's own terms.
+    """
+    with tempfile.TemporaryDirectory() as socket_dir:
+        socket_path = os.path.join(socket_dir, "fake-ast.sock")
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(socket_path)
+        listener.listen(1)
+
+        def serve() -> None:
+            try:
+                conn, _ = listener.accept()
+                with conn:
+                    hello = read_frame(conn)
+                    ack = {
+                        "protocol_version": AST_PROTOCOL_VERSION,
+                        "server_name": "fake-ast-server",
+                        "ok": True,
+                        "error": None,
+                    }
+                    conn.sendall(
+                        encode_frame(Frame(TYPE_HELLO_ACK, hello.correlation_id, _pack(ack)))
+                    )
+                    invoke = read_frame(conn)
+                    for msg_type, payload in frames_to_send:
+                        conn.sendall(
+                            encode_frame(Frame(msg_type, invoke.correlation_id, _pack(payload)))
+                        )
+                    conn.recv(1)  # wait for the client to hang up
+            except OSError:
+                pass  # the client went away first; the test asserts on its side
+            finally:
+                listener.close()
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        try:
+            yield socket_path
+        finally:
+            thread.join(timeout=5)
+
+
+def test_stream_sequence_violation_raises():
+    frames = [
+        (TYPE_STREAM_START, {"total_chunks": 2, "total_bytes": 6}),
+        (TYPE_STREAM_CHUNK, {"sequence": 0, "data": b"abc"}),
+        (TYPE_STREAM_CHUNK, {"sequence": 2, "data": b"def"}),  # skips 1
+        (TYPE_STREAM_END, {}),
+    ]
+    with _fake_server(frames) as path:
+        with AstClient.connect(path) as client:
+            with pytest.raises(AstProtocolError, match="stream protocol violation"):
+                client.invoke_stream("whatever")
+
+
+def test_stream_byte_total_mismatch_raises():
+    frames = [
+        (TYPE_STREAM_START, {"total_chunks": 1, "total_bytes": 10}),
+        (TYPE_STREAM_CHUNK, {"sequence": 0, "data": b"abc"}),  # 3 of the promised 10
+        (TYPE_STREAM_END, {}),
+    ]
+    with _fake_server(frames) as path:
+        with AstClient.connect(path) as client:
+            with pytest.raises(AstProtocolError, match="stream protocol violation"):
+                client.invoke_stream("whatever")
+
+
+def test_mid_stream_error_raises_server_error():
+    frames = [
+        (TYPE_STREAM_START, {"total_chunks": 2, "total_bytes": 20}),
+        (TYPE_STREAM_CHUNK, {"sequence": 0, "data": b"abc"}),
+        (TYPE_ERROR, {"code": "DEADLINE_EXCEEDED", "message": "simulated mid-stream failure"}),
+    ]
+    with _fake_server(frames) as path:
+        with AstClient.connect(path) as client:
+            with pytest.raises(AstServerError) as exc_info:
+                client.invoke_stream("whatever")
+    assert exc_info.value.code == "DEADLINE_EXCEEDED"

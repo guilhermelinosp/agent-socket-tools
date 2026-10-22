@@ -12,8 +12,10 @@ call (no concurrent multiplexing of several in-flight requests the way
 the Rust ``AstClient`` does) — proving the wire format and message
 semantics are portable doesn't require reproducing Rust's concurrency
 model in Python too. HELLO, PING, DISCOVER, INVOKE, CANCEL, and BATCH
-are all implemented; STREAM_* isn't, because the Rust side doesn't
-implement it either (see ``docs/AST_PROTOCOL.md``'s "Deferred" section).
+are all implemented. Streamed INVOKEs are supported through
+``invoke_stream``, which validates chunk sequence and total bytes (see
+``docs/AST_PROTOCOL.md``'s "Chunked streaming" section); it aggregates
+the whole result and has no incremental API like the Rust client's.
 
 Requires only the stdlib plus ``msgpack`` (``pip install msgpack``).
 """
@@ -202,14 +204,33 @@ class AstClient:
         if first.msg_type != TYPE_STREAM_START:
             raise AstProtocolError(f"expected STREAM_START, got type {first.msg_type}")
         start = _unpack(first.payload)
+        declared_total = int(start["total_bytes"])
 
         encoded = bytearray()
+        expected_sequence = 0
         while True:
             frame = self._recv_matching(cid)
+            # A mid-stream ERROR is a server failure, not a protocol
+            # violation: raise AstServerError just like a failed first frame.
+            self._raise_if_error(frame)
             if frame.msg_type == TYPE_STREAM_CHUNK:
                 chunk = _unpack(frame.payload)
+                # Chunks must arrive as 0, 1, 2, ... with no gaps, repeats
+                # or reordering (docs/AST_PROTOCOL.md, "Chunked streaming").
+                if chunk["sequence"] != expected_sequence:
+                    raise AstProtocolError(
+                        f"stream protocol violation: chunk sequence {chunk['sequence']} "
+                        f"arrived where {expected_sequence} was expected"
+                    )
+                expected_sequence += 1
                 encoded.extend(chunk["data"])
             elif frame.msg_type == TYPE_STREAM_END:
+                # The server always sends exactly STREAM_START.total_bytes.
+                if len(encoded) != declared_total:
+                    raise AstProtocolError(
+                        f"stream protocol violation: STREAM_END after {len(encoded)} bytes, "
+                        f"but STREAM_START declared total_bytes {declared_total}"
+                    )
                 break
             else:
                 raise AstProtocolError(f"unexpected message type during stream: {frame.msg_type}")

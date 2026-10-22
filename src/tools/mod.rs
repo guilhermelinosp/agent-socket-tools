@@ -99,9 +99,10 @@ impl std::fmt::Debug for StreamingToolOpen {
 /// entire point of this trait existing instead of just calling
 /// [`Tool::invoke`].
 pub trait IncrementalBytes: Send {
-    /// Total size in bytes, if known upfront (used for `StreamStart`'s
-    /// `total_bytes`/`total_chunks` — informational, per that message's
-    /// own doc comment, not load-bearing).
+    /// Total size in bytes, if known upfront. Used for `StreamStart`'s
+    /// `total_bytes`, which clients enforce exactly: the chunks this
+    /// reader yields must add up to it. Never report a size the reader
+    /// will not produce.
     fn total_bytes_hint(&self) -> Option<u64>;
 
     /// Returns the next chunk of up to `max_len` bytes, or `Ok(None)`

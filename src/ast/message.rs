@@ -128,12 +128,12 @@ pub struct InvokeResult {
     pub value: Value,
 }
 
-/// First message of a streamed response. `total_bytes` is the size, in
-/// bytes, of the streamed content *before* chunking — informational
-/// (e.g. for a progress bar), not load-bearing: a conforming client
-/// reassembles the result from exactly the chunks it receives, in
-/// `sequence` order, regardless of whether their total matches this
-/// number.
+/// First message of a streamed response. `total_bytes` is the exact size,
+/// in bytes, of the streamed content *before* chunking: a conforming
+/// server sends `STREAM_CHUNK.data` summing to exactly this, and a
+/// conforming client treats any other total at `STREAM_END` as a protocol
+/// violation (see `docs/AST_PROTOCOL.md`'s "Chunked streaming"
+/// section). `total_chunks` is only an estimate.
 ///
 /// Two distinct streaming modes, distinguished by `raw`:
 ///
