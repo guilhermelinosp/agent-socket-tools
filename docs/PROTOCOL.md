@@ -1,9 +1,17 @@
 # Wire protocol (version 1)
 
-Transport: a Unix Domain Socket, stream mode (`SOCK_STREAM`). Framing: one
-UTF-8 JSON object per line, terminated by `\n`. Both directions use the
-same framing; a connection may carry any number of request/response pairs
-in sequence before either side closes it.
+Transport: a Unix Domain Socket (`tokio::net::UnixListener` /
+`tokio::net::UnixStream`), stream mode (`SOCK_STREAM`). Framing: one UTF-8
+JSON object per line, terminated by `\n`. Both directions use the same
+framing; a connection may carry any number of request/response pairs in
+sequence before either side closes it.
+
+A connection-scoped buffer assembles each message, independent of how the
+bytes actually arrive on the wire: multiple messages written in a single
+`write()` on one side are each delivered in order on a single `read()`-loop
+on the other, and a single message fragmented across many small writes is
+reassembled before being handed to the application layer. Neither case
+requires one socket `read()` to correspond to one message.
 
 This document describes version `1`. The `version` field exists so future,
 breaking changes can be introduced as version `2`, `3`, etc. without
@@ -152,15 +160,33 @@ Returns the tool's own result shape on success, under `result`.
 | `invalid_args` | `args` failed the named tool's own validation. |
 | `unauthorized` | The tool refused the operation for a policy reason — today, exclusively "the resolved path is outside the authorized base directory." |
 | `tool_error` | The tool ran but failed for an operational reason (file not found, not a regular file, I/O error, non-UTF-8 content). |
-| `timeout` | The tool did not complete within `--request-timeout-secs`. |
-| `message_too_large` | A line exceeded `--max-message-bytes` before a newline was found. |
-| `internal` | Any other server-side failure (e.g. the tool's task panicked). |
+| `timeout` | Either a complete request didn't arrive, or the named tool didn't finish, within `--request-timeout-secs`. The two phases share one error code — `id` is still `"unknown"` for the first (the request never fully arrived, so there was nothing to recover an `id` from) and the real request `id` for the second. |
+| `message_too_large` | A request line exceeded `--max-message-bytes` before a newline was found. |
+| `response_too_large` | A fully-formed response would have exceeded `--max-message-bytes`; this bounded error was sent in its place. |
+| `incomplete_message` | The connection reached EOF with a partial message already buffered — the peer disconnected mid-message, not between messages (a clean disconnect between messages isn't an error at all; it just ends the connection). |
+| `invalid_utf8` | A complete line's bytes were not valid UTF-8. |
+| `connection_limit_exceeded` | The server was already serving its configured `--max-connections` and closed this connection immediately rather than queuing it. |
+| `internal` | Any other server-side failure, including the tool's task panicking and socket I/O errors that aren't one of the more specific codes above. |
 
 New codes may be added in future minor versions of this document without
 a protocol version bump, since clients are expected to treat any
 `error.code` they don't recognize as a generic failure. Removing or
 changing the meaning of an existing code is a breaking change and requires
 bumping `version`.
+
+## Limits
+
+| Limit | Default | Flag | Applies to |
+|---|---|---|---|
+| Message size | 1 MiB | `--max-message-bytes` | Each request line and each response line, independently. A request over the limit is rejected before being fully read; a response over the limit is replaced with a bounded `response_too_large` error rather than sent, written, or truncated. |
+| Request timeout | 10s | `--request-timeout-secs` | Receiving one complete request, and separately, running the tool it names — see the `timeout` row above. |
+| Concurrent connections | 256 | `--max-connections` | The whole server process. Enforced at accept time via a counting semaphore; a connection beyond the limit is rejected, not queued. |
+
+`filesystem.read`'s own 1 MiB file-size cap (`MAX_READ_BYTES`) is a
+separate, currently non-configurable limit on how much of a file is read
+into memory — see this document's `filesystem.read` section above. It is
+not the same knob as `--max-message-bytes`, even though both default to
+1 MiB today.
 
 ## Example session (raw bytes over the socket)
 

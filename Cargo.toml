@@ -21,7 +21,11 @@ clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
+# Used only for a handful of justified, documented `unsafe` FFI calls:
+# getuid()/umask() for the private-socket-directory hardening in
+# transport.rs, and O_NOFOLLOW for filesystem_read.rs's symlink-swap
+# mitigation. Not used anywhere else.
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
-libc = "0.2"

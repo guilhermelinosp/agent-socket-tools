@@ -68,11 +68,29 @@ pub enum ErrorCode {
     Unauthorized,
     /// The tool ran but failed (e.g. file not found, I/O error).
     ToolError,
-    /// The request did not complete within the configured timeout.
+    /// The request did not complete within the configured timeout. This
+    /// covers both "the request bytes never fully arrived in time" and
+    /// "the tool didn't finish in time" — see `docs/PROTOCOL.md` for which
+    /// phase applies.
     Timeout,
-    /// The request or a field in it exceeded a configured size limit.
+    /// A request line exceeded the configured maximum message size before
+    /// a newline was found.
     MessageTooLarge,
-    /// Any other server-side failure.
+    /// A fully-formed response would have exceeded the configured maximum
+    /// message size. The server sends this bounded error instead of the
+    /// oversized payload.
+    ResponseTooLarge,
+    /// The connection was closed because the socket reached end-of-file
+    /// with a partial message already buffered (no newline ever arrived).
+    IncompleteMessage,
+    /// A request line contained bytes that were not valid UTF-8.
+    InvalidUtf8,
+    /// The server was already serving its configured maximum number of
+    /// concurrent connections and closed this one immediately.
+    ConnectionLimitExceeded,
+    /// Any other server-side failure, including a tool task panicking and
+    /// I/O errors on the socket itself that aren't one of the more
+    /// specific codes above.
     Internal,
 }
 

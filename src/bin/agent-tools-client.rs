@@ -1,20 +1,37 @@
-use agent_socket_tools::config::default_socket_path;
+use agent_socket_tools::config::{default_socket_path, DEFAULT_MAX_MESSAGE_BYTES};
 use agent_socket_tools::protocol::{Operation, Request, Response, PROTOCOL_VERSION};
+use agent_socket_tools::transport::MessageReader;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 
 /// Connects to an agent-tools-server over its Unix Domain Socket and sends
 /// one request.
+///
+/// This is a test/debugging CLI, not an SDK: it sends exactly one request
+/// per invocation and prints the raw JSON response. An AI agent that wants
+/// to speak this protocol natively needs to implement the client side of
+/// `docs/PROTOCOL.md` itself (or shell out to this binary); nothing here
+/// provides automatic integration with any particular agent framework.
 #[derive(Parser, Debug)]
 #[command(name = "agent-tools-client", version)]
 struct Cli {
     /// Path to the server's Unix Domain Socket. Defaults to the same
-    /// resolution rule the server uses: `$XDG_RUNTIME_DIR/agent-tools.sock`,
-    /// falling back to `$TMPDIR/agent-tools.sock`.
+    /// resolution rule the server uses.
     #[arg(long)]
     socket_path: Option<PathBuf>,
+
+    /// Maximum size, in bytes, this client will buffer while waiting for
+    /// the server's response line. A response larger than this is reported
+    /// as a client-side error rather than buffered without bound.
+    #[arg(long, default_value_t = DEFAULT_MAX_MESSAGE_BYTES)]
+    max_message_bytes: usize,
+
+    /// How long to wait for the server's response before giving up.
+    #[arg(long, default_value_t = 10)]
+    response_timeout_secs: u64,
 
     #[command(subcommand)]
     command: Command,
@@ -41,6 +58,7 @@ enum Command {
 async fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
     let socket_path = cli.socket_path.unwrap_or_else(default_socket_path);
+    let response_timeout = Duration::from_secs(cli.response_timeout_secs);
 
     let (op, tool, args) = match cli.command {
         Command::Discover => (Operation::Discover, None, None),
@@ -65,7 +83,14 @@ async fn main() -> std::process::ExitCode {
         args,
     };
 
-    match send_request(&socket_path, &request).await {
+    match send_request(
+        &socket_path,
+        &request,
+        cli.max_message_bytes,
+        response_timeout,
+    )
+    .await
+    {
         Ok(response) => {
             let pretty = serde_json::to_string_pretty(&response).expect("Response serializes");
             println!("{pretty}");
@@ -85,25 +110,43 @@ async fn main() -> std::process::ExitCode {
 async fn send_request(
     socket_path: &std::path::Path,
     request: &Request,
+    max_message_bytes: usize,
+    response_timeout: Duration,
 ) -> std::io::Result<Response> {
-    let stream = UnixStream::connect(socket_path).await?;
-    let (read_half, mut write_half) = stream.into_split();
+    let mut stream = UnixStream::connect(socket_path).await?;
 
     let mut line = serde_json::to_string(request).expect("Request serializes");
     line.push('\n');
-    write_half.write_all(line.as_bytes()).await?;
-    write_half.flush().await?;
+    stream.write_all(line.as_bytes()).await?;
+    stream.flush().await?;
 
-    let mut reader = BufReader::new(read_half);
-    let mut response_line = String::new();
-    let n = reader.read_line(&mut response_line).await?;
-    if n == 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "server closed the connection without responding",
-        ));
-    }
+    // Reuses the server's own framing logic so the client enforces the
+    // same "don't buffer an unbounded response" guarantee, not an
+    // unrelated, separately-maintained copy of it.
+    let mut reader = MessageReader::new(max_message_bytes);
+    let message =
+        match tokio::time::timeout(response_timeout, reader.next_message(&mut stream)).await {
+            Ok(Ok(Some(line))) => line,
+            Ok(Ok(None)) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "server closed the connection without responding",
+                ))
+            }
+            Ok(Err(framing_err)) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("{framing_err:?}"),
+                ))
+            }
+            Err(_elapsed) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "no response within the configured timeout",
+                ))
+            }
+        };
 
-    serde_json::from_str(&response_line)
+    serde_json::from_str(&message)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }

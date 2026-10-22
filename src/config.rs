@@ -3,20 +3,40 @@ use std::time::Duration;
 
 pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 1024 * 1024; // 1 MiB per line
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+pub const DEFAULT_MAX_CONNECTIONS: usize = 256;
 
-/// Resolves the default socket path: `$XDG_RUNTIME_DIR/agent-tools.sock` when
-/// `XDG_RUNTIME_DIR` is set to an existing, absolute directory; otherwise
-/// falls back to `$TMPDIR/agent-tools.sock` (or `/tmp` on platforms without
-/// `TMPDIR`), matching typical macOS and minimal-Linux environments that
-/// have no systemd-managed runtime directory.
+/// Name of the private, per-user subdirectory the socket lives in. Never
+/// put the socket file directly in a shared temp root: a predictable
+/// filename there is attacker-plantable (a different local user could
+/// pre-create `agent-tools.sock` before this process does). A dedicated
+/// `0700` subdirectory that this process creates and validates the
+/// ownership/permissions of, instead, is the standard mitigation — see
+/// [`crate::transport::BoundListener::bind`], which creates and checks it.
+pub const SOCKET_DIR_NAME: &str = "agent-socket-tools";
+
+/// Resolves the default socket path: `$XDG_RUNTIME_DIR/agent-socket-tools/agent-tools.sock`
+/// when `XDG_RUNTIME_DIR` is set to an existing, absolute directory;
+/// otherwise falls back to `$TMPDIR/agent-socket-tools/agent-tools.sock`
+/// (or `/tmp/...` on platforms without `TMPDIR`), matching typical macOS
+/// and minimal-Linux environments that have no systemd-managed runtime
+/// directory.
+///
+/// This function only computes a path; it performs no filesystem I/O and
+/// makes no guarantee the parent directory exists or has safe permissions.
+/// [`crate::transport::BoundListener::bind`] is responsible for creating
+/// and validating that directory before binding.
 pub fn default_socket_path() -> PathBuf {
+    default_socket_dir().join("agent-tools.sock")
+}
+
+fn default_socket_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
         let dir = PathBuf::from(dir);
         if dir.is_absolute() && dir.is_dir() {
-            return dir.join("agent-tools.sock");
+            return dir.join(SOCKET_DIR_NAME);
         }
     }
-    std::env::temp_dir().join("agent-tools.sock")
+    std::env::temp_dir().join(SOCKET_DIR_NAME)
 }
 
 #[cfg(test)]
@@ -34,6 +54,7 @@ mod tests {
         let path = default_socket_path();
         assert_eq!(path.file_name().unwrap(), "agent-tools.sock");
         assert!(path.starts_with(std::env::temp_dir()));
+        assert!(path.to_string_lossy().contains(SOCKET_DIR_NAME));
         if let Some(previous) = previous {
             unsafe { std::env::set_var("XDG_RUNTIME_DIR", previous) };
         }

@@ -18,7 +18,13 @@ struct ServerHandle {
     child: Child,
     socket_path: PathBuf,
     _socket_dir: tempfile::TempDir,
-    _read_dir: tempfile::TempDir,
+    read_dir: tempfile::TempDir,
+}
+
+impl ServerHandle {
+    fn read_dir_path(&self) -> &Path {
+        self.read_dir.path()
+    }
 }
 
 impl Drop for ServerHandle {
@@ -30,8 +36,19 @@ impl Drop for ServerHandle {
 
 async fn wait_for_socket(path: &Path) {
     for _ in 0..100 {
-        if path.exists() && UnixStream::connect(path).await.is_ok() {
-            return;
+        if path.exists() {
+            if let Ok(probe) = UnixStream::connect(path).await {
+                drop(probe);
+                // The probe connection was still accepted and handed a
+                // connection-limiter permit server-side; give the
+                // server's connection task time to see this probe's EOF
+                // and release that permit before returning. Without this,
+                // a test that starts the server with a tight
+                // `--max-connections` can race the probe itself for the
+                // one available slot.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                return;
+            }
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -39,6 +56,10 @@ async fn wait_for_socket(path: &Path) {
 }
 
 async fn start_server() -> ServerHandle {
+    start_server_with_args(&[]).await
+}
+
+async fn start_server_with_args(extra_args: &[&str]) -> ServerHandle {
     let read_dir = tempfile::tempdir().unwrap();
     std::fs::write(read_dir.path().join("hello.txt"), "hello world\n").unwrap();
 
@@ -50,6 +71,7 @@ async fn start_server() -> ServerHandle {
         .arg(&socket_path)
         .arg("--read-dir")
         .arg(read_dir.path())
+        .args(extra_args)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -61,7 +83,7 @@ async fn start_server() -> ServerHandle {
         child,
         socket_path,
         _socket_dir: socket_dir,
-        _read_dir: read_dir,
+        read_dir,
     }
 }
 
@@ -211,6 +233,105 @@ async fn server_serves_two_connections_concurrently() {
         let resp: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(resp["ok"], true);
     }
+}
+
+#[tokio::test]
+async fn connection_limit_rejects_the_extra_connection_predictably() {
+    let server = start_server_with_args(&["--max-connections", "1"]).await;
+
+    // Holds the one available slot open without sending anything, so the
+    // second connection below has nothing to do with it but be rejected.
+    let _first = UnixStream::connect(&server.socket_path).await.unwrap();
+
+    let second = UnixStream::connect(&server.socket_path).await.unwrap();
+    let (read_half, mut write_half) = second.into_split();
+    // The limit is enforced at accept time, not on the first request, so
+    // nothing needs to be sent for the server to already reject this
+    // connection — but send a request anyway to also prove the rejection
+    // response arrives instead of (not in addition to) a real answer.
+    write_half
+        .write_all(b"{\"version\":1,\"id\":\"x\",\"op\":\"health\"}\n")
+        .await
+        .unwrap();
+    let mut reader = BufReader::new(read_half);
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+
+    let resp: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(resp["ok"], false);
+    assert_eq!(resp["error"]["code"], "connection_limit_exceeded");
+}
+
+#[tokio::test]
+async fn connection_limit_frees_a_slot_after_disconnect() {
+    let server = start_server_with_args(&["--max-connections", "1"]).await;
+
+    let first = UnixStream::connect(&server.socket_path).await.unwrap();
+    drop(first); // release the only slot
+
+    // Give the server a moment to notice the disconnect and release its
+    // permit before trying to claim the now-free slot.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let (success, resp) = run_client(&server.socket_path, &["health"]);
+    assert!(
+        success,
+        "a connection after the first disconnected should succeed: {resp}"
+    );
+}
+
+#[tokio::test]
+async fn response_exceeding_the_configured_limit_is_bounded_not_truncated_silently() {
+    // 200 bytes: comfortably larger than any request this test sends
+    // (so the *request* passes the server's framing check), but smaller
+    // than the *response* `filesystem.read` will produce for the
+    // oversized fixture file below (so the response is what trips it).
+    let server = start_server_with_args(&["--max-message-bytes", "200"]).await;
+    std::fs::write(
+        server.read_dir_path().join("large.txt"),
+        "y".repeat(500), // the response envelope alone exceeds 200 bytes
+    )
+    .unwrap();
+
+    let (success, resp) = run_client(
+        &server.socket_path,
+        &[
+            "--max-message-bytes",
+            "4096",
+            "invoke",
+            "--tool",
+            "filesystem.read",
+            "--args",
+            r#"{"path":"large.txt"}"#,
+        ],
+    );
+    assert!(!success);
+    assert_eq!(resp["error"]["code"], "response_too_large");
+}
+
+#[tokio::test]
+async fn request_read_timeout_is_reported_distinctly_from_tool_timeout() {
+    let server = start_server_with_args(&["--request-timeout-secs", "1"]).await;
+
+    let stream = UnixStream::connect(&server.socket_path).await.unwrap();
+    let (read_half, write_half) = stream.into_split();
+    // Send nothing at all; the server should give up after ~1s rather than
+    // waiting forever for a request that never arrives. `write_half` must
+    // stay alive (not dropped) for that to actually test the timeout:
+    // tokio's `OwnedWriteHalf` shuts down the write side of the socket on
+    // `Drop`, which would signal EOF to the server immediately and make it
+    // take the "clean disconnect" path instead of the timeout path this
+    // test exists to exercise.
+    let _write_half = write_half;
+    let mut reader = BufReader::new(read_half);
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+        .await
+        .expect("server should have responded within 5s")
+        .unwrap();
+
+    let resp: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(resp["error"]["code"], "timeout");
 }
 
 #[test]
