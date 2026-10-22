@@ -434,72 +434,78 @@ neither CLI is an SDK or an agent-framework adapter.
 ## MCP comparison
 
 A reproducible benchmark (`cargo run --release --bin ast-bench`) compares
-three things doing identical work in the same run on the same machine:
+four things doing identical work in the same run on the same machine:
 AST, **this crate's own legacy JSON-Lines protocol** (both over Unix
-Domain Sockets), and **`mcp-like-server`**
-(`src/bin/mcp-like-server.rs`) — a minimal JSON-RPC 2.0-over-stdio server
-implementing MCP's `initialize`/`tools/list`/`tools/call` methods and
-content-block result shape, serving the exact same
-`system.info`/`filesystem.read` tools.
+Domain Sockets), and two MCP baselines, both serving the exact same
+`system.info`/`filesystem.read` tools:
 
-**`mcp-like-server` is not the official MCP reference implementation —
-it is a shape-faithful stand-in, built for this benchmark.** It gets
-stdio framing, the three methods a tool-invocation benchmark needs, and
-the `{"content":[{"type":"text","text":...}], "isError": bool}`
-tool-result convention right, and nothing else from the full MCP
-specification (no resources, prompts, sampling, roots, or capability
-negotiation beyond the one call `ast-bench` makes). Treat every number
-below as "a faithfully-shaped MCP-like server, implemented by this
-project," not "MCP itself" or any particular official SDK's actual
-performance.
+- **`mcp-server`** (`src/bin/mcp-server.rs`) — built on the **official**
+  `rmcp` SDK (`modelcontextprotocol/rust-sdk`), pinned to an exact
+  version (`=3.6.0`). This is the fair baseline: a maintained
+  implementation of the real protocol and transport, not a hand-rolled
+  stand-in.
+- **`mcp-like-server`** (`src/bin/mcp-like-server.rs`) — a minimal,
+  hand-rolled JSON-RPC 2.0-over-stdio server implementing MCP's
+  `initialize`/`tools/list`/`tools/call` methods and content-block result
+  shape by hand. Kept only as a documented **synthetic fallback**,
+  useful for the one thing a real SDK can't cheaply isolate: a
+  near-irreducible floor for "JSON-RPC-over-stdio with essentially no
+  framework overhead." Not the official MCP reference implementation,
+  and not used as the primary comparison now that a real one exists.
 
 Representative results (`rustc 1.99.1`, Apple Silicon arm64, release
 build, 500 iterations per scenario, 20-way concurrency):
 
-| Scenario | Legacy (JSON) | AST (MessagePack) | mcp-like (JSON-RPC/stdio) |
-|---|---|---|---|
-| Startup time | 214.7ms | 217.3ms | **6.3ms (34x faster)** |
-| Cheapest round trip, sequential, persistent (p50) | 24.3µs | 32.4µs | **13.7µs (fastest)** |
-| Reconnect-per-call, 100 calls (total) | 3.79ms | 9.07ms (incl. `HELLO`) | n/a — see note below |
-| `filesystem.read`, 512 KiB payload (p50) | 10449.3µs | **663.6µs (16x faster than legacy)** | 584.7µs |
-| 20 concurrent calls | 74326 req/s (20 connections) | **165006 req/s (multiplexed, 1 connection)** | 3630 req/s (20 separate *processes*, spawn cost included) |
-| Encoded bytes, cheapest call | 37 B | **14 B (smallest)** | 94 B |
-| Avg CPU across the whole run | 7.8% | 3.6% | **2.1% (lowest)** |
+| Scenario | Legacy (JSON) | AST (MessagePack) | mcp-server (real, rmcp) | mcp-like-server (synthetic) |
+|---|---|---|---|---|
+| Startup time | 228.0ms | 239.6ms | 234.3ms | 196.1ms |
+| Cheapest round trip, sequential, persistent (p50) | 32.3µs | **35.8µs** | 40.3µs | 13.1µs |
+| `filesystem.read`, 512 KiB payload (p50) | 13973.1µs | **788.3µs (18x faster than legacy)** | 814.6µs | 812.8µs |
+| 20 concurrent calls | 50068 req/s (20 connections) | **129624 req/s (multiplexed, 1 connection)** | 1707 req/s (20 processes) | 2292 req/s (20 processes) |
+| Encoded bytes, cheapest call | 37 B | **14 B (smallest)** | 94 B (same request shape as mcp-like) | 94 B |
+| Avg CPU across the whole run | 6.9% | **3.7%** | 4.9% | 3.1% |
 
-**Read honestly — this is not a one-sided result for anyone:**
+**This corrects a previous version of this document**, which compared
+AST only against `mcp-like-server` and concluded MCP "wins startup and
+small-sequential-call latency by a wide margin." That conclusion doesn't
+survive comparison against the real SDK: `mcp-server`'s startup (234ms)
+is in the same range as AST's and legacy's (both socket-based, both pay
+a real handshake), not the ~6ms the synthetic stand-in showed — a real
+MCP server implementation has initialization cost of its own that a
+97-line hand-rolled stdio loop doesn't. Likewise, AST's sequential p50
+(35.8µs) is now *faster* than the real MCP server's (40.3µs), not
+slower, while `mcp-like-server`'s 13.1µs remains an outlier specific to
+how little work it does — it is a floor for "stdio with no framework,"
+not a representative MCP number.
 
-- **`mcp-like` wins startup and small-sequential-call latency by a wide
-  margin.** It pays no `connect()`/socket-setup cost at all — stdio pipes
-  are already open the moment the process exists — and no handshake
-  message the other two protocols require. For a short-lived,
-  spawn-once-use-once invocation (exactly how `mcp-like-server` is used
-  here, and arguably how MCP's stdio transport is used in practice), this
-  is a real, meaningful advantage.
-- **`mcp-like` collapses under concurrency**, because its stdio transport
-  fundamentally has no multi-caller model: serving N concurrent callers
-  means N separate processes, each paying the full spawn + `initialize`
-  cost again. 3630 req/s here is *that* cost dominating, not a
-  per-request protocol inefficiency — compare it to AST's 165006 req/s
-  multiplexing N requests over one already-open connection, which is
-  exactly the gap AST's design targets.
-- **Reconnect-per-call has no `mcp-like` row**, not because it's
-  unmeasured but because it's not a meaningful distinct scenario for a
-  process-per-session transport: every `mcp-like` call in the startup and
-  concurrency rows above *already* includes process-spawn cost, so
-  there's no separate "persistent vs reconnect" axis to measure the way
-  there is for a long-lived socket server.
-- **`mcp-like`'s response payloads are larger** than the request-size
-  table above suggests, because of the content-block double-encoding
-  described in `docs/AST_PROTOCOL.md`'s own "Encoded bytes" output
-  (`ast-bench`'s report prints the exact note) — a property of the
-  convention being compared against, not of this baseline's
-  implementation.
-- AST's two real advantages over the legacy protocol — large payloads
-  (16x) and concurrent multiplexing (2.2x, and a qualitatively different
-  story against `mcp-like`'s 45x) — are exactly the properties it was
-  designed for, and they're large, not marginal. AST is not universally
-  faster than either alternative; it's faster at the two things it
-  specifically trades handshake/dispatch overhead to be faster at.
+**Read honestly — this is still not a one-sided result for anyone:**
+
+- **AST and real MCP are close for sequential latency and single large
+  payloads** (35.8µs vs 40.3µs p50; 788.3µs vs 814.6µs for 512 KiB) —
+  neither dominates the other there once a real implementation is the
+  baseline. AST's actual, large advantage is concurrency and wire size.
+- **Concurrency is where the gap is enormous and exactly where AST was
+  designed for it**: 129624 req/s multiplexed on one AST connection vs
+  1707 req/s for real MCP's 20-separate-processes model — a ~76x
+  difference. This isn't a MCP inefficiency; it's structural. MCP's
+  stdio transport has no multi-caller concept at all, so N concurrent
+  callers means N process spawns, each paying full startup + handshake
+  cost again. AST's persistent, multiplexed connection is specifically
+  built to avoid exactly that cost.
+- **`mcp-like-server`'s very low sequential/startup numbers are an
+  artifact of its own minimalism**, not evidence about MCP's real
+  transport cost — useful only as a lower-bound reference ("this is
+  about as fast as stdio JSON-RPC can go with essentially no framework
+  on top"), not as a stand-in for what a real deployment measures.
+- **Encoded request size**: identical JSON-RPC request shape for both
+  MCP baselines (94 B), vs AST's 14 B — a ~6.7x difference that compounds
+  with throughput under concurrency and matters more at scale (network
+  egress, not just local IPC) than it does in a single local benchmark
+  run.
+- AST is not universally faster than real MCP; it is faster at large
+  payloads (comparable, actually slightly ahead here) and decisively
+  faster at concurrent multiplexing and wire size — exactly the
+  properties it was designed to win, not every property.
 
 ## Cross-language interoperability
 

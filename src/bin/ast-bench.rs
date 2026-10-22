@@ -1,14 +1,18 @@
 //! Reproducible benchmark: AST vs (1) this crate's own legacy JSON-Lines
-//! protocol, both over Unix Domain Sockets, and (2) `mcp-like-server`
-//! (`src/bin/mcp-like-server.rs`), a minimal, shape-faithful JSON-RPC
-//! 2.0-over-stdio baseline implementing MCP's `initialize`/`tools/list`/
-//! `tools/call` methods against the *exact same* `system.info`/
-//! `filesystem.read` tools. **`mcp-like-server` is not the official MCP
-//! reference implementation** — see its own doc comment and
+//! protocol, over Unix Domain Sockets, and two MCP baselines: (2)
+//! `mcp-server` (`src/bin/mcp-server.rs`), built on the official `rmcp`
+//! SDK (`modelcontextprotocol/rust-sdk`, pinned to `=3.6.0`) — the fair,
+//! real-protocol comparison — and (3) `mcp-like-server`
+//! (`src/bin/mcp-like-server.rs`), a minimal, hand-rolled JSON-RPC
+//! 2.0-over-stdio stand-in implementing MCP's `initialize`/`tools/list`/
+//! `tools/call` shapes by hand, kept only as a documented synthetic
+//! fallback now that a real implementation is wired in. Both MCP
+//! baselines serve the *exact same* `system.info`/`filesystem.read` tools
+//! as the other two protocols. See each binary's own doc comment and
 //! `docs/AST_PROTOCOL.md`'s "MCP comparison" section for exactly what
-//! comparing against it does and doesn't establish. All three baselines
-//! do identical work in the same run on the same machine; only transport
-//! and wire format differ.
+//! comparing against each one does and doesn't establish. All four
+//! baselines do identical work in the same run on the same machine; only
+//! transport and wire format differ.
 //!
 //! Run with: `cargo run --release --bin ast-bench`
 
@@ -244,9 +248,16 @@ impl McpLikeProc {
     }
 }
 
-async fn start_mcp_like(read_dir: &Path) -> (McpLikeProc, Duration) {
+/// Spawns `bin_name` (either `mcp-like-server`, the synthetic fallback, or
+/// `mcp-server`, the real rmcp-based baseline — both speak JSON-RPC
+/// 2.0-over-stdio with the same `tools/call` content-block shape, so one
+/// client suffices for both) and performs the real `initialize` handshake
+/// every MCP client does before any other call. Startup time includes
+/// that handshake, so the comparison against legacy/AST's own startup
+/// (which includes their equivalent handshake) stays fair.
+async fn start_mcp_proc(bin_name: &str, read_dir: &Path) -> (McpLikeProc, Duration) {
     let started = Instant::now();
-    let mut child = TokioCommand::new(sibling_bin("mcp-like-server"))
+    let mut child = TokioCommand::new(sibling_bin(bin_name))
         .arg(read_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -262,15 +273,11 @@ async fn start_mcp_like(read_dir: &Path) -> (McpLikeProc, Duration) {
         stdout,
         next_id: 1,
     };
-    // The "initialize" handshake real MCP clients perform before any
-    // other call; `mcp-like-server` requires nothing from its result, but
-    // sending it keeps this baseline's startup cost honest (a real
-    // startup-time comparison needs to include it).
     let _ = proc
         .call(
             "initialize",
             json!({
-                "protocolVersion": "2026-06-18",
+                "protocolVersion": "2026-07-28",
                 "capabilities": {},
                 "clientInfo": { "name": "ast-bench", "version": "0.1.0" }
             }),
@@ -282,8 +289,8 @@ async fn start_mcp_like(read_dir: &Path) -> (McpLikeProc, Duration) {
 
 #[tokio::main]
 async fn main() {
-    println!("# AST vs legacy JSON-Lines vs mcp-like-server — benchmark report\n");
-    println!("**`mcp-like-server` is a minimal, shape-faithful JSON-RPC 2.0-over-stdio baseline, not the official MCP reference implementation.** See `src/bin/mcp-like-server.rs`'s doc comment and `docs/AST_PROTOCOL.md`'s \"MCP comparison\" section for exactly what it does and doesn't establish.\n");
+    println!("# AST vs legacy JSON-Lines vs MCP — benchmark report\n");
+    println!("Two MCP baselines are compared: **`mcp-server`**, built on the official `rmcp` SDK (`modelcontextprotocol/rust-sdk`, pinned to `=3.6.0`) — the fair, real-protocol baseline — and **`mcp-like-server`**, a minimal, hand-rolled JSON-RPC 2.0-over-stdio stand-in kept only as a documented synthetic fallback. See `src/bin/mcp-server.rs` and `src/bin/mcp-like-server.rs`'s doc comments, and `docs/AST_PROTOCOL.md`'s \"MCP comparison\" section, for exactly what each does and doesn't establish.\n");
     print_environment();
 
     let fixture_dir = tempfile::tempdir().unwrap();
@@ -294,7 +301,9 @@ async fn main() {
     let socket_dir = tempfile::tempdir().unwrap();
     let (legacy, legacy_startup) = start_legacy(fixture_dir.path(), socket_dir.path()).await;
     let (ast, ast_startup) = start_ast(fixture_dir.path(), socket_dir.path()).await;
-    let (mut mcp, mcp_startup) = start_mcp_like(fixture_dir.path()).await;
+    let (mut mcp_real, mcp_real_startup) = start_mcp_proc("mcp-server", fixture_dir.path()).await;
+    let (mut mcp_like, mcp_like_startup) =
+        start_mcp_proc("mcp-like-server", fixture_dir.path()).await;
 
     println!("## Startup time\n");
     println!("| Server | Time to usable connection |");
@@ -308,24 +317,30 @@ async fn main() {
         ast_startup.as_secs_f64() * 1000.0
     );
     println!(
-        "| mcp-like-server (incl. `initialize`) | {:.2}ms |\n",
-        mcp_startup.as_secs_f64() * 1000.0
+        "| mcp-server (real, rmcp, incl. `initialize`) | {:.2}ms |",
+        mcp_real_startup.as_secs_f64() * 1000.0
+    );
+    println!(
+        "| mcp-like-server (synthetic, incl. `initialize`) | {:.2}ms |\n",
+        mcp_like_startup.as_secs_f64() * 1000.0
     );
 
     let legacy_sampler = ResourceSampler::start(legacy.child.id());
     let ast_sampler = ResourceSampler::start(ast.child.id());
-    let mcp_sampler = ResourceSampler::start(mcp.pid());
+    let mcp_real_sampler = ResourceSampler::start(mcp_real.pid());
+    let mcp_like_sampler = ResourceSampler::start(mcp_like.pid());
 
-    bench_sequential_health(&legacy, &ast, &mut mcp).await;
+    bench_sequential_health(&legacy, &ast, &mut mcp_real, &mut mcp_like).await;
     bench_persistent_vs_reconnect(&legacy, &ast).await;
-    bench_payload_sizes(&legacy, &ast, &mut mcp).await;
+    bench_payload_sizes(&legacy, &ast, &mut mcp_real, &mut mcp_like).await;
     bench_concurrency(&legacy, &ast, fixture_dir.path()).await;
-    bench_discover(&legacy, &ast, &mut mcp).await;
+    bench_discover(&legacy, &ast, &mut mcp_real, &mut mcp_like).await;
     print_encoded_sizes();
 
     let (legacy_peak_rss_kb, legacy_avg_cpu) = legacy_sampler.stop();
     let (ast_peak_rss_kb, ast_avg_cpu) = ast_sampler.stop();
-    let (mcp_peak_rss_kb, mcp_avg_cpu) = mcp_sampler.stop();
+    let (mcp_real_peak_rss_kb, mcp_real_avg_cpu) = mcp_real_sampler.stop();
+    let (mcp_like_peak_rss_kb, mcp_like_avg_cpu) = mcp_like_sampler.stop();
     println!(
         "\n## Resident memory and CPU (sampled every ~40ms via `ps` across the whole run above)\n"
     );
@@ -342,9 +357,14 @@ async fn main() {
         ast_avg_cpu
     );
     println!(
-        "| mcp-like-server | {:.1} MiB | {:.1}% |",
-        mcp_peak_rss_kb as f64 / 1024.0,
-        mcp_avg_cpu
+        "| mcp-server (real, rmcp) | {:.1} MiB | {:.1}% |",
+        mcp_real_peak_rss_kb as f64 / 1024.0,
+        mcp_real_avg_cpu
+    );
+    println!(
+        "| mcp-like-server (synthetic) | {:.1} MiB | {:.1}% |",
+        mcp_like_peak_rss_kb as f64 / 1024.0,
+        mcp_like_avg_cpu
     );
 
     println!("\n---\n");
@@ -382,7 +402,12 @@ fn print_environment() {
     );
 }
 
-async fn bench_sequential_health(legacy: &ServerProc, ast: &ServerProc, mcp: &mut McpLikeProc) {
+async fn bench_sequential_health(
+    legacy: &ServerProc,
+    ast: &ServerProc,
+    mcp_real: &mut McpLikeProc,
+    mcp_like: &mut McpLikeProc,
+) {
     println!("## No-op / health, sequential, persistent connection\n");
     println!("MCP has no dedicated no-op/health method in this baseline's implemented surface, so `tools/call system.info` (the cheapest real call available) stands in for it — this makes its number directly comparable to \"a round trip that does real work,\" not a true no-op, which the other two rows arguably understate relative to it for that reason.\n");
     println!("| Protocol | p50 | p95 | p99 | throughput |");
@@ -431,13 +456,30 @@ async fn bench_sequential_health(legacy: &ServerProc, ast: &ServerProc, mcp: &mu
     let started = Instant::now();
     for _ in 0..ITERATIONS {
         let t0 = Instant::now();
-        let _ = mcp.tools_call("system.info", json!({})).await;
+        let _ = mcp_real.tools_call("system.info", json!({})).await;
         samples.push(t0.elapsed());
     }
     let elapsed = started.elapsed();
     let p = percentiles(samples);
     println!(
-        "| mcp-like (JSON-RPC/stdio) | {} | {} | {} | {:.0} req/s |\n",
+        "| mcp-server (real, rmcp) | {} | {} | {} | {:.0} req/s |",
+        fmt_us(p.p50),
+        fmt_us(p.p95),
+        fmt_us(p.p99),
+        ITERATIONS as f64 / elapsed.as_secs_f64()
+    );
+
+    let mut samples = Vec::with_capacity(ITERATIONS);
+    let started = Instant::now();
+    for _ in 0..ITERATIONS {
+        let t0 = Instant::now();
+        let _ = mcp_like.tools_call("system.info", json!({})).await;
+        samples.push(t0.elapsed());
+    }
+    let elapsed = started.elapsed();
+    let p = percentiles(samples);
+    println!(
+        "| mcp-like-server (synthetic) | {} | {} | {} | {:.0} req/s |\n",
         fmt_us(p.p50),
         fmt_us(p.p95),
         fmt_us(p.p99),
@@ -507,7 +549,12 @@ async fn bench_persistent_vs_reconnect(legacy: &ServerProc, ast: &ServerProc) {
     );
 }
 
-async fn bench_payload_sizes(legacy: &ServerProc, ast: &ServerProc, mcp: &mut McpLikeProc) {
+async fn bench_payload_sizes(
+    legacy: &ServerProc,
+    ast: &ServerProc,
+    mcp_real: &mut McpLikeProc,
+    mcp_like: &mut McpLikeProc,
+) {
     println!("## Payload sizes (filesystem.read, persistent connection, sequential)\n");
     println!("| Protocol | File | p50 | p95 |");
     println!("|---|---|---|---|");
@@ -550,14 +597,29 @@ async fn bench_payload_sizes(legacy: &ServerProc, ast: &ServerProc, mcp: &mut Mc
         let mut samples = Vec::with_capacity(ITERATIONS);
         for _ in 0..ITERATIONS {
             let t0 = Instant::now();
-            let _ = mcp
+            let _ = mcp_real
                 .tools_call("filesystem.read", json!({ "path": file }))
                 .await;
             samples.push(t0.elapsed());
         }
         let p = percentiles(samples);
         println!(
-            "| mcp-like | {label} | {} | {} |",
+            "| mcp-server (real) | {label} | {} | {} |",
+            fmt_us(p.p50),
+            fmt_us(p.p95)
+        );
+
+        let mut samples = Vec::with_capacity(ITERATIONS);
+        for _ in 0..ITERATIONS {
+            let t0 = Instant::now();
+            let _ = mcp_like
+                .tools_call("filesystem.read", json!({ "path": file }))
+                .await;
+            samples.push(t0.elapsed());
+        }
+        let p = percentiles(samples);
+        println!(
+            "| mcp-like-server (synthetic) | {label} | {} | {} |",
             fmt_us(p.p50),
             fmt_us(p.p95)
         );
@@ -567,7 +629,7 @@ async fn bench_payload_sizes(legacy: &ServerProc, ast: &ServerProc, mcp: &mut Mc
 
 async fn bench_concurrency(legacy: &ServerProc, ast: &ServerProc, read_dir: &Path) {
     println!("## Concurrent requests\n");
-    println!("Legacy serves one request at a time *per connection*, so its only concurrency model is N separate connections. AST multiplexes N concurrent in-flight requests over a *single* connection; both are measured. `mcp-like-server`'s stdio transport is a single bidirectional pipe per process with no multi-client notion at all — its only way to serve N callers at once is N separate server *processes*, which is what's measured for it (process-spawn cost included, unlike the other two rows' connection-only cost).\n");
+    println!("Legacy serves one request at a time *per connection*, so its only concurrency model is N separate connections. AST multiplexes N concurrent in-flight requests over a *single* connection; both are measured. Both MCP baselines' stdio transport is a single bidirectional pipe per process with no multi-client notion at all — their only way to serve N callers at once is N separate server *processes*, which is what's measured for each (process-spawn cost included, unlike the other two rows' connection-only cost).\n");
     println!("| Protocol | Concurrency model | Total time for {CONCURRENCY} calls | Throughput |");
     println!("|---|---|---|---|");
 
@@ -640,7 +702,7 @@ async fn bench_concurrency(legacy: &ServerProc, ast: &ServerProc, read_dir: &Pat
     for _ in 0..CONCURRENCY {
         let dir = read_dir.to_path_buf();
         handles.push(tokio::spawn(async move {
-            let (mut proc, _startup) = start_mcp_like(&dir).await;
+            let (mut proc, _startup) = start_mcp_proc("mcp-server", &dir).await;
             let _ = proc.tools_call("system.info", json!({})).await;
         }));
     }
@@ -649,13 +711,37 @@ async fn bench_concurrency(legacy: &ServerProc, ast: &ServerProc, read_dir: &Pat
     }
     let elapsed = started.elapsed();
     println!(
-        "| mcp-like | {CONCURRENCY} separate processes (incl. spawn + initialize) | {:.2}ms | {:.0} req/s |\n",
+        "| mcp-server (real) | {CONCURRENCY} separate processes (incl. spawn + initialize) | {:.2}ms | {:.0} req/s |",
+        elapsed.as_secs_f64() * 1000.0,
+        CONCURRENCY as f64 / elapsed.as_secs_f64()
+    );
+
+    let started = Instant::now();
+    let mut handles = Vec::new();
+    for _ in 0..CONCURRENCY {
+        let dir = read_dir.to_path_buf();
+        handles.push(tokio::spawn(async move {
+            let (mut proc, _startup) = start_mcp_proc("mcp-like-server", &dir).await;
+            let _ = proc.tools_call("system.info", json!({})).await;
+        }));
+    }
+    for h in handles {
+        h.await.unwrap();
+    }
+    let elapsed = started.elapsed();
+    println!(
+        "| mcp-like-server (synthetic) | {CONCURRENCY} separate processes (incl. spawn + initialize) | {:.2}ms | {:.0} req/s |\n",
         elapsed.as_secs_f64() * 1000.0,
         CONCURRENCY as f64 / elapsed.as_secs_f64()
     );
 }
 
-async fn bench_discover(legacy: &ServerProc, ast: &ServerProc, mcp: &mut McpLikeProc) {
+async fn bench_discover(
+    legacy: &ServerProc,
+    ast: &ServerProc,
+    mcp_real: &mut McpLikeProc,
+    mcp_like: &mut McpLikeProc,
+) {
     println!("## Discovery\n");
     println!("| Protocol | p50 | p95 |");
     println!("|---|---|---|");
@@ -686,11 +772,28 @@ async fn bench_discover(legacy: &ServerProc, ast: &ServerProc, mcp: &mut McpLike
     let mut samples = Vec::with_capacity(ITERATIONS);
     for _ in 0..ITERATIONS {
         let t0 = Instant::now();
-        let _ = mcp.call("tools/list", json!({})).await;
+        let _ = mcp_real.call("tools/list", json!({})).await;
         samples.push(t0.elapsed());
     }
     let p = percentiles(samples);
-    println!("| mcp-like | {} | {} |\n", fmt_us(p.p50), fmt_us(p.p95));
+    println!(
+        "| mcp-server (real) | {} | {} |",
+        fmt_us(p.p50),
+        fmt_us(p.p95)
+    );
+
+    let mut samples = Vec::with_capacity(ITERATIONS);
+    for _ in 0..ITERATIONS {
+        let t0 = Instant::now();
+        let _ = mcp_like.call("tools/list", json!({})).await;
+        samples.push(t0.elapsed());
+    }
+    let p = percentiles(samples);
+    println!(
+        "| mcp-like-server (synthetic) | {} | {} |\n",
+        fmt_us(p.p50),
+        fmt_us(p.p95)
+    );
 }
 
 fn print_encoded_sizes() {
@@ -699,7 +802,7 @@ fn print_encoded_sizes() {
 
     println!("## Encoded bytes per request (computed directly, not sniffed off the wire)\n");
     println!(
-        "| Message | Legacy (JSON line incl. \\n) | AST (frame incl. header) | mcp-like (JSON-RPC line incl. \\n) |"
+        "| Message | Legacy (JSON line incl. \\n) | AST (frame incl. header) | MCP (JSON-RPC line incl. \\n — identical request shape for both `mcp-server` and `mcp-like-server`) |"
     );
     println!("|---|---|---|---|");
 
