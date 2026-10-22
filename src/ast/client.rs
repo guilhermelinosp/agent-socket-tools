@@ -217,9 +217,29 @@ impl AstClient {
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .remove(&id);
+                self.send_best_effort_cancel(id);
                 Err(AstClientError::Timeout)
             }
         }
+    }
+
+    /// Tells the server to stop working on a request this client has
+    /// given up on. Non-blocking and best-effort by design: it never
+    /// awaits the writer task, and a full or closed outgoing channel just
+    /// means the server keeps running the request, which is no worse than
+    /// before this existed.
+    fn send_best_effort_cancel(&self, target_correlation_id: u64) {
+        let Ok(payload) = codec::encode(&Cancel {
+            target_correlation_id,
+        }) else {
+            return;
+        };
+        let frame = Frame {
+            msg_type: MessageType::Cancel as u8,
+            correlation_id: self.next_correlation_id(),
+            payload,
+        };
+        let _ = self.tx.try_send(frame);
     }
 
     /// Fire-and-forget: AST's `CANCEL` has no response, by design (see
@@ -380,7 +400,10 @@ impl AstClient {
             .remove(&id);
         match result {
             Ok(outcome) => outcome,
-            Err(_elapsed) => Err(AstClientError::Timeout),
+            Err(_elapsed) => {
+                self.send_best_effort_cancel(id);
+                Err(AstClientError::Timeout)
+            }
         }
     }
 
@@ -903,6 +926,97 @@ mod tests {
             matches!(err, AstClientError::StreamTooLarge { .. }),
             "expected StreamTooLarge from actual-bytes check, got {err:?}"
         );
+
+        client.close().await;
+    }
+
+    /// A fake AST server that completes HELLO, reads the next request
+    /// frame, and then never answers it. Whatever frame arrives after
+    /// that (the test expects a CANCEL from the client's timeout) is
+    /// handed to the test through the returned oneshot receiver.
+    async fn start_silent_server_that_reports_the_next_frame() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        tokio::sync::oneshot::Receiver<(Frame, Frame)>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("silent-server.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let (report_tx, report_rx) = tokio::sync::oneshot::channel();
+
+        tokio::spawn(async move {
+            let (mut stream, _addr) = listener.accept().await.unwrap();
+
+            let hello_frame = wire::read_frame(&mut stream, FrameLimits::default())
+                .await
+                .unwrap()
+                .unwrap();
+            let ack = HelloAck {
+                protocol_version: AST_PROTOCOL_VERSION,
+                server_name: "silent-test-server".to_string(),
+                ok: true,
+                error: None,
+            };
+            wire::write_frame(
+                &mut stream,
+                &Frame {
+                    msg_type: MessageType::HelloAck as u8,
+                    correlation_id: hello_frame.correlation_id,
+                    payload: codec::encode(&ack).unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+
+            // The INVOKE: read it and deliberately say nothing back.
+            let invoke_frame = wire::read_frame(&mut stream, FrameLimits::default())
+                .await
+                .unwrap()
+                .unwrap();
+            // The next frame the client sends should be the CANCEL.
+            let next_frame = wire::read_frame(&mut stream, FrameLimits::default())
+                .await
+                .unwrap()
+                .unwrap();
+            let _ = report_tx.send((invoke_frame, next_frame));
+        });
+
+        (dir, socket_path, report_rx)
+    }
+
+    #[tokio::test]
+    async fn request_timeout_sends_a_best_effort_cancel_to_the_server() {
+        let (_dir, path, report_rx) = start_silent_server_that_reports_the_next_frame().await;
+        let config = AstClientConfig {
+            request_timeout: Duration::from_millis(100),
+            ..Default::default()
+        };
+        let client = AstClient::connect(&path, config).await.unwrap();
+
+        let err = client
+            .invoke("whatever", serde_json::json!({}), None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AstClientError::Timeout),
+            "expected Timeout, got {err:?}"
+        );
+
+        let (invoke_frame, cancel_frame) = tokio::time::timeout(Duration::from_secs(5), report_rx)
+            .await
+            .expect("server never received a frame after the INVOKE")
+            .unwrap();
+        assert_eq!(
+            MessageType::from_u8(invoke_frame.msg_type),
+            Some(MessageType::Invoke)
+        );
+        assert_eq!(
+            MessageType::from_u8(cancel_frame.msg_type),
+            Some(MessageType::Cancel),
+            "expected a CANCEL after the client timed out"
+        );
+        let cancel: Cancel = codec::decode(&cancel_frame.payload).unwrap();
+        assert_eq!(cancel.target_correlation_id, invoke_frame.correlation_id);
 
         client.close().await;
     }

@@ -652,3 +652,15 @@ run on macOS (arm64); Linux is expected to work (no platform-specific
 code in AST beyond the `cfg(target_os = ...)`-gated peer-credential
 functions, which have their own Linux branch) but has not actually been
 run there.
+
+## Known limitations
+
+- Streaming: `total_bytes` is only used for a size-ceiling check on the Rust client, which still preallocates up to `max_stream_bytes` (default 256 MiB) per in-flight stream when the server declares that much; a hostile server can therefore make a client reserve that much per concurrent stream.
+- Backpressure is bounded by frame count (the per-connection outgoing channel holds 64 frames), not bytes: with large `max_frame_bytes`, worst-case queued memory per connection is up to 64 × `max_frame_bytes`.
+- BATCH has no aggregate server-side deadline: each call honors its own deadline, so a 100-call batch can run for the sum of its calls' deadlines. The client now sends a best-effort CANCEL when its own timeout fires.
+- BATCH serializes each entry twice (once to measure the running budget, once in the final BatchResult); unmeasured, a possible CPU optimization.
+- Several buffer copies per frame on the hot path (`wire.rs` read path, chunk assembly in `filesystem_read.rs` and the client); unmeasured, candidates only if profiling shows them.
+- The legacy JSON-Lines server rescans its read buffer from the start on every 4 KiB read while looking for a newline (O(n²) in the line length, bounded by the 1 MiB default message limit).
+- `wire::read_frame` is not cancel-safe once it has consumed part of a frame; callers must treat a lost race as a reason to close the connection, never to retry the read (the idle timeout is built that way).
+- A mid-transfer failure of a genuinely streamed response is reported as a terminal ERROR, but a failure to enqueue STREAM_CHUNK/STREAM_END themselves (broken outgoing channel) is, by necessity, silent.
+- Performance claims in this document are from single runs on one machine (see "MCP comparison"); they are not statistical distributions.

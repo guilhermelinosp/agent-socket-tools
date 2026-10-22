@@ -725,17 +725,26 @@ fn spawn_invoke(
                 send_streamed_result(&tx, correlation_id, value, stream_chunk_bytes).await;
             }
             Ok(value) => {
-                let _ = send(
+                if send(
                     &tx,
                     MessageType::Result,
                     correlation_id,
                     &InvokeResult { value },
                     max_frame_len,
                 )
-                .await;
+                .await
+                .is_err()
+                {
+                    tracing::debug!(correlation_id, "response could not be delivered: the connection's outgoing channel is closed or the response failed to encode");
+                }
             }
             Err((code, message)) => {
-                let _ = send_error(&tx, correlation_id, code, &message, max_frame_len).await;
+                if send_error(&tx, correlation_id, code, &message, max_frame_len)
+                    .await
+                    .is_err()
+                {
+                    tracing::debug!(correlation_id, "response could not be delivered: the connection's outgoing channel is closed or the response failed to encode");
+                }
             }
         }
     });
@@ -1113,14 +1122,18 @@ fn spawn_batch(
             .unwrap_or_else(|p| p.into_inner())
             .remove(&correlation_id);
 
-        let _ = send(
+        if send(
             &tx,
             MessageType::BatchResult,
             correlation_id,
             &BatchResult { results },
             max_frame_len,
         )
-        .await;
+        .await
+        .is_err()
+        {
+            tracing::debug!(correlation_id, "response could not be delivered: the connection's outgoing channel is closed or the response failed to encode");
+        }
     });
 }
 
