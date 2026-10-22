@@ -3941,4 +3941,26 @@ mod tests {
         assert_eq!(pong.correlation_id, 3);
         assert_eq!(MessageType::from_u8(pong.msg_type), Some(MessageType::Pong));
     }
+
+    #[tokio::test]
+    async fn id_reuse_right_after_terminal_is_accepted_and_answered_once() {
+        let registry = registry_with(vec![Box::new(NoopTool)]);
+        let (mut client, _dir) =
+            connected_pair_with_registry(registry, ConnectionConfig::default()).await;
+        do_hello(&mut client).await;
+
+        // Each round waits for the terminal before reusing the same id, the
+        // only reuse a well-behaved client may make. Any duplicate-id ERROR
+        // would fail the round.
+        for round in 0..200 {
+            send_invoke(&mut client, 7, "system.noop", Some(5_000)).await;
+            let frame = recv_within(&mut client).await;
+            assert_eq!(
+                MessageType::from_u8(frame.msg_type),
+                Some(MessageType::Result),
+                "round {round}"
+            );
+            assert_eq!(frame.correlation_id, 7, "round {round}");
+        }
+    }
 }
