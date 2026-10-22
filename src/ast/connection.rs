@@ -13,7 +13,7 @@ use crate::ast::codec;
 use crate::ast::message::*;
 use crate::ast::peercred::{self, PeerCredentials};
 use crate::ast::wire::{self, Frame, FrameError, FrameLimits};
-use crate::tools::{ToolError, ToolRegistry};
+use crate::tools::{CancelToken, ToolError, ToolRegistry};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -1337,12 +1337,14 @@ async fn run_invoke(
     // — see the equivalent comment in `src/transport.rs` for why.
     let tool_name = invoke.tool.clone();
     let args = invoke.args;
+    let token = CancelToken::new();
+    let closure_token = token.clone();
     let task = tokio::task::spawn_blocking(move || {
         let _blocking_permit = blocking_permit; // released only when the tool returns
         let tool = registry
             .get(&tool_name)
             .expect("presence already checked before spawning");
-        tool.invoke(args)
+        tool.invoke_with_cancel(args, &closure_token)
     });
 
     // Races the deadline, explicit cancellation, and the tool actually
@@ -1351,7 +1353,9 @@ async fn run_invoke(
     // nor "cancelled" can forcibly stop a `spawn_blocking` task that's
     // already running. Both guarantee the *caller* gets an answer and the
     // in-flight slot is freed; neither guarantees the tool's own work
-    // actually stopped.
+    // actually stopped. The token is what lets a cooperative tool stop:
+    // it is set on every path where the caller is answered without the
+    // closure's own result.
     tokio::select! {
         result = task => match result {
             Ok(Ok(value)) => Ok(value),
@@ -1359,9 +1363,11 @@ async fn run_invoke(
             Err(join_err) => Err((ErrorCode::InternalError, format!("tool task panicked: {join_err}"))),
         },
         _ = tokio::time::sleep(deadline) => {
+            token.cancel();
             Err((ErrorCode::DeadlineExceeded, "the tool did not complete within the configured deadline".to_string()))
         }
         _ = cancel_notify.notified() => {
+            token.cancel();
             Err((ErrorCode::Cancelled, "the request was cancelled".to_string()))
         }
     }
@@ -3683,5 +3689,256 @@ mod tests {
             MessageType::from_u8(holder.msg_type),
             Some(MessageType::Result)
         );
+    }
+
+    /// Like `GateTool`, but cooperative: it checks the cancellation token at
+    /// every checkpoint, which here is each 5ms slice of waiting on the gate.
+    struct CoopGateTool {
+        name: &'static str,
+        started: mpsc::UnboundedSender<()>,
+        gate: Gate,
+        finished: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl Tool for CoopGateTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            "test tool that stops at its next checkpoint once cancelled"
+        }
+        fn input_schema(&self) -> JsonValue {
+            serde_json::json!({})
+        }
+        fn invoke(&self, args: JsonValue) -> Result<JsonValue, RegistryToolError> {
+            self.invoke_with_cancel(args, &CancelToken::new())
+        }
+        fn invoke_with_cancel(
+            &self,
+            _args: JsonValue,
+            cancel: &CancelToken,
+        ) -> Result<JsonValue, RegistryToolError> {
+            let _ = self.started.send(());
+            let safety = std::time::Instant::now() + Duration::from_secs(5);
+            let outcome = loop {
+                if cancel.is_cancelled() {
+                    break Err(RegistryToolError::Failed(
+                        "stopped at a checkpoint after cancellation".to_string(),
+                    ));
+                }
+                if self.gate.wait(Duration::from_millis(5)) {
+                    break Ok(serde_json::json!({"gate": "opened"}));
+                }
+                if std::time::Instant::now() >= safety {
+                    break Err(RegistryToolError::Failed("gate safety timeout".to_string()));
+                }
+            };
+            self.finished
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            outcome
+        }
+    }
+
+    fn coop_gate_tool(
+        name: &'static str,
+        gate: &Gate,
+        finished: &Arc<std::sync::atomic::AtomicBool>,
+        started: &mpsc::UnboundedSender<()>,
+    ) -> Box<dyn Tool> {
+        Box::new(CoopGateTool {
+            name,
+            started: started.clone(),
+            gate: gate.clone(),
+            finished: Arc::clone(finished),
+        })
+    }
+
+    async fn next_signal(rx: &mut mpsc::UnboundedReceiver<()>) {
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("signal not received within the safety timeout")
+            .expect("signal sender dropped");
+    }
+
+    async fn send_cancel(stream: &mut UnixStream, correlation_id: u64, target: u64) {
+        let cancel = Cancel {
+            target_correlation_id: target,
+        };
+        send_raw(
+            stream,
+            Frame {
+                msg_type: MessageType::Cancel as u8,
+                correlation_id,
+                payload: codec::encode(&cancel).unwrap(),
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn cooperative_tool_stops_on_cancel_and_releases_its_slot() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let gate = Gate::default(); // never opened: only cancellation can end the tool
+        let finished = Arc::new(AtomicBool::new(false));
+        let registry = registry_with(vec![
+            coop_gate_tool("test.coop", &gate, &finished, &started_tx),
+            Box::new(NoopTool),
+        ]);
+        let config = ConnectionConfig::default().with_max_blocking_tasks(1);
+        let slots = Arc::clone(&config.blocking_slots);
+        let (mut client, _dir) = connected_pair_with_registry(registry, config).await;
+        do_hello(&mut client).await;
+
+        send_invoke(&mut client, 1, "test.coop", Some(10_000)).await;
+        next_signal(&mut started_rx).await;
+        send_cancel(&mut client, 2, 1).await;
+
+        assert_eq!(
+            recv_error_frame(&mut client).await,
+            (1, ErrorCode::Cancelled)
+        );
+        wait_until("the cooperative tool to stop", || {
+            finished.load(Ordering::SeqCst)
+        })
+        .await;
+        wait_until("the slot to be returned", || slots.available_permits() == 1).await;
+
+        send_invoke(&mut client, 3, "system.noop", Some(5_000)).await;
+        let frame = recv_within(&mut client).await;
+        assert_eq!(frame.correlation_id, 3);
+        assert_eq!(
+            MessageType::from_u8(frame.msg_type),
+            Some(MessageType::Result)
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_cancel_yields_one_terminal() {
+        use std::sync::atomic::AtomicBool;
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let gate = Gate::default();
+        let finished = Arc::new(AtomicBool::new(false));
+        let registry = registry_with(vec![coop_gate_tool(
+            "test.coop",
+            &gate,
+            &finished,
+            &started_tx,
+        )]);
+        let (mut client, _dir) =
+            connected_pair_with_registry(registry, ConnectionConfig::default()).await;
+        do_hello(&mut client).await;
+
+        send_invoke(&mut client, 1, "test.coop", Some(10_000)).await;
+        next_signal(&mut started_rx).await;
+        for cancel_id in [2, 3, 4] {
+            send_cancel(&mut client, cancel_id, 1).await;
+        }
+
+        assert_eq!(
+            recv_error_frame(&mut client).await,
+            (1, ErrorCode::Cancelled)
+        );
+        // A second terminal for id 1 would arrive here instead of the PONG.
+        send_raw(
+            &mut client,
+            Frame {
+                msg_type: MessageType::Ping as u8,
+                correlation_id: 5,
+                payload: codec::encode(&Ping {}).unwrap(),
+            },
+        )
+        .await;
+        let pong = recv_within(&mut client).await;
+        assert_eq!(pong.correlation_id, 5);
+        assert_eq!(MessageType::from_u8(pong.msg_type), Some(MessageType::Pong));
+    }
+
+    #[tokio::test]
+    async fn cancel_one_of_several_concurrent_requests() {
+        use std::sync::atomic::AtomicBool;
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let gate = Gate::default();
+        let finished = Arc::new(AtomicBool::new(false));
+        let registry = registry_with(vec![coop_gate_tool(
+            "test.coop",
+            &gate,
+            &finished,
+            &started_tx,
+        )]);
+        let (mut client, _dir) =
+            connected_pair_with_registry(registry, ConnectionConfig::default()).await;
+        do_hello(&mut client).await;
+
+        for id in 1..=4 {
+            send_invoke(&mut client, id, "test.coop", Some(10_000)).await;
+        }
+        for _ in 0..4 {
+            next_signal(&mut started_rx).await;
+        }
+        send_cancel(&mut client, 10, 2).await;
+        assert_eq!(
+            recv_error_frame(&mut client).await,
+            (2, ErrorCode::Cancelled)
+        );
+
+        // The other three were not cancelled: release them and expect RESULTs.
+        gate.open();
+        let mut completed = Vec::new();
+        for _ in 0..3 {
+            let frame = recv_within(&mut client).await;
+            assert_eq!(
+                MessageType::from_u8(frame.msg_type),
+                Some(MessageType::Result)
+            );
+            completed.push(frame.correlation_id);
+        }
+        completed.sort_unstable();
+        assert_eq!(completed, vec![1, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn late_completion_after_cancel_sends_nothing() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let gate = Gate::default();
+        let finished = Arc::new(AtomicBool::new(false));
+        // Non-cooperative: ignores the token and only returns when released.
+        let registry = registry_with(vec![gate_tool("test.gate", &gate, &finished, &started_tx)]);
+        let (mut client, _dir) =
+            connected_pair_with_registry(registry, ConnectionConfig::default()).await;
+        do_hello(&mut client).await;
+
+        send_invoke(&mut client, 1, "test.gate", Some(10_000)).await;
+        next_signal(&mut started_rx).await;
+        send_cancel(&mut client, 2, 1).await;
+        assert_eq!(
+            recv_error_frame(&mut client).await,
+            (1, ErrorCode::Cancelled)
+        );
+
+        // The tool finishes only now, after its caller was already answered.
+        gate.open();
+        wait_until("the non-cooperative tool to finish", || {
+            finished.load(Ordering::SeqCst)
+        })
+        .await;
+        let quiet = tokio::time::timeout(Duration::from_millis(200), recv_raw(&mut client)).await;
+        assert!(
+            quiet.is_err(),
+            "a completion after cancellation must not send any frame"
+        );
+
+        send_raw(
+            &mut client,
+            Frame {
+                msg_type: MessageType::Ping as u8,
+                correlation_id: 3,
+                payload: codec::encode(&Ping {}).unwrap(),
+            },
+        )
+        .await;
+        let pong = recv_within(&mut client).await;
+        assert_eq!(pong.correlation_id, 3);
+        assert_eq!(MessageType::from_u8(pong.msg_type), Some(MessageType::Pong));
     }
 }
