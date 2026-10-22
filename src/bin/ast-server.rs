@@ -69,7 +69,7 @@ struct Cli {
 
     /// Timeout, in seconds, to receive a valid `HELLO` after a connection
     /// is accepted. A peer that doesn't send one in time is disconnected.
-    #[arg(long, default_value_t = 5)]
+    #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..))]
     handshake_timeout_secs: u64,
 
     /// Maximum time, in seconds, to wait for the *next* frame on an
@@ -77,13 +77,13 @@ struct Cli {
     /// frame received — bounds how long a connected-but-silent peer can
     /// hold a connection slot, independent of any one request's own
     /// `deadline_ms`.
-    #[arg(long, default_value_t = 300)]
+    #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..))]
     idle_timeout_secs: u64,
 
     /// Maximum time, in seconds, to write ONE frame to a peer's socket.
     /// A peer that stops reading (or drains too slowly) has its connection
     /// closed once a single frame write exceeds this.
-    #[arg(long, default_value_t = 30)]
+    #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
     write_timeout_secs: u64,
 
     /// Only accept connections from processes running as the same user as

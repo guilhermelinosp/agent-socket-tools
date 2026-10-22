@@ -112,19 +112,46 @@ def _unpack(data: bytes) -> dict[str, Any]:
     return msgpack.unpackb(data, raw=False)
 
 
+DEFAULT_MAX_STREAM_BYTES = 256 * 1024 * 1024
+_UNUSABLE_MESSAGE = "connection is unusable after a protocol failure; reconnect"
+
+
 @dataclass
 class AstClient:
-    """One AST connection. Not thread-safe; one call in flight at a time."""
+    """One AST connection. Not thread-safe; one call in flight at a time.
+
+    `timeout` bounds each socket send/receive, not the whole call. A timeout
+    or any stream protocol failure closes the connection: every later call
+    raises `AstProtocolError` and the caller must reconnect. A server
+    `ERROR` frame (`AstServerError`) leaves the connection usable.
+    """
 
     sock: socket.socket
+    timeout: float | None = 30.0
+    max_stream_bytes: int = DEFAULT_MAX_STREAM_BYTES
     _next_correlation_id: int = field(default=1, init=False)
+    _broken: bool = field(default=False, init=False)
+
+    def __post_init__(self) -> None:
+        self.sock.settimeout(self.timeout)
 
     @classmethod
-    def connect(cls, socket_path: str, client_name: str = "python-ast-client") -> "AstClient":
+    def connect(
+        cls,
+        socket_path: str,
+        client_name: str = "python-ast-client",
+        timeout: float | None = 30.0,
+        max_stream_bytes: int = DEFAULT_MAX_STREAM_BYTES,
+    ) -> "AstClient":
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.connect(socket_path)
-        client = cls(sock=sock)
-        client._hello(client_name)
+        sock.settimeout(timeout)  # also bounds connect() and the handshake
+        try:
+            sock.connect(socket_path)
+            client = cls(sock=sock, timeout=timeout, max_stream_bytes=max_stream_bytes)
+            client._hello(client_name)
+        except BaseException:
+            sock.close()
+            raise
         return client
 
     def _correlation_id(self) -> int:
@@ -132,14 +159,38 @@ class AstClient:
         self._next_correlation_id += 1
         return cid
 
+    def _break(self) -> None:
+        """Marks the connection unusable and closes it. Called after any
+        failure that may have left unread or missing frames on the wire."""
+        self._broken = True
+        self.sock.close()
+
+    def _timed_out(self, exc: BaseException) -> AstProtocolError:
+        self._break()
+        return AstProtocolError(f"timed out after {self.timeout}s waiting on the server")
+
     def _send(self, msg_type: int, correlation_id: int, payload: dict[str, Any]) -> None:
+        if self._broken:
+            raise AstProtocolError(_UNUSABLE_MESSAGE)
         frame = Frame(msg_type=msg_type, correlation_id=correlation_id, payload=_pack(payload))
-        self.sock.sendall(encode_frame(frame))
+        try:
+            self.sock.sendall(encode_frame(frame))
+        except socket.timeout as exc:
+            raise self._timed_out(exc) from exc
+
+    def _read(self) -> Frame:
+        try:
+            return read_frame(self.sock)
+        except socket.timeout as exc:
+            raise self._timed_out(exc) from exc
+        except AstProtocolError:
+            self._break()
+            raise
 
     def _request(self, msg_type: int, payload: dict[str, Any]) -> Frame:
         cid = self._correlation_id()
         self._send(msg_type, cid, payload)
-        return read_frame(self.sock)
+        return self._read()
 
     def _hello(self, client_name: str) -> None:
         frame = self._request(
@@ -199,12 +250,29 @@ class AstClient:
         cid = self._correlation_id()
         self._send(TYPE_INVOKE, cid, payload)
 
+        try:
+            return self._consume_stream(cid)
+        except AstServerError:
+            # The server ended the exchange with an ERROR frame: in sync.
+            raise
+        except (KeyError, TypeError) as exc:
+            self._break()
+            raise AstProtocolError(f"malformed stream frame: {exc!r}") from exc
+        except AstProtocolError:
+            self._break()
+            raise
+
+    def _consume_stream(self, cid: int) -> Any:
         first = self._recv_matching(cid)
         self._raise_if_error(first)
         if first.msg_type != TYPE_STREAM_START:
             raise AstProtocolError(f"expected STREAM_START, got type {first.msg_type}")
         start = _unpack(first.payload)
         declared_total = int(start["total_bytes"])
+        # Refuse before reading any chunk: the peer's declared size is the
+        # only thing that can be checked up front.
+        if declared_total > self.max_stream_bytes:
+            raise AstProtocolError("stream exceeds max_stream_bytes")
 
         encoded = bytearray()
         expected_sequence = 0
@@ -223,7 +291,10 @@ class AstClient:
                         f"arrived where {expected_sequence} was expected"
                     )
                 expected_sequence += 1
-                encoded.extend(chunk["data"])
+                data = chunk["data"]
+                if len(encoded) + len(data) > self.max_stream_bytes:
+                    raise AstProtocolError("stream exceeds max_stream_bytes")
+                encoded.extend(data)
             elif frame.msg_type == TYPE_STREAM_END:
                 # The server always sends exactly STREAM_START.total_bytes.
                 if len(encoded) != declared_total:
@@ -249,7 +320,7 @@ class AstClient:
         this just makes that assumption explicit and fails loudly rather
         than silently misattributing a frame if it's ever violated.
         """
-        frame = read_frame(self.sock)
+        frame = self._read()
         if frame.correlation_id != correlation_id:
             raise AstProtocolError(
                 f"expected a frame for correlation_id={correlation_id}, got {frame.correlation_id} "

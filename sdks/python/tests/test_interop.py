@@ -290,3 +290,72 @@ def test_mid_stream_error_raises_server_error():
             with pytest.raises(AstServerError) as exc_info:
                 client.invoke_stream("whatever")
     assert exc_info.value.code == "DEADLINE_EXCEEDED"
+
+
+def test_stream_over_cap_is_rejected_before_reading_chunks():
+    # Only STREAM_START is sent. The client must refuse on the declared size
+    # alone; if it tried to read chunks first it would block until the timeout.
+    frames = [(TYPE_STREAM_START, {"total_chunks": 1, "total_bytes": 100})]
+    with _fake_server(frames) as path:
+        with AstClient.connect(path, timeout=5.0, max_stream_bytes=10) as client:
+            started = time.monotonic()
+            with pytest.raises(AstProtocolError, match="max_stream_bytes"):
+                client.invoke_stream("whatever")
+            assert time.monotonic() - started < 2.0
+
+
+def test_client_is_unusable_after_protocol_violation():
+    frames = [
+        (TYPE_STREAM_START, {"total_chunks": 2, "total_bytes": 6}),
+        (TYPE_STREAM_CHUNK, {"sequence": 0, "data": b"abc"}),
+        (TYPE_STREAM_CHUNK, {"sequence": 2, "data": b"def"}),  # skips 1
+    ]
+    with _fake_server(frames) as path:
+        with AstClient.connect(path) as client:
+            with pytest.raises(AstProtocolError, match="stream protocol violation"):
+                client.invoke_stream("whatever")
+            with pytest.raises(AstProtocolError, match="unusable after a protocol failure"):
+                client.ping()
+
+
+def test_server_error_does_not_break_the_connection(server):
+    with AstClient.connect(str(server)) as client:
+        with pytest.raises(AstServerError):
+            client.invoke_stream("filesystem.read", {"path": "../../etc/passwd"})
+        client.ping()  # the connection is still in sync and usable
+
+
+@contextmanager
+def _silent_server():
+    """A fake AST server that accepts one connection and never writes to it."""
+    with tempfile.TemporaryDirectory() as socket_dir:
+        socket_path = os.path.join(socket_dir, "silent-ast.sock")
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(socket_path)
+        listener.listen(1)
+
+        def serve() -> None:
+            try:
+                conn, _ = listener.accept()
+                with conn:
+                    while conn.recv(4096):  # discard the client's bytes; returns on hang-up
+                        pass
+            except OSError:
+                pass
+            finally:
+                listener.close()
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        try:
+            yield socket_path
+        finally:
+            thread.join(timeout=5)
+
+
+def test_socket_timeout_raises():
+    with _silent_server() as path:
+        started = time.monotonic()
+        with pytest.raises(AstProtocolError, match="timed out"):
+            AstClient.connect(path, timeout=0.3)
+        assert time.monotonic() - started < 3.0

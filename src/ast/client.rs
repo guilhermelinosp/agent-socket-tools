@@ -573,6 +573,10 @@ impl AstClient {
     /// tasks to finish. Dropping an `AstClient` without calling this also
     /// shuts the connection down (the writer task ends once `tx` is
     /// dropped), just without waiting for it.
+    ///
+    /// Waits for every outstanding `StreamHandle` to be dropped: a task that
+    /// holds a live handle and awaits `close()` will wait forever. Drop or
+    /// finish the handle first.
     pub async fn close(self) {
         drop(self.tx);
         let _ = self.writer_task.await;

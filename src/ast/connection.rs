@@ -115,11 +115,36 @@ type Cancellations = Arc<Mutex<HashMap<u64, Arc<Notify>>>>;
 /// connection's `serve_reads` ends, for any reason (including the select
 /// in `run_connection` dropping it). `notify_one` stores a permit, so a
 /// task that reaches `.notified()` after this runs is cancelled too.
-struct CancelAllOnDrop(Cancellations);
+///
+/// The one exception is a clean EOF from the peer (a half-close): the
+/// caller `disarm`s the guard, so responses already in flight are still
+/// delivered. `run_connection` then drops its sender and waits for the
+/// writer, which drains them.
+struct CancelAllOnDrop {
+    cancellations: Cancellations,
+    armed: bool,
+}
+
+impl CancelAllOnDrop {
+    fn new(cancellations: Cancellations) -> Self {
+        Self {
+            cancellations,
+            armed: true,
+        }
+    }
+
+    /// Stops this guard from cancelling in-flight work when it is dropped.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
 
 impl Drop for CancelAllOnDrop {
     fn drop(&mut self) {
-        let map = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        if !self.armed {
+            return;
+        }
+        let map = self.cancellations.lock().unwrap_or_else(|p| p.into_inner());
         for notify in map.values() {
             notify.notify_one();
         }
@@ -346,7 +371,7 @@ async fn serve_reads(
         Arc::new(Mutex::new(Default::default()));
     let cancellations: Cancellations = Arc::new(Mutex::new(HashMap::new()));
     // Cancels all in-flight work of this connection when `serve_reads` ends.
-    let _cancel_on_drop = CancelAllOnDrop(Arc::clone(&cancellations));
+    let mut cancel_on_drop = CancelAllOnDrop::new(Arc::clone(&cancellations));
     let in_flight_limit = Arc::new(Semaphore::new(config.max_in_flight));
 
     loop {
@@ -363,7 +388,12 @@ async fn serve_reads(
 
         let frame = match read_result {
             Ok(Some(f)) => f,
-            Ok(None) => return, // clean disconnect
+            Ok(None) => {
+                // Clean EOF (possibly a half-close): keep in-flight responses
+                // so the writer can still drain them.
+                cancel_on_drop.disarm();
+                return;
+            }
             Err(FrameError::TooLarge { .. }) => {
                 let _ = send_error(
                     &tx,
@@ -880,7 +910,19 @@ async fn send_raw_streamed_result(
     cancel_notify: Arc<Notify>,
     max_frame_len: u32,
 ) {
-    let total_bytes = opened.reader.total_bytes_hint().unwrap_or(0);
+    // Clients enforce `total_bytes` exactly, so a stream whose size is
+    // unknown cannot be sent: refuse it before STREAM_START goes out.
+    let Some(total_bytes) = opened.reader.total_bytes_hint() else {
+        let _ = send_error(
+            tx,
+            correlation_id,
+            ErrorCode::InternalError,
+            "streaming tool did not report a size",
+            max_frame_len,
+        )
+        .await;
+        return;
+    };
     let total_chunks = if total_bytes == 0 {
         1
     } else {
@@ -3045,5 +3087,191 @@ mod tests {
             matches!(after, Ok(None) | Err(_)),
             "expected the connection to be closed, got another frame"
         );
+    }
+
+    #[tokio::test]
+    async fn half_close_still_delivers_in_flight_responses() {
+        let registry = registry_with(vec![Box::new(SlowTool {
+            sleep: Duration::from_millis(200),
+        })]);
+        let (mut client, _dir) =
+            connected_pair_with_registry(registry, ConnectionConfig::default()).await;
+        do_hello(&mut client).await;
+
+        let invoke = Invoke {
+            tool: "test.slow".to_string(),
+            args: serde_json::json!({}),
+            deadline_ms: Some(10_000),
+            stream: None,
+        };
+        send_raw(
+            &mut client,
+            Frame {
+                msg_type: MessageType::Invoke as u8,
+                correlation_id: 1,
+                payload: codec::encode(&invoke).unwrap(),
+            },
+        )
+        .await;
+        // Half-close: nothing more will be sent, but the response is still wanted.
+        tokio::io::AsyncWriteExt::shutdown(&mut client)
+            .await
+            .unwrap();
+
+        let resp = tokio::time::timeout(Duration::from_secs(5), recv_raw(&mut client))
+            .await
+            .expect("the in-flight response was not delivered after the half-close");
+        assert_eq!(
+            MessageType::from_u8(resp.msg_type),
+            Some(MessageType::Result)
+        );
+        assert_eq!(resp.correlation_id, 1);
+    }
+
+    #[tokio::test]
+    async fn read_error_still_cancels_in_flight_work() {
+        // The tool would answer with RESULT after 1s. A framing error must
+        // cancel it, so no RESULT may arrive before the connection closes.
+        let config = ConnectionConfig {
+            frame_limits: FrameLimits {
+                max_frame_len: 1024,
+            },
+            ..Default::default()
+        };
+        let registry = registry_with(vec![Box::new(SlowTool {
+            sleep: Duration::from_secs(1),
+        })]);
+        let (mut client, _dir) = connected_pair_with_registry(registry, config).await;
+        do_hello(&mut client).await;
+
+        let invoke = Invoke {
+            tool: "test.slow".to_string(),
+            args: serde_json::json!({}),
+            deadline_ms: Some(10_000),
+            stream: None,
+        };
+        send_raw(
+            &mut client,
+            Frame {
+                msg_type: MessageType::Invoke as u8,
+                correlation_id: 1,
+                payload: codec::encode(&invoke).unwrap(),
+            },
+        )
+        .await;
+
+        // Length prefix far above max_frame_len: a framing error, not a clean EOF.
+        let mut bytes = 10_000_000u32.to_be_bytes().to_vec();
+        bytes.extend_from_slice(&[0u8; 9]);
+        tokio::io::AsyncWriteExt::write_all(&mut client, &bytes)
+            .await
+            .unwrap();
+
+        let saw_result = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut saw_result = false;
+            while let Ok(Some(frame)) = read_frame(&mut client, FrameLimits::default()).await {
+                if MessageType::from_u8(frame.msg_type) == Some(MessageType::Result) {
+                    saw_result = true;
+                }
+            }
+            saw_result
+        })
+        .await
+        .expect("the connection did not close within 5s after the framing error");
+        assert!(
+            !saw_result,
+            "a RESULT arrived after a framing error; in-flight work was not cancelled"
+        );
+    }
+
+    /// A streaming tool that cannot report its total size.
+    struct UnsizedStreamingTool;
+    impl Tool for UnsizedStreamingTool {
+        fn name(&self) -> &str {
+            "test.unsized_stream"
+        }
+        fn description(&self) -> &str {
+            "streams without a known size, for tests"
+        }
+        fn input_schema(&self) -> JsonValue {
+            serde_json::json!({})
+        }
+        fn invoke(&self, _args: JsonValue) -> Result<JsonValue, RegistryToolError> {
+            Ok(serde_json::json!({"contents": ""}))
+        }
+        fn as_streaming(&self) -> Option<&dyn StreamingTool> {
+            Some(self)
+        }
+    }
+    impl StreamingTool for UnsizedStreamingTool {
+        fn open_stream(&self, _args: JsonValue) -> Result<StreamingToolOpen, RegistryToolError> {
+            struct UnsizedReader;
+            impl IncrementalBytes for UnsizedReader {
+                fn total_bytes_hint(&self) -> Option<u64> {
+                    None
+                }
+                fn next_chunk(
+                    &mut self,
+                    _max_len: usize,
+                ) -> Result<Option<Vec<u8>>, RegistryToolError> {
+                    Ok(None)
+                }
+            }
+            Ok(StreamingToolOpen {
+                metadata: serde_json::json!({}),
+                field_name: "contents",
+                reader: Box::new(UnsizedReader),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_tool_without_a_known_size_gets_an_error_and_the_connection_survives() {
+        let registry = registry_with(vec![Box::new(UnsizedStreamingTool)]);
+        let (mut client, _dir) =
+            connected_pair_with_registry(registry, ConnectionConfig::default()).await;
+        do_hello(&mut client).await;
+
+        let invoke = Invoke {
+            tool: "test.unsized_stream".to_string(),
+            args: serde_json::json!({}),
+            deadline_ms: Some(5_000),
+            stream: Some(true),
+        };
+        send_raw(
+            &mut client,
+            Frame {
+                msg_type: MessageType::Invoke as u8,
+                correlation_id: 1,
+                payload: codec::encode(&invoke).unwrap(),
+            },
+        )
+        .await;
+
+        // The first frame must be the ERROR: no STREAM_START with an unknown size.
+        let resp = tokio::time::timeout(Duration::from_secs(5), recv_raw(&mut client))
+            .await
+            .expect("no response to a stream without a known size");
+        assert_eq!(
+            MessageType::from_u8(resp.msg_type),
+            Some(MessageType::Error)
+        );
+        assert_eq!(resp.correlation_id, 1);
+        let err: ErrorPayload = codec::decode(&resp.payload).unwrap();
+        assert_eq!(err.code, ErrorCode::InternalError);
+        assert_eq!(err.message, "streaming tool did not report a size");
+
+        send_raw(
+            &mut client,
+            Frame {
+                msg_type: MessageType::Ping as u8,
+                correlation_id: 2,
+                payload: codec::encode(&Ping {}).unwrap(),
+            },
+        )
+        .await;
+        let pong = recv_raw(&mut client).await;
+        assert_eq!(MessageType::from_u8(pong.msg_type), Some(MessageType::Pong));
+        assert_eq!(pong.correlation_id, 2);
     }
 }

@@ -32,6 +32,13 @@ with AstClient.connect("/path/to/ast.sock") as client:
 `invoke` and `invoke_stream` return the exact same reassembled value for
 the same call — the difference is only how it travels on the wire.
 
+`AstClient.connect(path, timeout=30.0, max_stream_bytes=256 MiB)`: `timeout`
+bounds each socket send/receive (not the whole call); `max_stream_bytes` caps
+a streamed result, refused before any chunk is read when the declared size
+exceeds it. A timeout or stream protocol failure closes the connection, so
+later calls raise `AstProtocolError` until you reconnect. A server `ERROR`
+(`AstServerError`) leaves the connection usable.
+
 ## Running the interop tests
 
 These start a real, unmodified `ast-server` binary as a subprocess and
