@@ -45,6 +45,18 @@ pub struct ConnectionConfig {
     /// value — this bounds how much sequential work one slot can demand,
     /// not how many slots a batch consumes.
     pub max_batch_size: usize,
+    /// Running budget, in bytes, for a `BATCH`'s aggregate encoded
+    /// output. Checked incrementally, after each call's result is
+    /// encoded — never by accumulating every result unbounded and only
+    /// discovering the batch is too large when the whole `BatchResult`
+    /// is serialized at the end. The call that would push the running
+    /// total over this budget is reported as `ResultTooLarge` in its own
+    /// entry and the batch stops there (same early-termination shape as
+    /// a mid-batch cancellation — entries for calls that never ran are
+    /// simply absent from `results`). Defaults to `frame_limits`'s
+    /// `max_frame_len`, since that's the real ceiling a `BatchResult`
+    /// must fit under regardless of this setting.
+    pub max_batch_output_bytes: usize,
     /// Target size, in bytes, of one `STREAM_CHUNK`'s `data` when a
     /// client requests streamed delivery (`Invoke.stream: true`). The
     /// last chunk of a stream is typically smaller. Clamped down at
@@ -64,6 +76,7 @@ impl Default for ConnectionConfig {
             peer_policy: PeerPolicy::SameUid,
             server_name: "agent-socket-tools/ast".to_string(),
             max_batch_size: 100,
+            max_batch_output_bytes: FrameLimits::default().max_frame_len as usize,
             stream_chunk_bytes: 64 * 1024,
         }
     }
@@ -466,6 +479,7 @@ async fn serve_reads(
                     Arc::clone(&cancellations),
                     tx.clone(),
                     max_frame_len,
+                    config.max_batch_output_bytes,
                 );
             }
             Some(MessageType::Cancel) => {
@@ -668,6 +682,7 @@ fn spawn_batch(
     cancellations: Cancellations,
     tx: mpsc::Sender<Frame>,
     max_frame_len: u32,
+    max_batch_output_bytes: usize,
 ) {
     tokio::spawn(async move {
         let _permit = permit; // held for the whole batch's lifetime
@@ -679,7 +694,17 @@ fn spawn_batch(
         // `cancel_notify`, so a `CANCEL` targeting this batch stops
         // whichever call is currently running the same way it would stop
         // a single in-flight `INVOKE`.
+        //
+        // `encoded_bytes_so_far` tracks a running, incremental estimate of
+        // the aggregate output encoded so far (one call's result at a
+        // time) against `max_batch_output_bytes` — never by accumulating
+        // every result unbounded and discovering the batch is too large
+        // only when the whole `BatchResult` is serialized at the end.
+        // This bounds peak memory to "whatever's already in `results`
+        // plus one more call's result," not "every result the batch ever
+        // produces."
         let mut results = Vec::with_capacity(batch.calls.len());
+        let mut encoded_bytes_so_far: usize = 0;
         for call in batch.calls {
             let id = call.id;
             let invoke = Invoke {
@@ -706,13 +731,38 @@ fn spawn_batch(
             .await;
             let was_cancelled = matches!(outcome, Err((ErrorCode::Cancelled, _)));
 
-            results.push(BatchResultEntry {
+            let mut entry = BatchResultEntry {
                 id,
                 outcome: match outcome {
                     Ok(value) => BatchOutcome::Ok { value },
                     Err((code, message)) => BatchOutcome::Error { code, message },
                 },
-            });
+            };
+
+            // Measure this one entry's own encoded size and check it
+            // against the remaining budget *before* committing it to
+            // `results` — the entry that would tip the running total
+            // over the budget is replaced with a small `ResultTooLarge`
+            // error in its own slot (not silently dropped: the caller
+            // needs to know this `id` was attempted, not merely
+            // "never ran" like a call after cancellation or budget
+            // exhaustion would be).
+            let entry_bytes = codec::encode(&entry).map(|b| b.len()).unwrap_or(0);
+            let exceeds_budget =
+                encoded_bytes_so_far.saturating_add(entry_bytes) > max_batch_output_bytes;
+            if exceeds_budget {
+                entry = BatchResultEntry {
+                    id,
+                    outcome: BatchOutcome::Error {
+                        code: ErrorCode::ResultTooLarge,
+                        message: "this call's result, combined with the batch's prior results, exceeded the configured aggregate output budget".to_string(),
+                    },
+                };
+                results.push(entry);
+                break;
+            }
+            encoded_bytes_so_far += entry_bytes;
+            results.push(entry);
 
             if was_cancelled {
                 // Stop processing the rest of the batch; the entries that
@@ -1780,5 +1830,65 @@ mod tests {
             effective_stream_chunk_bytes(1024, wire::DEFAULT_MAX_FRAME_LEN),
             1024
         );
+    }
+
+    #[tokio::test]
+    async fn batch_output_budget_is_checked_per_call_not_after_full_accumulation() {
+        // Each call's result is ~1000 bytes; a budget of 1500 lets the
+        // first succeed but not the second — proving the server checks
+        // incrementally (one result's worth of slack) rather than
+        // accumulating every call's result unbounded and only rejecting
+        // the whole batch after serializing it all at the end.
+        let registry = registry_with(vec![Box::new(BigResultTool { result_bytes: 1000 })]);
+        let config = ConnectionConfig {
+            max_batch_output_bytes: 1500,
+            ..Default::default()
+        };
+        let (mut client, _dir) = connected_pair_with_registry(registry, config).await;
+        do_hello(&mut client).await;
+
+        let batch = Batch {
+            calls: (0..3)
+                .map(|id| BatchInvoke {
+                    id,
+                    tool: "test.big_result".to_string(),
+                    args: serde_json::json!({}),
+                    deadline_ms: None,
+                })
+                .collect(),
+        };
+        send_raw(
+            &mut client,
+            Frame {
+                msg_type: MessageType::Batch as u8,
+                correlation_id: 1,
+                payload: codec::encode(&batch).unwrap(),
+            },
+        )
+        .await;
+
+        let resp = recv_raw(&mut client).await;
+        assert_eq!(
+            MessageType::from_u8(resp.msg_type),
+            Some(MessageType::BatchResult),
+            "the batch as a whole must not be rejected outright — only the offending entry"
+        );
+        let result: BatchResult = codec::decode(&resp.payload).unwrap();
+
+        // Exactly 2 entries: call 0 (succeeded) and call 1 (tipped the
+        // budget over, reported as ResultTooLarge in its own slot). Call
+        // 2 never ran — absent from results, same as a mid-batch
+        // cancellation.
+        assert_eq!(result.results.len(), 2);
+        assert_eq!(result.results[0].id, 0);
+        assert!(matches!(result.results[0].outcome, BatchOutcome::Ok { .. }));
+        assert_eq!(result.results[1].id, 1);
+        assert!(matches!(
+            result.results[1].outcome,
+            BatchOutcome::Error {
+                code: ErrorCode::ResultTooLarge,
+                ..
+            }
+        ));
     }
 }

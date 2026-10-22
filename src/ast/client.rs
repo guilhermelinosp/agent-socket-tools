@@ -43,6 +43,13 @@ pub enum AstClientError {
     Server { code: ErrorCode, message: String },
     #[error("unexpected response message type: {0}")]
     UnexpectedResponseType(u8),
+    #[error(
+        "streamed result of {declared_or_received} bytes exceeds this client's configured max_stream_bytes ({limit})"
+    )]
+    StreamTooLarge {
+        declared_or_received: u64,
+        limit: usize,
+    },
 }
 
 type Waiters = Arc<Mutex<HashMap<u64, oneshot::Sender<Frame>>>>;
@@ -61,6 +68,7 @@ pub struct AstClient {
     stream_waiters: StreamWaiters,
     next_id: AtomicU64,
     default_timeout: Duration,
+    max_stream_bytes: usize,
     writer_task: JoinHandle<()>,
     reader_task: JoinHandle<()>,
 }
@@ -69,6 +77,16 @@ pub struct AstClientConfig {
     pub client_name: String,
     pub frame_limits: FrameLimits,
     pub request_timeout: Duration,
+    /// Hard ceiling on a streamed `INVOKE`'s total size, checked against
+    /// `StreamStart.total_bytes` *before* this client preallocates any
+    /// buffer sized to it — that field is a server-supplied,
+    /// untrusted number; without this ceiling, a malicious or buggy
+    /// server could declare an arbitrarily large value and force a huge
+    /// allocation before a single byte of real data arrives. Also
+    /// enforced against the *actual* cumulative bytes received (not just
+    /// the declared total), since nothing requires a server's chunks to
+    /// match what it declared. Default: 256 MiB.
+    pub max_stream_bytes: usize,
 }
 
 impl Default for AstClientConfig {
@@ -77,6 +95,7 @@ impl Default for AstClientConfig {
             client_name: "ast-client-sdk".to_string(),
             frame_limits: FrameLimits::default(),
             request_timeout: Duration::from_secs(10),
+            max_stream_bytes: 256 * 1024 * 1024,
         }
     }
 }
@@ -148,6 +167,7 @@ impl AstClient {
             stream_waiters,
             next_id: AtomicU64::new(1),
             default_timeout: config.request_timeout,
+            max_stream_bytes: config.max_stream_bytes,
             writer_task,
             reader_task,
         };
@@ -371,12 +391,31 @@ impl AstClient {
             Some(MessageType::Error) => Err(self.decode_server_error(&first.payload)?),
             Some(MessageType::StreamStart) => {
                 let start: StreamStart = codec::decode(&first.payload)?;
+                // `total_bytes` is server-supplied and untrusted — reject
+                // outright, before allocating anything sized to it,
+                // rather than trusting it for `Vec::with_capacity`.
+                if start.total_bytes > self.max_stream_bytes as u64 {
+                    return Err(AstClientError::StreamTooLarge {
+                        declared_or_received: start.total_bytes,
+                        limit: self.max_stream_bytes,
+                    });
+                }
                 let mut encoded = Vec::with_capacity(start.total_bytes as usize);
                 loop {
                     let frame = srx.recv().await.ok_or(AstClientError::Closed)?;
                     match MessageType::from_u8(frame.msg_type) {
                         Some(MessageType::StreamChunk) => {
                             let chunk: StreamChunk = codec::decode(&frame.payload)?;
+                            // Also bound *actual* received bytes against
+                            // the same ceiling — nothing requires a
+                            // server's chunks to add up to what
+                            // `StreamStart` declared.
+                            if encoded.len() + chunk.data.len() > self.max_stream_bytes {
+                                return Err(AstClientError::StreamTooLarge {
+                                    declared_or_received: (encoded.len() + chunk.data.len()) as u64,
+                                    limit: self.max_stream_bytes,
+                                });
+                            }
                             encoded.extend_from_slice(&chunk.data);
                         }
                         Some(MessageType::StreamEnd) => break,
@@ -592,6 +631,138 @@ mod tests {
                 ..
             }
         ));
+
+        client.close().await;
+    }
+
+    /// A fake AST server that performs a real HELLO handshake and then
+    /// sends whatever raw frames the test gives it for the next INVOKE —
+    /// used to simulate a malicious or buggy peer that lies about stream
+    /// sizes, something the real `ast-server` would never do but that a
+    /// defensive client still has to handle.
+    async fn start_lying_stream_server(
+        reply_frames: Vec<(MessageType, Vec<u8>)>,
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("lying-server.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+
+        tokio::spawn(async move {
+            let (mut stream, _addr) = listener.accept().await.unwrap();
+
+            let hello_frame = wire::read_frame(&mut stream, FrameLimits::default())
+                .await
+                .unwrap()
+                .unwrap();
+            let ack = HelloAck {
+                protocol_version: AST_PROTOCOL_VERSION,
+                server_name: "lying-test-server".to_string(),
+                ok: true,
+                error: None,
+            };
+            wire::write_frame(
+                &mut stream,
+                &Frame {
+                    msg_type: MessageType::HelloAck as u8,
+                    correlation_id: hello_frame.correlation_id,
+                    payload: codec::encode(&ack).unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+
+            let invoke_frame = wire::read_frame(&mut stream, FrameLimits::default())
+                .await
+                .unwrap()
+                .unwrap();
+            for (msg_type, payload) in reply_frames {
+                wire::write_frame(
+                    &mut stream,
+                    &Frame {
+                        msg_type: msg_type as u8,
+                        correlation_id: invoke_frame.correlation_id,
+                        payload,
+                    },
+                )
+                .await
+                .unwrap();
+            }
+
+            // Keep the connection open until the client is done with it.
+            let mut buf = [0u8; 1];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+        });
+
+        (dir, socket_path)
+    }
+
+    #[tokio::test]
+    async fn invoke_stream_rejects_a_server_declared_total_bytes_over_the_configured_limit() {
+        let (_dir, path) = start_lying_stream_server(vec![(
+            MessageType::StreamStart,
+            codec::encode(&StreamStart {
+                total_chunks: 1,
+                total_bytes: 10 * 1024 * 1024 * 1024, // 10 GiB — absurd for a test payload
+            })
+            .unwrap(),
+        )])
+        .await;
+
+        let config = AstClientConfig {
+            max_stream_bytes: 1024, // 1 KiB — the lying server's claim blows past this
+            ..Default::default()
+        };
+        let client = AstClient::connect(&path, config).await.unwrap();
+
+        let err = client
+            .invoke_stream("whatever", serde_json::json!({}), None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AstClientError::StreamTooLarge { .. }),
+            "expected StreamTooLarge, got {err:?}"
+        );
+
+        client.close().await;
+    }
+
+    #[tokio::test]
+    async fn invoke_stream_rejects_actual_bytes_received_over_the_limit_even_if_declared_total_was_small(
+    ) {
+        let oversized_chunk = StreamChunk {
+            sequence: 0,
+            data: vec![0u8; 2048], // bigger than max_stream_bytes below
+        };
+        let (_dir, path) = start_lying_stream_server(vec![
+            (
+                MessageType::StreamStart,
+                codec::encode(&StreamStart {
+                    total_chunks: 1,
+                    total_bytes: 10, // lies small, to get past the first check
+                })
+                .unwrap(),
+            ),
+            (
+                MessageType::StreamChunk,
+                codec::encode(&oversized_chunk).unwrap(),
+            ),
+        ])
+        .await;
+
+        let config = AstClientConfig {
+            max_stream_bytes: 1024,
+            ..Default::default()
+        };
+        let client = AstClient::connect(&path, config).await.unwrap();
+
+        let err = client
+            .invoke_stream("whatever", serde_json::json!({}), None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AstClientError::StreamTooLarge { .. }),
+            "expected StreamTooLarge from actual-bytes check, got {err:?}"
+        );
 
         client.close().await;
     }

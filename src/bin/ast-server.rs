@@ -54,6 +54,13 @@ struct Cli {
     #[arg(long, default_value_t = 100)]
     max_batch_size: usize,
 
+    /// Running budget, in bytes, for a BATCH's aggregate encoded output,
+    /// checked incrementally per call rather than after serializing the
+    /// whole response. Defaults to `--max-frame-bytes`, since that's the
+    /// real ceiling a BATCH_RESULT must fit under regardless.
+    #[arg(long)]
+    max_batch_output_bytes: Option<usize>,
+
     /// Target size, in bytes, of one `STREAM_CHUNK` when a client
     /// requests streamed delivery (`INVOKE`'s `stream: true`). Clamped
     /// down automatically if it wouldn't fit under `--max-frame-bytes`.
@@ -120,6 +127,9 @@ async fn main() -> std::process::ExitCode {
         },
         server_name: "agent-socket-tools/ast".to_string(),
         max_batch_size: cli.max_batch_size,
+        max_batch_output_bytes: cli
+            .max_batch_output_bytes
+            .unwrap_or(cli.max_frame_bytes as usize),
         stream_chunk_bytes: cli.stream_chunk_bytes,
     };
 
