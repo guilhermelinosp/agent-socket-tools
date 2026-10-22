@@ -1,14 +1,20 @@
-use super::{IncrementalBytes, StreamingTool, StreamingToolOpen, Tool, ToolError};
+use super::{CancelToken, IncrementalBytes, StreamingTool, StreamingToolOpen, Tool, ToolError};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::io::Read;
-use std::os::unix::fs::OpenOptionsExt;
+use std::ffi::CString;
+use std::fs::File;
+use std::io::{self, Read};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 
 /// Caps how much of a file `invoke` (the non-streaming path) reads into
 /// memory at once, to bound server memory use regardless of the on-disk
 /// file size.
 const MAX_READ_BYTES: u64 = 1024 * 1024; // 1 MiB
+
+/// Block size for the bounded read loop in `invoke`, so cancellation is
+/// checked at least once per 64 KiB rather than only once per file.
+const READ_BLOCK_BYTES: usize = 64 * 1024;
 
 /// Caps how much of a file `open_stream` (the genuine-incremental path)
 /// will stream, total. Much larger than `MAX_READ_BYTES` because the
@@ -28,119 +34,216 @@ struct Args {
 
 /// Reads a UTF-8 text file from inside a single authorized base directory.
 ///
-/// The base directory is fixed at construction time by the server operator,
-/// never by the client. Every request path is resolved to an absolute,
-/// symlink-free path and checked against that base directory before any
-/// data is read, which also rejects a symlink *inside* the base directory
-/// that points *outside* it: such a symlink canonicalizes to a path outside
-/// the base directory and is rejected the same way a literal `../`
-/// traversal would be.
+/// The base directory is opened once, at construction, as a file descriptor
+/// that the struct keeps for its whole lifetime. Every later open is
+/// relative to that descriptor (`openat`), one path component at a time,
+/// with `O_NOFOLLOW` on every component. The client's path is never handed
+/// to a path-based syscall, so there is no canonicalize-then-open window.
 ///
-/// ## TOCTOU
+/// Request rules, enforced before any filesystem access:
 ///
-/// There is an unavoidable gap between resolving/validating a path and
-/// acting on it: `resolve` canonicalizes and checks the path, and the
-/// filesystem can change between that check and the subsequent `open`.
-/// This implementation narrows, but does not eliminate, that window:
+/// - empty, absolute, NUL-containing, or any `..` component is refused;
+/// - `.` and empty components (`a//b`) are ignored;
+/// - any symlink in the requested path is refused, including one that
+///   points inside the base directory (a deliberate, documented rule);
+/// - FIFOs, sockets and devices are refused without blocking (`O_NONBLOCK`
+///   on the final open, then a regular-file check on the descriptor).
 ///
-/// - The final `open` uses `O_NOFOLLOW`, so if something replaces the
-///   target *file itself* with a symlink in that window, the open fails
-///   outright instead of silently following the symlink to an
-///   unauthorized location.
-/// - Size and file-type checks are read from the already-open file
-///   descriptor's metadata (`fstat`), not from a second, path-based `stat`
-///   call, which removes the separate TOCTOU window that a path-based
-///   check-then-open-then-check-again pattern would have.
+/// ## Residual risks (not solved by this server)
 ///
-/// What this does **not** protect against: `O_NOFOLLOW` only covers the
-/// path's final component. An attacker who can rename or relink
-/// *intermediate directories* inside the authorized tree between
-/// canonicalization and `open` could still redirect where the open
-/// ultimately lands — there is no portable (Linux+macOS) equivalent of
-/// Linux's `openat2(RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH)` available here
-/// without a Linux-only dependency, which this project avoids per its
-/// "no unnecessary dependencies" / "keep Linux and macOS compatible"
-/// constraints. The threat model this crate assumes is: the authorized
-/// base directory tree is not being concurrently modified by an untrusted
-/// actor while the server is running. If that assumption doesn't hold in
-/// your deployment, don't point `--read-dir` at a directory writable by
-/// anyone other than whoever runs the server.
+/// - **Hardlinks.** A hardlink inside the tree to a file outside it is
+///   indistinguishable from a regular file; the server cannot detect it.
+///   Whoever can write into the tree already controls what it exposes.
+/// - **Mounts.** A bind mount or other mount point inside the tree is
+///   followed; `O_NOFOLLOW` only refuses symlinks, not mount crossings.
+/// - **Same-UID processes.** A process running as the same user can read
+///   the same files directly and can also talk to the socket. The security
+///   boundary is the UID, not this tool.
 pub struct FilesystemReadTool {
-    /// Canonicalized once at construction; `invoke` never re-reads this from
-    /// the filesystem to avoid any race on the base directory itself.
-    base_dir: PathBuf,
+    /// Descriptor for the canonicalized base directory, opened once at
+    /// construction. All request resolution starts from this descriptor.
+    /// The base path itself is not stored: nothing reads it after
+    /// construction, and keeping it would only be dead state.
+    base_fd: OwnedFd,
 }
 
 impl FilesystemReadTool {
-    /// Fails if `base_dir` does not exist or cannot be canonicalized.
-    pub fn new(base_dir: impl AsRef<Path>) -> std::io::Result<Self> {
+    /// Fails if `base_dir` does not exist, cannot be canonicalized, or is
+    /// not a directory.
+    pub fn new(base_dir: impl AsRef<Path>) -> io::Result<Self> {
         let base_dir = base_dir.as_ref().canonicalize()?;
-        Ok(Self { base_dir })
+        let base_file = File::open(&base_dir)?;
+        if !base_file.metadata()?.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "base path is not a directory",
+            ));
+        }
+        Ok(Self {
+            base_fd: base_file.into(),
+        })
     }
 
-    fn resolve(&self, requested: &str) -> Result<PathBuf, ToolError> {
-        if requested.is_empty() {
-            return Err(ToolError::InvalidArgs("path must not be empty".into()));
-        }
-        let candidate = if Path::new(requested).is_absolute() {
-            PathBuf::from(requested)
-        } else {
-            self.base_dir.join(requested)
-        };
+    /// Opens the requested path relative to the base descriptor, one
+    /// component at a time, refusing symlinks and special files. Returns
+    /// the open regular file, its path relative to the base directory, and
+    /// its size from the descriptor's own metadata.
+    fn open_validated(&self, args: Value) -> Result<(File, PathBuf, u64), ToolError> {
+        let args: Args =
+            serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
+        let requested = args.path.as_str();
 
-        let canonical = candidate.canonicalize().map_err(|_| {
+        let components = split_request(requested)?;
+        let (last, dirs) = components
+            .split_last()
+            .ok_or_else(|| ToolError::Unauthorized("path must name a file".into()))?;
+
+        let not_found = || {
             ToolError::Failed(format!(
                 "cannot read {requested:?}: not found or inaccessible"
             ))
-        })?;
+        };
 
-        if !canonical.starts_with(&self.base_dir) {
-            return Err(ToolError::Unauthorized(format!(
-                "{requested:?} resolves outside the authorized base directory"
-            )));
+        // Walk the intermediate directories. Each step opens a directory
+        // with O_DIRECTORY|O_NOFOLLOW relative to the previous one, and the
+        // previous descriptor is dropped as soon as the next one exists.
+        let mut dir = self
+            .base_fd
+            .try_clone()
+            .map_err(|e| ToolError::Failed(format!("descriptor clone failed: {e}")))?;
+        for comp in dirs {
+            let name = to_cstring(comp)?;
+            dir = match openat_nofollow(
+                dir.as_fd(),
+                &name,
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+            ) {
+                Ok(fd) => fd,
+                Err(e) => match e.raw_os_error() {
+                    Some(libc::ELOOP) => return Err(symlink_refused()),
+                    Some(libc::ENOTDIR) => {
+                        // Either a symlink (some platforms report ENOTDIR for
+                        // O_DIRECTORY|O_NOFOLLOW on one) or a plain file in a
+                        // directory position. Re-open without O_DIRECTORY to
+                        // tell them apart; a symlink reports ELOOP here.
+                        // O_NONBLOCK keeps a FIFO from blocking this probe.
+                        match openat_nofollow(
+                            dir.as_fd(),
+                            &name,
+                            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+                        ) {
+                            Err(e2) if e2.raw_os_error() == Some(libc::ELOOP) => {
+                                return Err(symlink_refused());
+                            }
+                            _ => return Err(not_found()),
+                        }
+                    }
+                    Some(libc::ENOENT) => return Err(not_found()),
+                    Some(libc::EACCES) => {
+                        return Err(ToolError::Failed("permission denied".into()))
+                    }
+                    _ => return Err(ToolError::Failed("open failed".into())),
+                },
+            };
         }
 
-        Ok(canonical)
-    }
+        // Final component: O_NONBLOCK so opening a FIFO, socket, or device
+        // returns instead of blocking. The regular-file check below runs on
+        // the descriptor, and for a regular file O_NONBLOCK has no effect on
+        // reads, so it is left set.
+        let name = to_cstring(last)?;
+        let fd = match openat_nofollow(
+            dir.as_fd(),
+            &name,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        ) {
+            Ok(fd) => fd,
+            Err(e) => {
+                return Err(match e.raw_os_error() {
+                    Some(libc::ELOOP) => symlink_refused(),
+                    Some(libc::ENOENT) | Some(libc::ENOTDIR) => not_found(),
+                    Some(libc::EACCES) => ToolError::Failed("permission denied".into()),
+                    _ => ToolError::Failed("open failed".into()),
+                })
+            }
+        };
 
-    /// Resolves, opens (`O_NOFOLLOW`), and `fstat`s the requested file —
-    /// every authorization/validation step `invoke` and `open_stream`
-    /// both need, with no size cap applied yet (each caller enforces its
-    /// own, different, limit). Returns the open file, its path relative
-    /// to the base directory (for the result's `path` field), and its
-    /// size from the file descriptor's own metadata.
-    fn open_validated(&self, args: Value) -> Result<(std::fs::File, PathBuf, u64), ToolError> {
-        let args: Args =
-            serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
-
-        let resolved = self.resolve(&args.path)?;
-
-        // `O_NOFOLLOW`: if the final path component was swapped for a
-        // symlink after `resolve`'s canonicalization but before this open,
-        // fail loudly (ELOOP) instead of transparently following it
-        // somewhere unauthorized. See the TOCTOU note on this struct.
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&resolved)
-            .map_err(|e| ToolError::Failed(format!("open failed: {e}")))?;
-
-        // Checked on the already-open descriptor (`fstat`), not via a
-        // second path-based `stat`, so there's no separate race between
-        // this check and the read below.
+        let file = File::from(fd);
         let metadata = file
             .metadata()
-            .map_err(|e| ToolError::Failed(format!("stat failed: {e}")))?;
+            .map_err(|_| ToolError::Failed("stat failed".into()))?;
         if !metadata.is_file() {
             return Err(ToolError::Failed("not a regular file".into()));
         }
 
-        let relative = resolved
-            .strip_prefix(&self.base_dir)
-            .unwrap_or(&resolved)
-            .to_path_buf();
+        let relative = PathBuf::from(components.join("/"));
         Ok((file, relative, metadata.len()))
     }
+}
+
+/// Splits a client-supplied path into normal components. Refuses empty
+/// paths, absolute paths, NUL bytes, and any `..`. Error messages contain
+/// only the client's own text or a generic phrase, never host paths.
+fn split_request(requested: &str) -> Result<Vec<&str>, ToolError> {
+    if requested.is_empty() {
+        return Err(ToolError::Unauthorized("path must not be empty".into()));
+    }
+    if requested.starts_with('/') {
+        return Err(ToolError::Unauthorized(
+            "absolute paths are not allowed".into(),
+        ));
+    }
+    if requested.contains('\0') {
+        return Err(ToolError::Unauthorized("path contains a NUL byte".into()));
+    }
+    let mut components = Vec::new();
+    for comp in requested.split('/') {
+        match comp {
+            "" | "." => continue,
+            ".." => {
+                return Err(ToolError::Unauthorized(
+                    "path traversal (`..`) is not allowed".into(),
+                ))
+            }
+            other => components.push(other),
+        }
+    }
+    if components.is_empty() {
+        return Err(ToolError::Unauthorized("path must name a file".into()));
+    }
+    Ok(components)
+}
+
+fn to_cstring(component: &str) -> Result<std::ffi::CString, ToolError> {
+    CString::new(component.as_bytes())
+        .map_err(|_| ToolError::Unauthorized("path contains a NUL byte".into()))
+}
+
+fn symlink_refused() -> ToolError {
+    ToolError::Unauthorized("symbolic links are not allowed".into())
+}
+
+/// Opens `name` relative to `dirfd` with the caller's flags. The only FFI
+/// call in this module.
+fn openat_nofollow(
+    dirfd: BorrowedFd<'_>,
+    name: &CString,
+    flags: libc::c_int,
+) -> io::Result<OwnedFd> {
+    // SAFETY: `dirfd` is a live descriptor borrowed for the duration of this
+    // call, so its raw value is valid. `name` is a NUL-terminated CString,
+    // so its pointer is valid for reads up to its terminator. `openat` with
+    // no O_CREAT takes no mode argument, so no variadic argument is read.
+    // The return value is checked before use. A non-negative result is a
+    // fresh descriptor owned by nothing else, and it is wrapped in OwnedFd
+    // immediately below so it is closed exactly once.
+    let fd = unsafe { libc::openat(dirfd.as_raw_fd(), name.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` was just returned by a successful `openat` and is not
+    // owned by anything else, so ownership transfers to this OwnedFd once.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 impl Tool for FilesystemReadTool {
@@ -167,16 +270,18 @@ impl Tool for FilesystemReadTool {
     }
 
     fn invoke(&self, args: Value) -> Result<Value, ToolError> {
-        let (mut file, relative, size) = self.open_validated(args)?;
+        self.invoke_with_cancel(args, &CancelToken::new())
+    }
+
+    fn invoke_with_cancel(&self, args: Value, cancel: &CancelToken) -> Result<Value, ToolError> {
+        let (file, relative, size) = self.open_validated(args)?;
         if size > MAX_READ_BYTES {
             return Err(ToolError::Failed(format!(
                 "file exceeds the {MAX_READ_BYTES}-byte read limit"
             )));
         }
 
-        let mut bytes = Vec::with_capacity(size as usize);
-        file.read_to_end(&mut bytes)
-            .map_err(|e| ToolError::Failed(format!("read failed: {e}")))?;
+        let bytes = read_capped(file, MAX_READ_BYTES, cancel)?;
         let contents = String::from_utf8(bytes)
             .map_err(|_| ToolError::Failed("file is not valid UTF-8".into()))?;
 
@@ -214,6 +319,35 @@ impl StreamingTool for FilesystemReadTool {
             }),
         })
     }
+}
+
+/// Reads at most `limit` bytes from `file` in `READ_BLOCK_BYTES` blocks,
+/// checking `cancel` before each block.
+///
+/// The reader is wrapped in `take(limit + 1)`, so a file that grows after
+/// its `fstat` still cannot push the read past `limit`. One byte over is
+/// enough to prove the file grew, and that is reported as an error rather
+/// than returned as truncated content.
+fn read_capped(file: File, limit: u64, cancel: &CancelToken) -> Result<Vec<u8>, ToolError> {
+    let mut reader = file.take(limit + 1);
+    let mut out = Vec::new();
+    let mut block = vec![0u8; READ_BLOCK_BYTES];
+    loop {
+        if cancel.is_cancelled() {
+            return Err(ToolError::Failed("cancelled".into()));
+        }
+        let n = match reader.read(&mut block) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(ToolError::Failed(format!("read failed: {e}"))),
+        };
+        out.extend_from_slice(&block[..n]);
+        if out.len() as u64 > limit {
+            return Err(ToolError::Failed("file grew beyond the size limit".into()));
+        }
+    }
+    Ok(out)
 }
 
 /// Reads a file's bytes incrementally, validating UTF-8 *across* chunk
@@ -352,13 +486,15 @@ mod tests {
     }
 
     #[test]
-    fn accepts_absolute_path_inside_base_dir() {
+    fn rejects_absolute_path_even_inside_base_dir() {
+        // Behavior change: absolute paths are refused outright now, even
+        // when they point inside the base directory. Previously accepted.
         let (dir, tool) = tool_with_fixture();
         let absolute = dir.path().canonicalize().unwrap().join("hello.txt");
-        let result = tool
+        let err = tool
             .invoke(json!({"path": absolute.to_str().unwrap()}))
-            .unwrap();
-        assert_eq!(result["contents"], "hello world\n");
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Unauthorized(_)));
     }
 
     #[test]
@@ -569,5 +705,176 @@ mod tests {
 
         let err = tool.open_stream(json!({"path": "huge.bin"})).unwrap_err();
         assert!(matches!(err, ToolError::Failed(_)));
+    }
+
+    #[test]
+    fn rejects_an_intermediate_symlink_directory() {
+        // `d` points at another directory that is INSIDE the base. Still
+        // refused: every symlink in the requested path is a rejection.
+        let (dir, tool) = tool_with_fixture();
+        symlink(dir.path().join("sub"), dir.path().join("d")).unwrap();
+
+        let err = tool.invoke(json!({"path": "d/nested.txt"})).unwrap_err();
+        assert!(matches!(err, ToolError::Unauthorized(_)));
+    }
+
+    #[test]
+    fn rejects_dotdot_absolute_nul_and_empty_paths() {
+        let (_dir, tool) = tool_with_fixture();
+        for bad in [
+            "",
+            "/etc/hosts",
+            "a/../hello.txt",
+            "../hello.txt",
+            "hello\0.txt",
+        ] {
+            let err = tool.invoke(json!({"path": bad})).unwrap_err();
+            assert!(
+                matches!(err, ToolError::Unauthorized(_)),
+                "{bad:?} should be Unauthorized, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn current_and_empty_components_are_ignored() {
+        let (_dir, tool) = tool_with_fixture();
+        let result = tool.invoke(json!({"path": "./sub//nested.txt"})).unwrap();
+        assert_eq!(result["contents"], "nested\n");
+        assert_eq!(result["path"], "sub/nested.txt");
+    }
+
+    #[test]
+    fn rejects_a_final_symlink_even_when_it_points_inside() {
+        let (dir, tool) = tool_with_fixture();
+        symlink(dir.path().join("hello.txt"), dir.path().join("alias.txt")).unwrap();
+
+        let err = tool.invoke(json!({"path": "alias.txt"})).unwrap_err();
+        assert!(matches!(err, ToolError::Unauthorized(_)));
+    }
+
+    #[test]
+    fn a_fifo_in_the_tree_is_rejected_without_blocking() {
+        // A FIFO with no writer would block a plain open forever. Run the
+        // call on a worker thread and bound the wait, so a regression fails
+        // this test instead of hanging the suite.
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let (dir, tool) = tool_with_fixture();
+        let fifo = dir.path().join("pipe");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo binary must be available");
+        assert!(status.success());
+
+        let (tx, rx) = mpsc::channel();
+        let started = Instant::now();
+        std::thread::spawn(move || {
+            let result = tool.invoke(json!({"path": "pipe"}));
+            let _ = tx.send(result.map(|_| ()));
+        });
+
+        let outcome = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("invoke on a FIFO must return instead of blocking");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(matches!(outcome, Err(ToolError::Failed(_))));
+    }
+
+    #[test]
+    fn error_messages_do_not_contain_the_host_base_path() {
+        let (dir, tool) = tool_with_fixture();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("s.txt"), "s").unwrap();
+        symlink(outside.path().join("s.txt"), dir.path().join("link.txt")).unwrap();
+
+        let base = dir.path().to_string_lossy().into_owned();
+        let requests = [
+            json!({"path": "../x"}),
+            json!({"path": "link.txt"}),
+            json!({"path": "nope.txt"}),
+            json!({"path": "sub/missing.txt"}),
+        ];
+        for req in requests {
+            let err = tool.invoke(req.clone()).unwrap_err();
+            let text = err.to_string();
+            assert!(!text.contains(&base), "{req} leaked the base path: {text}");
+        }
+    }
+
+    #[test]
+    fn cancelled_token_stops_the_read() {
+        let (dir, tool) = tool_with_fixture();
+        fs::write(dir.path().join("big.txt"), vec![b'a'; 1024 * 1024]).unwrap();
+
+        let token = CancelToken::new();
+        token.cancel();
+        let err = tool
+            .invoke_with_cancel(json!({"path": "big.txt"}), &token)
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Failed(ref m) if m == "cancelled"));
+    }
+
+    /// Race test. It can only FAIL if the defect exists: a secret outside
+    /// the base could appear in a successful result only if an intermediate
+    /// directory were followed out of the tree. With the correct
+    /// implementation no interleaving can produce that, so it never fails
+    /// spuriously. The test is probabilistic only in the sense that the
+    /// swapping may or may not land inside a given `openat` window, so a
+    /// pass does not prove absence; it bounds the search. Errors from the
+    /// tool are expected and fine. It takes about 1.5 s and always ends.
+    #[test]
+    fn swapping_an_intermediate_directory_never_leaks_outside_content() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().join("base");
+        let d = base.join("d");
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join("f.txt"), "inside").unwrap();
+        let outside = root.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("f.txt"), "SECRET-OUTSIDE").unwrap();
+        let tool = FilesystemReadTool::new(&base).unwrap();
+
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let mut flip = false;
+                while !stop.load(Ordering::Relaxed) {
+                    // `remove_dir_all` unlinks a symlink without following it.
+                    let _ = fs::remove_dir_all(&d);
+                    if flip {
+                        let _ = symlink(&outside, &d);
+                    } else {
+                        let _ = fs::create_dir(&d);
+                        // Write only into a REAL directory, never through a
+                        // symlink, so the outside secret is never overwritten.
+                        if fs::symlink_metadata(&d)
+                            .map(|m| m.is_dir())
+                            .unwrap_or(false)
+                        {
+                            let _ = fs::write(d.join("f.txt"), "inside");
+                        }
+                    }
+                    flip = !flip;
+                }
+            });
+
+            let deadline = Instant::now() + Duration::from_millis(1500);
+            while Instant::now() < deadline {
+                if let Ok(value) = tool.invoke(json!({"path": "d/f.txt"})) {
+                    let contents = value["contents"].as_str().unwrap_or_default();
+                    assert!(
+                        !contents.contains("SECRET-OUTSIDE"),
+                        "read escaped the base directory"
+                    );
+                }
+            }
+            stop.store(true, Ordering::Relaxed);
+        });
     }
 }
