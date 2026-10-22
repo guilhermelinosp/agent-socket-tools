@@ -421,6 +421,9 @@ impl AstClient {
                             encoded.extend_from_slice(&chunk.data);
                         }
                         Some(MessageType::StreamEnd) => break,
+                        Some(MessageType::Error) => {
+                            return Err(self.decode_server_error(&frame.payload)?)
+                        }
                         _ => return Err(AstClientError::UnexpectedResponseType(frame.msg_type)),
                     }
                 }
@@ -816,6 +819,48 @@ mod tests {
             matches!(err, AstClientError::StreamTooLarge { .. }),
             "expected StreamTooLarge, got {err:?}"
         );
+
+        client.close().await;
+    }
+
+    #[tokio::test]
+    async fn invoke_stream_surfaces_a_mid_stream_error_as_a_server_error() {
+        let (_dir, path) = start_lying_stream_server(vec![
+            (
+                MessageType::StreamStart,
+                codec::encode(&StreamStart {
+                    total_chunks: 2,
+                    total_bytes: 20,
+                    raw: None,
+                })
+                .unwrap(),
+            ),
+            (
+                MessageType::Error,
+                codec::encode(&ErrorPayload {
+                    code: ErrorCode::DeadlineExceeded,
+                    message: "simulated mid-stream failure".to_string(),
+                })
+                .unwrap(),
+            ),
+        ])
+        .await;
+
+        let client = AstClient::connect(&path, AstClientConfig::default())
+            .await
+            .unwrap();
+
+        let err = client
+            .invoke_stream("whatever", serde_json::json!({}), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AstClientError::Server {
+                code: ErrorCode::DeadlineExceeded,
+                ..
+            }
+        ));
 
         client.close().await;
     }

@@ -661,9 +661,16 @@ fn spawn_invoke(
                 .deadline_ms
                 .map(Duration::from_millis)
                 .unwrap_or(default_deadline);
+            let started = Instant::now();
 
-            let opened =
-                run_invoke_streaming(invoke, registry, deadline, Arc::clone(&cancel_notify)).await;
+            let opened = run_invoke_streaming(
+                invoke,
+                registry,
+                deadline,
+                started,
+                Arc::clone(&cancel_notify),
+            )
+            .await;
             match opened {
                 Ok(opened) => {
                     send_raw_streamed_result(
@@ -672,7 +679,9 @@ fn spawn_invoke(
                         opened,
                         stream_chunk_bytes,
                         deadline,
+                        started,
                         cancel_notify,
+                        max_frame_len,
                     )
                     .await;
                 }
@@ -740,6 +749,7 @@ async fn run_invoke_streaming(
     invoke: Invoke,
     registry: Arc<ToolRegistry>,
     deadline: Duration,
+    started: Instant,
     cancel_notify: Arc<Notify>,
 ) -> Result<crate::tools::StreamingToolOpen, (ErrorCode, String)> {
     let Some(_tool) = registry.get(&invoke.tool) else {
@@ -767,7 +777,7 @@ async fn run_invoke_streaming(
             Ok(Err(tool_err)) => Err(tool_error_to_code(tool_err)),
             Err(join_err) => Err((ErrorCode::InternalError, format!("tool task panicked: {join_err}"))),
         },
-        _ = tokio::time::sleep(deadline) => {
+        _ = tokio::time::sleep(deadline.saturating_sub(started.elapsed())) => {
             Err((ErrorCode::DeadlineExceeded, "the tool did not complete within the configured deadline".to_string()))
         }
         _ = cancel_notify.notified() => {
@@ -784,23 +794,28 @@ async fn run_invoke_streaming(
 /// regardless of its total size.
 ///
 /// Deadline and cancellation are raced on every single chunk read, not
-/// just once up front — but once `STREAM_START` has gone out, there is no
-/// way to retract it: a deadline or cancellation firing mid-transfer
-/// simply stops sending further frames (no `STREAM_END`, no error frame)
-/// rather than retroactively reporting `DeadlineExceeded`/`Cancelled` for
-/// a response shape already committed to. The client's own overall
-/// timeout on `invoke_stream` eventually surfaces this as
-/// `AstClientError::Timeout` — a known, documented limitation, not an
-/// oversight: there is no way to un-send `STREAM_START` once it's out.
+/// just once up front. Once `STREAM_START` has gone out there is no
+/// way to retract it, but a mid-transfer failure (deadline, cancellation,
+/// a panicked reader task, or the tool's own incremental read failing)
+/// now sends a terminal `ERROR` frame with this stream's own
+/// correlation_id instead of silently stopping — the client finds out
+/// immediately, rather than only after its own overall timeout on the
+/// call eventually fires.
+///
+/// `started` is the same clock `run_invoke_streaming` was given, so the
+/// open step and the chunk-reading step share one `deadline` budget
+/// rather than each getting a fresh one.
+#[allow(clippy::too_many_arguments)]
 async fn send_raw_streamed_result(
     tx: &mpsc::Sender<Frame>,
     correlation_id: u64,
     opened: crate::tools::StreamingToolOpen,
     chunk_bytes: usize,
     deadline: Duration,
+    started: Instant,
     cancel_notify: Arc<Notify>,
+    max_frame_len: u32,
 ) {
-    let started = Instant::now();
     let total_bytes = opened.reader.total_bytes_hint().unwrap_or(0);
     let total_chunks = if total_bytes == 0 {
         1
@@ -832,7 +847,15 @@ async fn send_raw_streamed_result(
     loop {
         let remaining = deadline.saturating_sub(started.elapsed());
         if remaining.is_zero() {
-            return; // deadline exceeded — see this fn's doc comment
+            let _ = send_error(
+                tx,
+                correlation_id,
+                ErrorCode::DeadlineExceeded,
+                "the tool did not complete within the configured deadline",
+                max_frame_len,
+            )
+            .await;
+            return;
         }
 
         let read_task = tokio::task::spawn_blocking(move || {
@@ -843,10 +866,40 @@ async fn send_raw_streamed_result(
         let (returned_reader, chunk_result) = tokio::select! {
             result = read_task => match result {
                 Ok(pair) => pair,
-                Err(_join_err) => return, // reader task panicked — nothing more to send
+                Err(join_err) => {
+                    let _ = send_error(
+                        tx,
+                        correlation_id,
+                        ErrorCode::InternalError,
+                        &format!("the streaming reader task panicked: {join_err}"),
+                        max_frame_len,
+                    )
+                    .await;
+                    return;
+                }
             },
-            _ = tokio::time::sleep(remaining) => return, // deadline exceeded — see this fn's doc comment
-            _ = cancel_notify.notified() => return, // cancelled — see this fn's doc comment
+            _ = tokio::time::sleep(remaining) => {
+                let _ = send_error(
+                    tx,
+                    correlation_id,
+                    ErrorCode::DeadlineExceeded,
+                    "the tool did not complete within the configured deadline",
+                    max_frame_len,
+                )
+                .await;
+                return;
+            }
+            _ = cancel_notify.notified() => {
+                let _ = send_error(
+                    tx,
+                    correlation_id,
+                    ErrorCode::Cancelled,
+                    "the request was cancelled",
+                    max_frame_len,
+                )
+                .await;
+                return;
+            }
         };
         reader = returned_reader;
 
@@ -865,8 +918,12 @@ async fn send_raw_streamed_result(
                 }
                 sequence += 1;
             }
-            Ok(None) => break,        // exhausted
-            Err(_tool_err) => return, // can't retroactively report this — see this fn's doc comment
+            Ok(None) => break, // exhausted
+            Err(tool_err) => {
+                let (code, message) = tool_error_to_code(tool_err);
+                let _ = send_error(tx, correlation_id, code, &message, max_frame_len).await;
+                return;
+            }
         }
     }
 
@@ -1196,9 +1253,72 @@ async fn send_error(
 mod tests {
     use super::*;
     use crate::ast::wire::read_frame;
-    use crate::tools::{FilesystemReadTool, SystemInfoTool, Tool, ToolError as RegistryToolError};
+    use crate::tools::{
+        FilesystemReadTool, IncrementalBytes, StreamingTool, StreamingToolOpen, SystemInfoTool,
+        Tool, ToolError as RegistryToolError,
+    };
     use serde_json::Value as JsonValue;
     use tokio::net::UnixListener;
+
+    /// A test-only tool whose `open_stream` itself takes a configurable
+    /// amount of time before returning, and whose reader takes its own
+    /// configurable time on the first chunk read. Lets the test prove the
+    /// open step and the chunk-reading step share one `deadline` budget,
+    /// which an always-fast open (like `FilesystemReadTool`) cannot.
+    struct SlowOpenStreamingTool {
+        open_delay: Duration,
+        chunk_delay: Duration,
+    }
+    impl Tool for SlowOpenStreamingTool {
+        fn name(&self) -> &str {
+            "test.slow_open_stream"
+        }
+        fn description(&self) -> &str {
+            "a streaming tool whose open and first read are artificially slow, for tests"
+        }
+        fn input_schema(&self) -> JsonValue {
+            serde_json::json!({})
+        }
+        fn invoke(&self, _args: JsonValue) -> Result<JsonValue, RegistryToolError> {
+            Ok(serde_json::json!({"contents": ""}))
+        }
+        fn as_streaming(&self) -> Option<&dyn StreamingTool> {
+            Some(self)
+        }
+    }
+    impl StreamingTool for SlowOpenStreamingTool {
+        fn open_stream(&self, _args: JsonValue) -> Result<StreamingToolOpen, RegistryToolError> {
+            std::thread::sleep(self.open_delay);
+            struct SlowOneChunkReader {
+                chunk_delay: Duration,
+                delivered: bool,
+            }
+            impl IncrementalBytes for SlowOneChunkReader {
+                fn total_bytes_hint(&self) -> Option<u64> {
+                    Some(1)
+                }
+                fn next_chunk(
+                    &mut self,
+                    _max_len: usize,
+                ) -> Result<Option<Vec<u8>>, RegistryToolError> {
+                    if self.delivered {
+                        return Ok(None);
+                    }
+                    std::thread::sleep(self.chunk_delay);
+                    self.delivered = true;
+                    Ok(Some(b"x".to_vec()))
+                }
+            }
+            Ok(StreamingToolOpen {
+                metadata: serde_json::json!({}),
+                field_name: "contents",
+                reader: Box::new(SlowOneChunkReader {
+                    chunk_delay: self.chunk_delay,
+                    delivered: false,
+                }),
+            })
+        }
+    }
 
     /// A test-only tool that blocks the calling (blocking-pool) thread for
     /// a configurable duration, so deadline/cancellation paths have
@@ -1315,6 +1435,153 @@ mod tests {
             registry.register(tool);
         }
         Arc::new(registry)
+    }
+
+    #[tokio::test]
+    async fn genuine_stream_deadline_covers_open_and_chunk_reading_as_one_shared_budget() {
+        // open_stream takes ~150ms; the first chunk read takes ~180ms;
+        // deadline_ms is 200. With one shared budget the open eats 150ms,
+        // leaving ~50ms for the read, so the read is cut off and the client
+        // gets a terminal ERROR at ~200ms. If each phase instead got a fresh
+        // 200ms (the bug), the read would finish at ~330ms with a normal
+        // STREAM_END — so both the frame type and the timing discriminate.
+        let registry = registry_with(vec![Box::new(SlowOpenStreamingTool {
+            open_delay: Duration::from_millis(50),
+            chunk_delay: Duration::from_millis(400),
+        })]);
+        let (mut client, _dir) =
+            connected_pair_with_registry(registry, ConnectionConfig::default()).await;
+        do_hello(&mut client).await;
+
+        let invoke = Invoke {
+            tool: "test.slow_open_stream".to_string(),
+            args: serde_json::json!({}),
+            deadline_ms: Some(200),
+            stream: Some(true),
+        };
+        let sent_at = std::time::Instant::now();
+        send_raw(
+            &mut client,
+            Frame {
+                msg_type: MessageType::Invoke as u8,
+                correlation_id: 1,
+                payload: codec::encode(&invoke).unwrap(),
+            },
+        )
+        .await;
+
+        let start_frame = recv_raw(&mut client).await;
+        assert_eq!(
+            MessageType::from_u8(start_frame.msg_type),
+            Some(MessageType::StreamStart)
+        );
+
+        let terminal = tokio::time::timeout(Duration::from_millis(1000), recv_raw(&mut client))
+            .await
+            .expect("a terminal frame must arrive well before the test's own timeout");
+        let elapsed = sent_at.elapsed();
+        assert_eq!(
+            MessageType::from_u8(terminal.msg_type),
+            Some(MessageType::Error),
+            "the open and read phases must share one 200ms budget: the read should be \
+             cut off by the deadline, not complete with STREAM_END ({elapsed:?} elapsed)"
+        );
+        assert!(
+            elapsed < Duration::from_millis(300),
+            "terminal frame took {elapsed:?} since the request was sent — the open and \
+             chunk-reading phases are not sharing one deadline budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn genuine_stream_deadline_exceeded_mid_transfer_sends_a_terminal_error() {
+        // A reader whose first next_chunk() call blocks past the
+        // deadline — proves a mid-transfer deadline now sends a real
+        // ERROR frame instead of just going silent.
+        struct ForeverPendingReader;
+        impl IncrementalBytes for ForeverPendingReader {
+            fn total_bytes_hint(&self) -> Option<u64> {
+                Some(1)
+            }
+            fn next_chunk(
+                &mut self,
+                _max_len: usize,
+            ) -> Result<Option<Vec<u8>>, RegistryToolError> {
+                std::thread::sleep(Duration::from_secs(2));
+                Ok(None)
+            }
+        }
+        struct ForeverPendingTool;
+        impl Tool for ForeverPendingTool {
+            fn name(&self) -> &str {
+                "test.forever_pending_stream"
+            }
+            fn description(&self) -> &str {
+                "a streaming tool whose first chunk read never returns in time, for tests"
+            }
+            fn input_schema(&self) -> JsonValue {
+                serde_json::json!({})
+            }
+            fn invoke(&self, _args: JsonValue) -> Result<JsonValue, RegistryToolError> {
+                Ok(serde_json::json!({"contents": ""}))
+            }
+            fn as_streaming(&self) -> Option<&dyn StreamingTool> {
+                Some(self)
+            }
+        }
+        impl StreamingTool for ForeverPendingTool {
+            fn open_stream(
+                &self,
+                _args: JsonValue,
+            ) -> Result<StreamingToolOpen, RegistryToolError> {
+                Ok(StreamingToolOpen {
+                    metadata: serde_json::json!({}),
+                    field_name: "contents",
+                    reader: Box::new(ForeverPendingReader),
+                })
+            }
+        }
+
+        let registry = registry_with(vec![Box::new(ForeverPendingTool)]);
+        let (mut client, _dir) =
+            connected_pair_with_registry(registry, ConnectionConfig::default()).await;
+        do_hello(&mut client).await;
+
+        let invoke = Invoke {
+            tool: "test.forever_pending_stream".to_string(),
+            args: serde_json::json!({}),
+            deadline_ms: Some(100),
+            stream: Some(true),
+        };
+        send_raw(
+            &mut client,
+            Frame {
+                msg_type: MessageType::Invoke as u8,
+                correlation_id: 1,
+                payload: codec::encode(&invoke).unwrap(),
+            },
+        )
+        .await;
+
+        let start_frame = tokio::time::timeout(Duration::from_secs(2), recv_raw(&mut client))
+            .await
+            .expect("must receive STREAM_START promptly");
+        assert_eq!(
+            MessageType::from_u8(start_frame.msg_type),
+            Some(MessageType::StreamStart)
+        );
+
+        let resp = tokio::time::timeout(Duration::from_secs(2), recv_raw(&mut client))
+            .await
+            .expect("must receive a terminal frame, not hang until this test's own timeout");
+        assert_eq!(
+            MessageType::from_u8(resp.msg_type),
+            Some(MessageType::Error),
+            "a mid-transfer deadline must send a terminal ERROR frame, not silently stop"
+        );
+        assert_eq!(resp.correlation_id, 1);
+        let err: ErrorPayload = codec::decode(&resp.payload).unwrap();
+        assert_eq!(err.code, ErrorCode::DeadlineExceeded);
     }
 
     #[tokio::test]
