@@ -46,9 +46,13 @@ until the client disconnects.
 
 ## Installing / building
 
-Requires a stable Rust toolchain (1.75+; developed against 1.99). No other
-system dependencies — this targets macOS and Linux via `tokio::net::UnixDomainSocket`
-and does not build on Windows.
+Requires a stable Rust toolchain. Built and tested against **1.99.1** on
+macOS (arm64); no lower bound has actually been verified against older
+toolchains, so treat 1.99.1 as the only confirmed-working version rather
+than inferring an MSRV from it. No other system dependencies — this targets
+macOS and Linux via `tokio::net::UnixListener` and does not build on
+Windows. Only tested on macOS so far; Linux should work (no platform-specific
+code beyond what `tokio` itself handles), but hasn't been run there.
 
 ```bash
 cargo build --release
@@ -125,7 +129,13 @@ operations, and error codes.
   directory that points outside it.
 - There is no shell/command execution tool in this MVP, by design.
 - Messages are capped at `--max-message-bytes` (default 1 MiB) before a
-  newline is even found, so a client can't force unbounded buffering.
+  newline is even found, so a client can't force unbounded buffering. This
+  is a *transport*-level cap on one JSON line (request or response); it is
+  separate from `filesystem.read`'s own 1 MiB file-size cap
+  (`MAX_READ_BYTES`, hard-coded, not currently exposed as a CLI flag). The
+  two happen to share a default value today, but changing
+  `--max-message-bytes` does not change how much of a file `filesystem.read`
+  will return.
 - Every tool invocation runs under `--request-timeout-secs` (default 10s).
   Note: for a tool that is already blocking on blocking I/O, this timeout
   bounds how long the *caller* waits — it cannot forcibly preempt a
