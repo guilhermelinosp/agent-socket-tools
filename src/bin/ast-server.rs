@@ -100,6 +100,13 @@ struct Cli {
     #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
     write_timeout_secs: u64,
 
+    /// On SIGINT/SIGTERM, how long, in seconds, to wait for open connections
+    /// to finish after their in-flight requests are cancelled. Connections
+    /// still open when it elapses are abandoned, and so are tool executions
+    /// still running on blocking threads.
+    #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..))]
+    shutdown_grace_secs: u64,
+
     /// Only accept connections from processes running as the same user as
     /// this server, checked via `SO_PEERCRED` (Linux) / `LOCAL_PEERCRED`
     /// (macOS) — independent of, and in addition to, the socket file's
@@ -144,7 +151,12 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
-    runtime.block_on(run(cli))
+    let code = runtime.block_on(run(cli));
+    // Do not wait for tool executions still running on blocking threads:
+    // the shutdown grace period has already ended, and they are abandoned
+    // along with the process. Dropping a runtime would otherwise block on them.
+    runtime.shutdown_background();
+    code
 }
 
 async fn run(cli: Cli) -> std::process::ExitCode {
@@ -170,7 +182,9 @@ async fn run(cli: Cli) -> std::process::ExitCode {
         }
     };
 
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let config = ConnectionConfig {
+        shutdown: shutdown_rx,
         frame_limits: agent_socket_tools::ast::wire::FrameLimits {
             max_frame_len: cli.max_frame_bytes,
         },
@@ -205,7 +219,15 @@ async fn run(cli: Cli) -> std::process::ExitCode {
         "ast-server listening"
     );
 
-    run_until_shutdown(listener, registry, config, cli.max_connections).await;
+    run_until_shutdown(
+        listener,
+        registry,
+        config,
+        cli.max_connections,
+        shutdown_tx,
+        Duration::from_secs(cli.shutdown_grace_secs),
+    )
+    .await;
 
     tracing::info!("ast-server shut down");
     std::process::ExitCode::SUCCESS
@@ -216,13 +238,19 @@ async fn run_until_shutdown(
     registry: Arc<ToolRegistry>,
     config: ConnectionConfig,
     max_connections: usize,
+    shutdown: tokio::sync::watch::Sender<bool>,
+    grace: Duration,
 ) {
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .expect("failed to install SIGTERM handler");
     let limiter = agent_socket_tools::transport::ConnectionLimiter::new(max_connections);
+    let mut connections = tokio::task::JoinSet::new();
 
     loop {
         tokio::select! {
+            // Reaps finished connections so the set does not grow for the
+            // lifetime of the server.
+            Some(_) = connections.join_next(), if !connections.is_empty() => {}
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, _addr)) => {
@@ -230,7 +258,7 @@ async fn run_until_shutdown(
                             Some(permit) => {
                                 let registry = Arc::clone(&registry);
                                 let config = config.clone();
-                                tokio::spawn(async move {
+                                connections.spawn(async move {
                                     let _permit = permit;
                                     run_connection(stream, registry, config).await;
                                 });
@@ -263,5 +291,25 @@ async fn run_until_shutdown(
                 break;
             }
         }
+    }
+
+    // Stop accepting (dropping the listener also removes the socket file),
+    // then signal every connection to cancel its in-flight work and close.
+    drop(listener);
+    shutdown.send_replace(true);
+    tracing::info!(
+        open_connections = connections.len(),
+        ?grace,
+        "draining open connections"
+    );
+    let drained = tokio::time::timeout(grace, async {
+        while connections.join_next().await.is_some() {}
+    })
+    .await;
+    if drained.is_err() {
+        tracing::warn!(
+            remaining = connections.len(),
+            "grace period elapsed; abandoning connections still open"
+        );
     }
 }

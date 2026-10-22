@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::BufReader;
 use tokio::net::UnixStream;
-use tokio::sync::{mpsc, Notify, Semaphore};
+use tokio::sync::{mpsc, watch, Notify, Semaphore};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerPolicy {
@@ -101,6 +101,11 @@ pub struct ConnectionConfig {
     /// instead of starting. Shared by every connection cloned from this
     /// config; see [`ConnectionConfig::with_max_blocking_tasks`].
     pub blocking_slots: Arc<Semaphore>,
+    /// Server shutdown signal. Once the value becomes `true`, every
+    /// connection stops reading, cancels its in-flight requests, and closes
+    /// after their terminal frames are written. A config whose sender was
+    /// dropped without signalling (the `Default` one) never shuts down.
+    pub shutdown: watch::Receiver<bool>,
 }
 
 /// Default number of tool executions allowed to run at once, server-wide.
@@ -132,6 +137,22 @@ impl Default for ConnectionConfig {
             write_timeout: Duration::from_secs(30),
             max_deadline: Duration::from_secs(60),
             blocking_slots: Arc::new(Semaphore::new(DEFAULT_MAX_BLOCKING_TASKS)),
+            // The sender is dropped here on purpose: `wait_for_shutdown`
+            // treats a closed channel as "never shuts down".
+            shutdown: watch::channel(false).1,
+        }
+    }
+}
+
+/// Resolves once `rx` carries `true`. If the sender is dropped without ever
+/// signalling, this never resolves: that is not a shutdown request.
+async fn wait_for_shutdown(rx: &mut watch::Receiver<bool>) {
+    loop {
+        if *rx.borrow_and_update() {
+            return;
+        }
+        if rx.changed().await.is_err() {
+            std::future::pending::<()>().await;
         }
     }
 }
@@ -415,6 +436,7 @@ async fn serve_reads(
     // Cancels all in-flight work of this connection when `serve_reads` ends.
     let mut cancel_on_drop = CancelAllOnDrop::new(Arc::clone(&cancellations));
     let in_flight_limit = Arc::new(Semaphore::new(config.max_in_flight));
+    let mut shutdown = config.shutdown.clone();
 
     loop {
         let read_result = tokio::select! {
@@ -424,6 +446,13 @@ async fn serve_reads(
                     idle_timeout = ?config.idle_timeout,
                     "closing connection: no frame received within the idle timeout"
                 );
+                return;
+            }
+            _ = wait_for_shutdown(&mut shutdown) => {
+                // Returning like a connection error: the armed guard cancels
+                // every in-flight request, each sends its terminal frame, and
+                // the writer drains them before the connection closes.
+                tracing::debug!("closing connection: server is shutting down");
                 return;
             }
         };
@@ -4040,5 +4069,49 @@ mod tests {
             Some(MessageType::Result)
         );
         wait_until("the slot to be returned", || slots.available_permits() == 1).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_signal_cancels_in_flight_requests_and_closes_cleanly() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let gate = Gate::default(); // never opened: only shutdown can end the tool
+        let finished = Arc::new(AtomicBool::new(false));
+        let registry = registry_with(vec![coop_gate_tool(
+            "test.coop",
+            &gate,
+            &finished,
+            &started_tx,
+        )]);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let config = ConnectionConfig {
+            shutdown: shutdown_rx,
+            ..Default::default()
+        };
+        let (mut client, _dir) = connected_pair_with_registry(registry, config).await;
+        do_hello(&mut client).await;
+
+        send_invoke(&mut client, 1, "test.coop", Some(10_000)).await;
+        next_signal(&mut started_rx).await;
+
+        shutdown_tx.send(true).unwrap();
+        assert_eq!(
+            recv_error_frame(&mut client).await,
+            (1, ErrorCode::Cancelled)
+        );
+
+        // After its terminal frame the connection closes: a clean EOF, not a hang.
+        let after = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_frame(&mut client, FrameLimits::default()),
+        )
+        .await
+        .expect("connection did not close after shutdown")
+        .expect("read after shutdown failed");
+        assert!(after.is_none(), "expected EOF after the terminal frame");
+        wait_until("the cooperative tool to stop", || {
+            finished.load(Ordering::SeqCst)
+        })
+        .await;
     }
 }
