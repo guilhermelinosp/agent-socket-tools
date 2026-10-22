@@ -23,6 +23,12 @@ Both share the same `Tool` trait, registry, and tool implementations
 differ. The rest of this README covers the original protocol in detail;
 see `docs/AST_PROTOCOL.md` for AST's equivalent.
 
+A minimal Python client for AST also lives here —
+**[`sdks/python/`](sdks/python/)** — verifying that `docs/AST_PROTOCOL.md`
+is actually sufficient to implement a conforming client in a second
+language, by running its tests against the real, unmodified
+`ast-server` binary.
+
 ## Why
 
 MCP is a general-purpose protocol for agent/tool integration, with its own

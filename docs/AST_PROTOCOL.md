@@ -8,10 +8,9 @@ for why both exist.
 **Status: implemented and tested in this repository only.** No second,
 independent implementation exists yet. Per this document's own standard
 (see [Cross-language interoperability](#cross-language-interoperability)),
-that means cross-language compatibility is a documented *goal*, not a
-verified *fact* — nothing here should be read as "any language can talk
-to this today," only "any language *should be able to*, given this spec
-and the test vectors below."
+cross-language compatibility is now a **verified fact for one other
+language (Python)**, not just a documented goal — see that section for
+exactly what's been checked and what hasn't.
 
 ## Transport
 
@@ -468,13 +467,29 @@ This document, plus [Framing](#framing), [Serialization](#serialization),
 and the [test vectors](#test-vectors) below, are meant to be sufficient
 to implement an AST client or server in any language with a MessagePack
 library and Unix domain socket support — which is to say, essentially
-any mainstream language. **That claim is unverified.** Only one
-implementation (this crate's own, in Rust) exists. Per this document's
-own standard: cross-language compatibility becomes a verified fact only
-once a second, independent implementation exchanges real messages with
-this one using the vectors below (or new ones derived the same way), not
-before. If you implement one, the test vectors are the right starting
-point to validate against before attempting a live connection.
+any mainstream language.
+
+**This is now verified for one other language.** `sdks/python/` is a
+minimal, synchronous Python client (stdlib `socket` + `msgpack`, no
+other dependencies) implementing `HELLO`/`PING`/`DISCOVER`/`INVOKE`/
+`CANCEL`/`BATCH` from this spec alone. `sdks/python/tests/test_interop.py`
+spawns the real, unmodified `ast-server` binary as a subprocess and
+drives it entirely through that Python client — not a mock of the
+server, not a second Rust process pretending to be a different
+language. Every scenario the Rust integration tests cover for these
+message types also passes from Python: handshake, ping, discovery,
+successful and failing invokes, path-traversal rejection, and batched
+calls with mixed success/failure correlated by id. This is run in CI
+(see `.github/workflows/ci.yml`'s `python-interop` job) on every push,
+so it stays true rather than becoming a one-time claim.
+
+**What's still unverified**: `STREAM_*` (not implemented on either
+side, so there's nothing to check), the Python client's behavior under
+concurrent multiplexing (it only ever has one request in flight, by
+design — see `sdks/python/README.md`), and any implementation outside
+this repository in a third language. Per this document's own standard,
+each of those remains a documented goal, not a verified fact, until
+something analogous to the Python client exists for it too.
 
 ## Test vectors
 
