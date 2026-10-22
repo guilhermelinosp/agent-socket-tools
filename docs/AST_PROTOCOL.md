@@ -264,23 +264,21 @@ carried in an `ERROR` frame's payload)
 | `DEADLINE_EXCEEDED` | See [Deadlines](#deadlines). |
 | `CANCELLED` | See [Cancellation](#cancellation). |
 | `RESOURCE_EXHAUSTED` | The connection was already serving its configured maximum of in-flight requests. |
-| `RESULT_TOO_LARGE` | *(Reserved — see note below.)* |
+| `RESULT_TOO_LARGE` | A fully-formed response (`HELLO_ACK`, `DISCOVER_RESULT`, `RESULT`, or `ERROR`) would have exceeded `--max-frame-bytes`; this bounded error was sent in its place. See the note below. |
 | `INTERNAL_ERROR` | Any other server-side failure, including a tool task panicking. |
 
-**Note on `RESULT_TOO_LARGE`:** AST's framing already rejects an
-oversized *request* before allocating a buffer for it (see
-[Framing](#framing)); the equivalent check for an oversized *response*
-(mirroring the legacy protocol's `response_too_large`, in
-`docs/PROTOCOL.md`) is not yet wired into `src/ast/connection.rs` for this
-pass — a response from a future tool capable of producing one larger
-than `--max-frame-bytes` would currently hit `write_frame`'s existing
-`u32`-overflow guard only in the pathological case of exceeding 4 GiB,
-not the configured frame limit. Both of this crate's actual MVP tools are
-individually bounded well under any reasonable frame limit today
-(`filesystem.read`'s 1 MiB cap plus MessagePack's modest overhead), so
-this is a documented gap rather than a current risk — see
-[Known limitations](#known-limitations-and-deferred-features) in the
-project's top-level report, not a silently-missing feature.
+**`RESULT_TOO_LARGE` is enforced**, symmetrically with request-side
+framing: every outgoing frame (`HELLO_ACK`, `DISCOVER_RESULT`, `RESULT`,
+`ERROR`) is size-checked against `--max-frame-bytes` *after* encoding but
+*before* being handed to the connection's writer task. One whose encoded
+size would exceed the limit is replaced with a small, fixed
+`ERROR{RESULT_TOO_LARGE}` instead of ever being sent — see
+`send`/`send_raw` in `src/ast/connection.rs`. The substitute error uses a
+short, static message (never the oversized content, and never anything
+derived from it), so it can never itself trigger the check it's
+replacing. Tested in `src/ast/connection.rs`
+(`result_exceeding_max_frame_len_is_bounded_not_sent_oversized` and
+`result_within_max_frame_len_is_sent_normally`).
 
 Error messages name what the client sent wrong (e.g. the requested tool
 name, the requested path as given) and never a resolved absolute
@@ -312,10 +310,10 @@ is a breaking change requiring a `protocol_version` bump.
     Linux, always `None` on macOS. Neither is implemented for any other
     platform — `peer_credentials()` returns `Unsupported` there.
 - **Resource limits:** `--max-connections` (server-wide),
-  `--max-in-flight-per-connection`, `--max-frame-bytes`, and per-request
-  deadlines are all enforced — see the sections above and
-  [Known limitations](#known-limitations-and-deferred-features) for what
-  isn't (yet) covered by the same enforcement (`RESULT_TOO_LARGE`).
+  `--max-in-flight-per-connection`, `--max-frame-bytes` (both directions:
+  oversized requests are rejected before being fully read, oversized
+  responses are replaced with a bounded `RESULT_TOO_LARGE` error before
+  being sent), and per-request deadlines are all enforced.
 - **Filesystem confinement:** identical to the legacy protocol's
   `filesystem.read` — same base-directory canonicalization,
   `O_NOFOLLOW`-on-final-open TOCTOU narrowing, and the same explicitly

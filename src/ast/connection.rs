@@ -112,6 +112,8 @@ async fn serve_reads(
     registry: Arc<ToolRegistry>,
     config: ConnectionConfig,
 ) {
+    let max_frame_len = config.frame_limits.max_frame_len;
+
     // --- Handshake: the first frame must be HELLO. ---
     let first = match tokio::time::timeout(
         config.handshake_timeout,
@@ -137,6 +139,7 @@ async fn serve_reads(
             first.correlation_id,
             ErrorCode::InvalidMessage,
             "the first message on a connection must be HELLO",
+            max_frame_len,
         )
         .await;
         return;
@@ -150,6 +153,7 @@ async fn serve_reads(
                 first.correlation_id,
                 ErrorCode::InvalidMessage,
                 &e.to_string(),
+                max_frame_len,
             )
             .await;
             return;
@@ -166,7 +170,14 @@ async fn serve_reads(
                 hello.protocol_version
             )),
         };
-        let _ = send(&tx, MessageType::HelloAck, first.correlation_id, &ack).await;
+        let _ = send(
+            &tx,
+            MessageType::HelloAck,
+            first.correlation_id,
+            &ack,
+            max_frame_len,
+        )
+        .await;
         return;
     }
 
@@ -176,9 +187,15 @@ async fn serve_reads(
         ok: true,
         error: None,
     };
-    if send(&tx, MessageType::HelloAck, first.correlation_id, &ack)
-        .await
-        .is_err()
+    if send(
+        &tx,
+        MessageType::HelloAck,
+        first.correlation_id,
+        &ack,
+        max_frame_len,
+    )
+    .await
+    .is_err()
     {
         return;
     }
@@ -199,6 +216,7 @@ async fn serve_reads(
                     0,
                     ErrorCode::InvalidFrame,
                     "frame exceeded the maximum size",
+                    max_frame_len,
                 )
                 .await;
                 return;
@@ -209,6 +227,7 @@ async fn serve_reads(
                     0,
                     ErrorCode::InvalidFrame,
                     "frame was smaller than the minimum header",
+                    max_frame_len,
                 )
                 .await;
                 return;
@@ -222,9 +241,15 @@ async fn serve_reads(
 
         match MessageType::from_u8(frame.msg_type) {
             Some(MessageType::Ping) => {
-                if send(&tx, MessageType::Pong, frame.correlation_id, &Pong {})
-                    .await
-                    .is_err()
+                if send(
+                    &tx,
+                    MessageType::Pong,
+                    frame.correlation_id,
+                    &Pong {},
+                    max_frame_len,
+                )
+                .await
+                .is_err()
                 {
                     return;
                 }
@@ -249,6 +274,7 @@ async fn serve_reads(
                     MessageType::DiscoverResult,
                     frame.correlation_id,
                     &result,
+                    max_frame_len,
                 )
                 .await
                 .is_err()
@@ -267,6 +293,7 @@ async fn serve_reads(
                         frame.correlation_id,
                         ErrorCode::InvalidMessage,
                         "duplicate correlation_id: a request with this id is already in flight",
+                        max_frame_len,
                     )
                     .await;
                     continue;
@@ -284,6 +311,7 @@ async fn serve_reads(
                             frame.correlation_id,
                             ErrorCode::ResourceExhausted,
                             "server is already handling its configured maximum of in-flight requests on this connection",
+                            max_frame_len,
                         )
                         .await;
                         continue;
@@ -302,6 +330,7 @@ async fn serve_reads(
                             frame.correlation_id,
                             ErrorCode::InvalidMessage,
                             &e.to_string(),
+                            max_frame_len,
                         )
                         .await;
                         continue;
@@ -324,6 +353,7 @@ async fn serve_reads(
                     Arc::clone(&in_flight),
                     Arc::clone(&cancellations),
                     tx.clone(),
+                    max_frame_len,
                 );
             }
             Some(MessageType::Cancel) => {
@@ -347,6 +377,7 @@ async fn serve_reads(
                     frame.correlation_id,
                     ErrorCode::InvalidMessage,
                     "HELLO is only valid as the first message on a connection",
+                    max_frame_len,
                 )
                 .await;
             }
@@ -364,6 +395,7 @@ async fn serve_reads(
                     frame.correlation_id,
                     ErrorCode::InvalidMessage,
                     "this message type is server-to-client only",
+                    max_frame_len,
                 )
                 .await;
             }
@@ -373,6 +405,7 @@ async fn serve_reads(
                     frame.correlation_id,
                     ErrorCode::InvalidFrame,
                     &format!("unknown message type byte: {}", frame.msg_type),
+                    max_frame_len,
                 )
                 .await;
             }
@@ -391,6 +424,7 @@ fn spawn_invoke(
     in_flight: Arc<Mutex<std::collections::HashSet<u64>>>,
     cancellations: Cancellations,
     tx: mpsc::Sender<Frame>,
+    max_frame_len: u32,
 ) {
     tokio::spawn(async move {
         let _permit = permit; // held for this task's whole lifetime
@@ -417,11 +451,12 @@ fn spawn_invoke(
                     MessageType::Result,
                     correlation_id,
                     &InvokeResult { value },
+                    max_frame_len,
                 )
                 .await;
             }
             Err((code, message)) => {
-                let _ = send_error(&tx, correlation_id, code, &message).await;
+                let _ = send_error(&tx, correlation_id, code, &message, max_frame_len).await;
             }
         }
     });
@@ -482,7 +517,12 @@ fn tool_error_to_code(err: ToolError) -> (ErrorCode, String) {
     }
 }
 
-async fn send<T: serde::Serialize>(
+/// Encodes and enqueues `payload` as-is, with no size check — used only
+/// by [`send`] itself (for the actual, already-validated payload) and for
+/// the `RESULT_TOO_LARGE` substitute error it sends instead of an
+/// oversized one (a short, fixed string that can never itself trigger
+/// the check it's replacing).
+async fn send_raw<T: serde::Serialize>(
     tx: &mpsc::Sender<Frame>,
     msg_type: MessageType,
     correlation_id: u64,
@@ -497,11 +537,42 @@ async fn send<T: serde::Serialize>(
     tx.send(frame).await.map_err(|_| ())
 }
 
+/// Encodes `payload` and enqueues it — unless the resulting frame would
+/// exceed `max_frame_len`, in which case a small, bounded
+/// `ERROR{RESULT_TOO_LARGE}` is sent in its place instead. Checked here,
+/// once, for every outgoing message regardless of which operation
+/// produced it: `DISCOVER_RESULT` (a long tool list), `HELLO_ACK`, and
+/// `RESULT`/`ERROR` (a tool's own result or error, e.g.
+/// `filesystem.read`'s file contents) all go through it.
+async fn send<T: serde::Serialize>(
+    tx: &mpsc::Sender<Frame>,
+    msg_type: MessageType,
+    correlation_id: u64,
+    payload: &T,
+    max_frame_len: u32,
+) -> Result<(), ()> {
+    let bytes = codec::encode(payload).map_err(|_| ())?;
+    if (wire::HEADER_LEN as u64 + bytes.len() as u64) > max_frame_len as u64 {
+        let substitute = ErrorPayload {
+            code: ErrorCode::ResultTooLarge,
+            message: "the response exceeded the configured maximum frame size".to_string(),
+        };
+        return send_raw(tx, MessageType::Error, correlation_id, &substitute).await;
+    }
+    let frame = Frame {
+        msg_type: msg_type as u8,
+        correlation_id,
+        payload: bytes,
+    };
+    tx.send(frame).await.map_err(|_| ())
+}
+
 async fn send_error(
     tx: &mpsc::Sender<Frame>,
     correlation_id: u64,
     code: ErrorCode,
     message: &str,
+    max_frame_len: u32,
 ) -> Result<(), ()> {
     send(
         tx,
@@ -511,6 +582,7 @@ async fn send_error(
             code,
             message: message.to_string(),
         },
+        max_frame_len,
     )
     .await
 }
@@ -542,6 +614,26 @@ mod tests {
         fn invoke(&self, _args: JsonValue) -> Result<JsonValue, RegistryToolError> {
             std::thread::sleep(self.sleep);
             Ok(serde_json::json!({"slept_ms": self.sleep.as_millis()}))
+        }
+    }
+
+    /// A test-only tool that returns a result of a configurable size, for
+    /// exercising `RESULT_TOO_LARGE`.
+    struct BigResultTool {
+        result_bytes: usize,
+    }
+    impl Tool for BigResultTool {
+        fn name(&self) -> &str {
+            "test.big_result"
+        }
+        fn description(&self) -> &str {
+            "returns a large result, for tests"
+        }
+        fn input_schema(&self) -> JsonValue {
+            serde_json::json!({})
+        }
+        fn invoke(&self, _args: JsonValue) -> Result<JsonValue, RegistryToolError> {
+            Ok(serde_json::json!({ "data": "x".repeat(self.result_bytes) }))
         }
     }
 
@@ -864,6 +956,85 @@ mod tests {
         );
         let err: ErrorPayload = codec::decode(&resp.payload).unwrap();
         assert_eq!(err.code, ErrorCode::ResourceExhausted);
+    }
+
+    #[tokio::test]
+    async fn result_exceeding_max_frame_len_is_bounded_not_sent_oversized() {
+        let registry = registry_with(vec![Box::new(BigResultTool { result_bytes: 1000 })]);
+        // Large enough for HELLO_ACK itself to fit (it carries
+        // `server_name` and is sent before this test's real assertion),
+        // small enough that `BigResultTool`'s ~1000-byte result does not.
+        let config = ConnectionConfig {
+            frame_limits: FrameLimits { max_frame_len: 200 },
+            ..Default::default()
+        };
+        let (mut client, _dir) = connected_pair_with_registry(registry, config).await;
+        do_hello(&mut client).await;
+
+        let invoke = Invoke {
+            tool: "test.big_result".to_string(),
+            args: serde_json::json!({}),
+            deadline_ms: Some(5000),
+        };
+        send_raw(
+            &mut client,
+            Frame {
+                msg_type: MessageType::Invoke as u8,
+                correlation_id: 1,
+                payload: codec::encode(&invoke).unwrap(),
+            },
+        )
+        .await;
+
+        // Bound the read itself: if the implementation regressed and
+        // actually tried to send the 1000+-byte oversized frame while this
+        // test's own reader is capped at 64 bytes too, the read would
+        // error out (rather than this test hanging), which is still a
+        // clear failure signal — but asserting on the *received* error is
+        // the direct proof the fix works, not just that nothing crashed.
+        let resp = recv_raw(&mut client).await;
+        assert_eq!(
+            MessageType::from_u8(resp.msg_type),
+            Some(MessageType::Error)
+        );
+        let err: ErrorPayload = codec::decode(&resp.payload).unwrap();
+        assert_eq!(err.code, ErrorCode::ResultTooLarge);
+    }
+
+    #[tokio::test]
+    async fn result_within_max_frame_len_is_sent_normally() {
+        let registry = registry_with(vec![Box::new(BigResultTool { result_bytes: 10 })]);
+        let config = ConnectionConfig {
+            frame_limits: FrameLimits {
+                max_frame_len: 4096,
+            },
+            ..Default::default()
+        };
+        let (mut client, _dir) = connected_pair_with_registry(registry, config).await;
+        do_hello(&mut client).await;
+
+        let invoke = Invoke {
+            tool: "test.big_result".to_string(),
+            args: serde_json::json!({}),
+            deadline_ms: Some(5000),
+        };
+        send_raw(
+            &mut client,
+            Frame {
+                msg_type: MessageType::Invoke as u8,
+                correlation_id: 1,
+                payload: codec::encode(&invoke).unwrap(),
+            },
+        )
+        .await;
+
+        let resp = recv_raw(&mut client).await;
+        assert_eq!(
+            MessageType::from_u8(resp.msg_type),
+            Some(MessageType::Result)
+        );
+        let result: InvokeResult = codec::decode(&resp.payload).unwrap();
+        assert_eq!(result.value["data"], "x".repeat(10));
     }
 
     #[tokio::test]
