@@ -362,6 +362,9 @@ envelope.
 - The clock starts when the server begins handling the request, not when the frame arrives on the wire.
 - When `deadline_ms` is absent, `--default-deadline-ms` applies (default 10000). There is no "no deadline" mode.
 - A streamed `INVOKE` has one budget covering the stream open and every chunk read. Exceeding it sends `ERROR{DEADLINE_EXCEEDED}` mid-stream.
+- The effective deadline is the requested (or default) value clamped to `--max-deadline-ms` (default 60000). It applies to each `INVOKE`, to each call of a `BATCH`, and to streams.
+- An effective deadline of 0 ms is answered `DEADLINE_EXCEEDED` at once. The tool is not started and no execution slot is taken.
+- The deadline is a **response** deadline: the client receives `DEADLINE_EXCEEDED` when it expires, even if the tool is still running.
 
 **Cancellation**
 
@@ -369,14 +372,19 @@ envelope.
 - A live target completes with `ERROR{CANCELLED}`. A `CANCEL` for an unknown or already-completed id is ignored.
 - If completion, cancellation, or a deadline race, the first one wins. Each request receives exactly one terminal frame (`RESULT`, `BATCH_RESULT`, `STREAM_END`, or `ERROR`).
 - `CANCEL` is handled by the connection's asynchronous read loop, so a slow tool never delays it.
+- The server sets a cancellation token (`Tool::invoke_with_cancel`) whenever a request is answered without its tool's own result: deadline expiry, `CANCEL`, connection failure, and server shutdown. A tool that checks the token at its checkpoints stops early. Streaming tools do not receive a token yet.
 
-**What is not interrupted**
+**Execution is bounded, not interrupted**
 
-- Synchronous tools run on `spawn_blocking` threads. Cancellation and deadlines do not stop them: the client gets its terminal frame and the in-flight slot is released, but the tool's thread runs until its own code returns. Tools must therefore be short and bounded.
+- Each tool execution runs on a blocking thread and takes one of the server-wide `--max-blocking-tasks` slots (default 64). The slot is held until the tool actually returns, even after its caller was answered `DEADLINE_EXCEEDED` or `CANCELLED`.
+- While every slot is taken, new executions (`INVOKE`, `BATCH` calls, stream opens and chunk reads) fail with `RESOURCE_EXHAUSTED` without starting.
+- Rust cannot stop a running thread, and the server does not try. A tool that ignores its token keeps its slot until its own code returns, so tools must stay short and bounded, or check the token.
 
-**Disconnects**
+**Disconnects and shutdown**
 
-- When a connection ends for any reason (peer disconnect, idle timeout, framing error, write failure, or write timeout), all of its in-flight requests are signalled as cancelled and their slots are released.
+- A clean end of the peer's stream (FIN, half-close) between frames drains: the connection stays open and each in-flight request still gets its response, until its terminal frame or its deadline. A non-cooperative tool therefore keeps the connection open until it returns or its deadline expires.
+- A read error (including a reset), an invalid or truncated frame, a failed write, or a write timeout ends the connection. Its in-flight requests are cancelled (token set, `CANCELLED` sent when the caller is still waiting), and their slots are released when their tools return.
+- On `SIGINT`/`SIGTERM` the server stops accepting, cancels the in-flight requests of every connection, waits up to `--shutdown-grace-secs` (default 5) for connections to close, and exits. Tools still running at that point are abandoned with the process.
 
 ## Error model
 
@@ -397,7 +405,7 @@ carried in an `ERROR` frame's payload)
 | `PERMISSION_DENIED` | The tool refused the operation for a policy reason (today, exclusively: a `filesystem.read` path outside the authorized base directory). |
 | `DEADLINE_EXCEEDED` | See [Deadlines and cancellation](#deadlines-and-cancellation). |
 | `CANCELLED` | See [Deadlines and cancellation](#deadlines-and-cancellation). |
-| `RESOURCE_EXHAUSTED` | The connection was already serving its configured maximum of in-flight requests. |
+| `RESOURCE_EXHAUSTED` | The connection was already serving its configured maximum of in-flight requests, or every server-wide tool execution slot (`--max-blocking-tasks`) is taken. |
 | `RESULT_TOO_LARGE` | A fully-formed response (`HELLO_ACK`, `DISCOVER_RESULT`, `RESULT`, or `ERROR`) would have exceeded `--max-frame-bytes`; this bounded error was sent in its place. See the note below. |
 | `INTERNAL_ERROR` | Any other server-side failure, including a tool task panicking. |
 
@@ -677,6 +685,9 @@ Defaults are for `ast-server`. Values marked *fixed* are constants in the code a
 | Idle | `--idle-timeout-secs` | 300 | Connection closed. Counts only while no request is in flight. |
 | Write, per frame | `--write-timeout-secs` | 30 | Connection closed. |
 | Default deadline | `--default-deadline-ms` | 10000 | `DEADLINE_EXCEEDED`. |
+| Maximum deadline | `--max-deadline-ms` | 60000 | Larger requested deadlines are clamped to this value. |
+| Tool executions, server-wide | `--max-blocking-tasks` | 64 | `RESOURCE_EXHAUSTED`. A slot is held until the tool returns. The blocking thread pool is sized to this value plus 8. |
+| Shutdown grace period | `--shutdown-grace-secs` | 5 | Connections still open when it elapses are abandoned at exit. |
 | Outgoing queue per connection | fixed | 64 frames | Bounded by frame count, not bytes. |
 | `filesystem.read`, invoke | fixed (tool) | 1 MiB | The tool rejects larger files. |
 | `filesystem.read`, streamed | fixed (tool) | 256 MiB | The tool rejects larger files. |
@@ -688,6 +699,10 @@ Defaults are for `ast-server`. Values marked *fixed* are constants in the code a
 - Streaming totals in mode 2 come from the tool's `total_bytes_hint()`. A tool that returns `None` makes the server send `total_bytes: 0` with non-empty chunks, which conforming clients now reject as a protocol violation. No current tool does this (`filesystem.read` always reports its size), but a future one must report an exact total before it can use genuine streaming.
 - Backpressure is bounded by frame count (the per-connection outgoing channel holds 64 frames), not bytes: with large `max_frame_bytes`, worst-case queued memory per connection is up to 64 × `max_frame_bytes`.
 - BATCH has no aggregate server-side deadline: each call honors its own deadline, so a 100-call batch can run for the sum of its calls' deadlines. The client now sends a best-effort CANCEL when its own timeout fires.
+- Tool executions are capped by `--max-blocking-tasks`, not by tool cooperation. A synchronous tool that ignores its token keeps its slot until it returns, so a few slow tools can make the server answer `RESOURCE_EXHAUSTED` to other requests.
+- Streaming tools (`StreamingTool`) receive no cancellation token. Their `open_stream` and chunk reads cannot be interrupted cooperatively; they stop only when the caller is answered, and their slot is still held until the blocking call returns.
+- A stream chunk read that finds every slot taken is a terminal ERROR (`RESOURCE_EXHAUSTED`), because `STREAM_START` has already been sent.
+- On shutdown, a request whose tool is still running when the grace period ends never gets a terminal frame; the connection is abandoned with the process.
 - BATCH serializes each entry twice (once to measure the running budget, once in the final BatchResult); unmeasured, a possible CPU optimization.
 - Several buffer copies per frame on the hot path (`wire.rs` read path, chunk assembly in `filesystem_read.rs` and the client); unmeasured, candidates only if profiling shows them.
 - The legacy JSON-Lines server rescans its read buffer from the start on every 4 KiB read while looking for a newline (O(n²) in the line length, bounded by the 1 MiB default message limit).
