@@ -172,17 +172,32 @@ fn effective_deadline(
         .min(max_deadline)
 }
 
+/// In-flight requests of one connection, keyed by correlation id, each with
+/// the `Notify` its task races against. The per-request `CancelToken` lives
+/// inside `run_invoke`: it is cancelled there, on the same arm that observes
+/// the notification, so signalling the `Notify` is enough.
 type Cancellations = Arc<Mutex<HashMap<u64, Arc<Notify>>>>;
+
+/// Signals every in-flight request of a connection as cancelled. `notify_one`
+/// stores a permit, so a request that reaches its `.notified()` arm after
+/// this runs is cancelled too.
+fn cancel_all(cancellations: &Cancellations) {
+    let map = cancellations.lock().unwrap_or_else(|p| p.into_inner());
+    for notify in map.values() {
+        notify.notify_one();
+    }
+}
 
 /// Signals every in-flight request of a connection as cancelled when the
 /// connection's `serve_reads` ends, for any reason (including the select
-/// in `run_connection` dropping it). `notify_one` stores a permit, so a
-/// task that reaches `.notified()` after this runs is cancelled too.
+/// in `run_connection` dropping it).
 ///
 /// The one exception is a clean EOF from the peer (a half-close): the
 /// caller `disarm`s the guard, so responses already in flight are still
 /// delivered. `run_connection` then drops its sender and waits for the
-/// writer, which drains them.
+/// writer, which drains them. In that state the writer also cancels
+/// everything on its first failed write, and `run_connection` cancels
+/// everything on server shutdown.
 struct CancelAllOnDrop {
     cancellations: Cancellations,
     armed: bool,
@@ -204,12 +219,8 @@ impl CancelAllOnDrop {
 
 impl Drop for CancelAllOnDrop {
     fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        let map = self.cancellations.lock().unwrap_or_else(|p| p.into_inner());
-        for notify in map.values() {
-            notify.notify_one();
+        if self.armed {
+            cancel_all(&self.cancellations);
         }
     }
 }
@@ -244,6 +255,12 @@ pub async fn run_connection(
     let read_half = BufReader::with_capacity(READ_BUF_CAPACITY, read_half);
     let (tx, mut rx) = mpsc::channel::<Frame>(64);
     let write_timeout = config.write_timeout;
+    // Owned here, not by `serve_reads`, so the writer can cancel in-flight
+    // work after a failed write even once `serve_reads` has returned (a
+    // clean EOF disarms its guard, see `CancelAllOnDrop`).
+    let cancellations: Cancellations = Arc::new(Mutex::new(HashMap::new()));
+    let writer_cancellations = Arc::clone(&cancellations);
+    let mut shutdown = config.shutdown.clone();
 
     let mut writer_task = tokio::spawn(async move {
         let mut write_half = write_half;
@@ -254,6 +271,7 @@ pub async fn run_connection(
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
                     tracing::debug!(error = %e, "closing connection: frame write failed");
+                    cancel_all(&writer_cancellations);
                     return;
                 }
                 Err(_elapsed) => {
@@ -261,6 +279,7 @@ pub async fn run_connection(
                         ?write_timeout,
                         "closing connection: frame write timed out (peer not reading)"
                     );
+                    cancel_all(&writer_cancellations);
                     return;
                 }
             }
@@ -274,13 +293,24 @@ pub async fn run_connection(
     // non-cancel-safe `read_frame` is never resumed.
     let mut writer_finished = false;
     tokio::select! {
-        _ = serve_reads(read_half, tx.clone(), registry, config) => {}
+        _ = serve_reads(read_half, tx.clone(), registry, config, Arc::clone(&cancellations)) => {}
         _ = &mut writer_task => { writer_finished = true; }
     }
 
     drop(tx); // lets the writer task's `rx.recv()` loop end
     if !writer_finished {
-        let _ = writer_task.await;
+        // Reached after a clean EOF (half-close, guard disarmed) or any
+        // other `serve_reads` exit. Waiting only for the writer would leave
+        // half-closed connections uncancelled on shutdown, so shutdown
+        // cancels the remaining work and the writer drains the terminals.
+        tokio::select! {
+            _ = &mut writer_task => {}
+            _ = wait_for_shutdown(&mut shutdown) => {
+                tracing::debug!("cancelling in-flight work of a half-closed connection: server is shutting down");
+                cancel_all(&cancellations);
+                let _ = (&mut writer_task).await;
+            }
+        }
     }
 }
 
@@ -340,6 +370,7 @@ async fn serve_reads(
     tx: mpsc::Sender<Frame>,
     registry: Arc<ToolRegistry>,
     config: ConnectionConfig,
+    cancellations: Cancellations,
 ) {
     let max_frame_len = config.frame_limits.max_frame_len;
 
@@ -432,7 +463,6 @@ async fn serve_reads(
     // --- Steady state. ---
     let in_flight: Arc<Mutex<std::collections::HashSet<u64>>> =
         Arc::new(Mutex::new(Default::default()));
-    let cancellations: Cancellations = Arc::new(Mutex::new(HashMap::new()));
     // Cancels all in-flight work of this connection when `serve_reads` ends.
     let mut cancel_on_drop = CancelAllOnDrop::new(Arc::clone(&cancellations));
     let in_flight_limit = Arc::new(Semaphore::new(config.max_in_flight));
@@ -4069,6 +4099,115 @@ mod tests {
             Some(MessageType::Result)
         );
         wait_until("the slot to be returned", || slots.available_permits() == 1).await;
+    }
+
+    /// Polls `cond` until it holds, failing after `max`. Unlike `wait_until`,
+    /// the bound is set by the caller, so tests can assert a tight deadline.
+    async fn wait_until_within(what: &str, max: Duration, cond: impl Fn() -> bool) {
+        tokio::time::timeout(max, async {
+            while !cond() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out after {max:?} waiting for: {what}"));
+    }
+
+    /// Limitation under test: a Unix socket cannot tell a half-close from a
+    /// full close until a write fails. After a clean EOF the connection keeps
+    /// draining, so the first failed write (here, A's RESULT after the peer
+    /// is gone) must cancel the rest of the connection's in-flight work.
+    #[tokio::test]
+    async fn write_failure_after_clean_eof_cancels_remaining_in_flight_work() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::AsyncWriteExt;
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        // A finishes once released, so its RESULT is the first write.
+        let gate_a = Gate::default();
+        let finished_a = Arc::new(AtomicBool::new(false));
+        // B is cooperative and never released: only cancellation can end it.
+        let gate_b = Gate::default();
+        let finished_b = Arc::new(AtomicBool::new(false));
+        let registry = registry_with(vec![
+            gate_tool("test.a", &gate_a, &finished_a, &started_tx),
+            coop_gate_tool("test.b", &gate_b, &finished_b, &started_tx),
+        ]);
+        let config = ConnectionConfig::default();
+        let slots = Arc::clone(&config.blocking_slots);
+        let total = slots.available_permits();
+        let (mut client, _dir) = connected_pair_with_registry(registry, config).await;
+        do_hello(&mut client).await;
+
+        send_invoke(&mut client, 1, "test.a", Some(10_000)).await;
+        send_invoke(&mut client, 2, "test.b", Some(10_000)).await;
+        next_signal(&mut started_rx).await;
+        next_signal(&mut started_rx).await;
+
+        // Clean half-close: the server reads EOF and keeps both requests.
+        client.shutdown().await.unwrap();
+        // The test runtime is single-threaded: sleep so the server reads the
+        // EOF first. Otherwise the failing write ends `serve_reads` through
+        // the select's drop, and the test would not exercise the writer's
+        // own cancellation.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Then the peer disappears completely, and only now does A finish.
+        drop(client);
+        gate_a.open();
+
+        wait_until_within(
+            "B to observe the cancellation",
+            Duration::from_secs(2),
+            || finished_b.load(Ordering::SeqCst),
+        )
+        .await;
+        wait_until_within("both slots to be returned", Duration::from_secs(2), || {
+            slots.available_permits() == total
+        })
+        .await;
+    }
+
+    /// Shutdown must cancel a request whose connection is half-closed. The
+    /// test client keeps reading after its write side is closed, so it
+    /// receives the terminal `ERROR(Cancelled)` that the drain delivers.
+    #[tokio::test]
+    async fn shutdown_cancels_half_closed_connections() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::AsyncWriteExt;
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let gate = Gate::default(); // never opened: only shutdown can end it
+        let finished = Arc::new(AtomicBool::new(false));
+        let registry = registry_with(vec![coop_gate_tool(
+            "test.coop",
+            &gate,
+            &finished,
+            &started_tx,
+        )]);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let config = ConnectionConfig {
+            shutdown: shutdown_rx,
+            ..Default::default()
+        };
+        let (mut client, _dir) = connected_pair_with_registry(registry, config).await;
+        do_hello(&mut client).await;
+
+        send_invoke(&mut client, 1, "test.coop", Some(10_000)).await;
+        next_signal(&mut started_rx).await;
+        client.shutdown().await.unwrap();
+        // Give the server time to read the EOF, so shutdown hits the
+        // half-closed state rather than the still-reading one.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        shutdown_tx.send(true).unwrap();
+        wait_until_within(
+            "the half-closed request to stop",
+            Duration::from_secs(2),
+            || finished.load(Ordering::SeqCst),
+        )
+        .await;
+        assert_eq!(
+            recv_error_frame(&mut client).await,
+            (1, ErrorCode::Cancelled)
+        );
     }
 
     #[tokio::test]
