@@ -3963,4 +3963,82 @@ mod tests {
             assert_eq!(frame.correlation_id, 7, "round {round}");
         }
     }
+
+    #[tokio::test]
+    async fn abrupt_disconnect_cancels_cooperative_work_and_frees_the_slot() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::AsyncWriteExt;
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let gate = Gate::default(); // never opened: only cancellation can end the tool
+        let finished = Arc::new(AtomicBool::new(false));
+        let registry = registry_with(vec![coop_gate_tool(
+            "test.coop",
+            &gate,
+            &finished,
+            &started_tx,
+        )]);
+        let config = ConnectionConfig::default().with_max_blocking_tasks(1);
+        let slots = Arc::clone(&config.blocking_slots);
+        let (mut client, _dir) = connected_pair_with_registry(registry, config).await;
+        do_hello(&mut client).await;
+
+        send_invoke(&mut client, 1, "test.coop", Some(10_000)).await;
+        next_signal(&mut started_rx).await;
+
+        // Mechanism: a frame header announcing a 100-byte payload, followed by
+        // only 10 payload bytes, and then the socket is dropped. Unix sockets
+        // have no RST, so this is how the test makes the server's read fail
+        // mid-frame (`FrameError::Incomplete`) rather than see a clean EOF.
+        let mut partial = Vec::new();
+        partial.extend_from_slice(&((1 + 8 + 100) as u32).to_be_bytes());
+        partial.push(MessageType::Ping as u8);
+        partial.extend_from_slice(&9u64.to_be_bytes());
+        partial.extend_from_slice(&[0u8; 10]);
+        client.write_all(&partial).await.unwrap();
+        drop(client);
+
+        wait_until("the cooperative tool to stop", || {
+            finished.load(Ordering::SeqCst)
+        })
+        .await;
+        wait_until("the slot to be returned", || slots.available_permits() == 1).await;
+    }
+
+    #[tokio::test]
+    async fn clean_fin_drains_and_holds_the_slot_until_done() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::AsyncWriteExt;
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let gate = Gate::default();
+        let finished = Arc::new(AtomicBool::new(false));
+        // Non-cooperative: only the gate can end it, never the connection's EOF.
+        let registry = registry_with(vec![gate_tool("test.gate", &gate, &finished, &started_tx)]);
+        let config = ConnectionConfig::default().with_max_blocking_tasks(1);
+        let slots = Arc::clone(&config.blocking_slots);
+        let (mut client, _dir) = connected_pair_with_registry(registry, config).await;
+        do_hello(&mut client).await;
+
+        send_invoke(&mut client, 1, "test.gate", Some(10_000)).await;
+        next_signal(&mut started_rx).await;
+
+        // Half-close: the server reads a clean EOF between frames, which must
+        // keep the in-flight request rather than cancel it.
+        client.shutdown().await.unwrap();
+        let early = tokio::time::timeout(Duration::from_millis(200), recv_raw(&mut client)).await;
+        assert!(
+            early.is_err(),
+            "nothing may be sent before the tool completes"
+        );
+        assert!(!finished.load(Ordering::SeqCst));
+        assert_eq!(slots.available_permits(), 0, "the slot is still held");
+
+        gate.open();
+        let frame = recv_within(&mut client).await;
+        assert_eq!(frame.correlation_id, 1);
+        assert_eq!(
+            MessageType::from_u8(frame.msg_type),
+            Some(MessageType::Result)
+        );
+        wait_until("the slot to be returned", || slots.available_permits() == 1).await;
+    }
 }
