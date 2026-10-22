@@ -134,7 +134,6 @@ Each entry has the shape below. The numbers are illustrative, not measurements:
 
 ## Not measured
 
-- Allocations per call (covered by tests, not by this benchmark).
 - Cancellation and deadline latency (covered by tests).
 - Behaviour under a slow reader or back-pressure (covered by tests).
 - Malformed or adversarial inputs (covered by tests).
@@ -192,3 +191,5 @@ Measured at commit `4f716f1` on an Apple M3 Pro (macOS arm64), rustc 1.99.1, wit
 
 The interpretation and the target-by-target verdicts are in the
 ["MCP comparison"](AST_PROTOCOL.md#mcp-comparison) section of `docs/AST_PROTOCOL.md`.
+
+Wire-path optimization run (commit `26fe02d`, same machine and toolchain): [`results/bench-2026-10-22-wire-opt.md`](results/bench-2026-10-22-wire-opt.md) and [`results/bench-2026-10-22-wire-opt.json`](results/bench-2026-10-22-wire-opt.json). Allocator calls per call are measured by `alloc-probe` (`cargo run --release --bin alloc-probe`, client and server in one process, sequential), not by `ast-bench`; raw data in [`results/alloc-baseline.json`](results/alloc-baseline.json) and [`results/alloc-after-wire.json`](results/alloc-after-wire.json).

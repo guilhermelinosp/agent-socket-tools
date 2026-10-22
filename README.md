@@ -28,7 +28,7 @@ A minimal Python client for AST also lives here —
 is actually sufficient to implement a conforming client in a second
 language, by running its tests against the real, unmodified
 `ast-server` binary.
-An optional MCP stdio bridge, **`ast-mcp-adapter`**, lets MCP hosts use tools served by a running `ast-server` — see **[`docs/MCP_ADAPTER.md`](docs/MCP_ADAPTER.md)**. Benchmark results and the MCP comparison are in **[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md#results)** and **[`docs/AST_PROTOCOL.md`](docs/AST_PROTOCOL.md#mcp-comparison)**.
+An optional MCP stdio bridge, **`ast-mcp-adapter`**, lets MCP hosts use tools served by a running `ast-server` — see **[`docs/MCP_ADAPTER.md`](docs/MCP_ADAPTER.md)**. Benchmark results and the MCP comparison are in **[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md#results)** and **[`docs/AST_PROTOCOL.md`](docs/AST_PROTOCOL.md#mcp-comparison)**. The engineering status, targets met and missed, and retracted claims are in **[`docs/ENGINEERING_REPORT.md`](docs/ENGINEERING_REPORT.md)**.
 
 ## Why
 

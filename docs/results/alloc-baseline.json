@@ -1,0 +1,30 @@
+{
+  "commit": "da7aa95f514f63f2773784eb531f96978ac6ea60",
+  "scenarios": [
+    {
+      "name": "invoke system.noop",
+      "allocs_per_call": 18.0,
+      "bytes_per_call": 1579.0
+    },
+    {
+      "name": "invoke system.info",
+      "allocs_per_call": 35.0,
+      "bytes_per_call": 3079.0
+    },
+    {
+      "name": "ping",
+      "allocs_per_call": 9.0,
+      "bytes_per_call": 160.0
+    },
+    {
+      "name": "batch x20 system.noop (por batch)",
+      "allocs_per_call": 229.0,
+      "bytes_per_call": 33050.0
+    },
+    {
+      "name": "batch x20 system.noop (por chamada interna)",
+      "allocs_per_call": 11.45,
+      "bytes_per_call": 1652.5
+    }
+  ]
+}

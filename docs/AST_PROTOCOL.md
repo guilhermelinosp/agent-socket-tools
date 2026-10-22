@@ -526,7 +526,7 @@ The last column is a deployment model (one server process per caller), not a pro
 
 | Target (AST vs real MCP, persistent stdio) | Result |
 |---|---|
-| ≥2× lower p50 for small calls | **Not achieved.** AST is ~9% slower on `system.noop` (33.7 vs 30.9 µs), ~13% slower on `system.info`, ~5% slower on a tiny read, and at parity within noise for 16 KiB and 512 KiB reads. It is faster only on discovery (1.42×). The target is not reachable with this architecture: AST `ping`, which does no tool work at all, already costs 22.0 µs, so 2× below MCP's 30.9 µs (≈15 µs) lies below the protocol's own floor. A defensible target is parity within ~10% for single sequential calls. |
+| ≥2× lower p50 for small calls | **Not achieved.** AST is ~9% slower on `system.noop` (33.7 vs 30.9 µs), ~13% slower on `system.info`, ~5% slower on a tiny read, and at parity within noise for 16 KiB and 512 KiB reads. It is faster only on discovery (1.42×). The target is not reachable with this architecture: AST `ping`, which does no tool work at all, already costs 22.0 µs, so 2× below MCP's 30.9 µs (≈15 µs) lies below the protocol's own floor. A defensible target is parity within ~10% for single sequential calls. See the wire-path optimization subsection below: sequential latency reached parity with the real MCP server in a second run (32.7 vs 32.1 µs), still not 2×. |
 | ≥2× throughput under concurrency | **Achieved** with one AST connection against one pipelined MCP connection from C=4 (2.08×), C=16 (2.66×) and C=64 (2.47×); not at C=1 (1.17×). MCP real plateaus near 44k ops/s regardless of C. Even the one-process-per-caller MCP deployment tops out near 65k ops/s, below a single AST connection at C≥16. |
 | Lower CPU per small call | **Achieved vs MCP real** (25.0 vs 41.0 µs, −39%); **not** vs the legacy JSON-Lines server (18.5 µs). Allocations per call were not measured. |
 | No unexplained p99 regression | **Not met for sequential calls**: noop p99 51.5 µs vs 40.2 µs for MCP real. Under concurrency AST's tail is lower (C=16: 262 vs 537 µs). |
@@ -539,6 +539,26 @@ The last column is a deployment model (one server process per caller), not a pro
 - Semantic features not benchmarked: per-request deadlines, cancellation, peer-credential authentication, bounded streaming and batch budgets. MCP can pipeline requests on one connection, but this server does not run them concurrently (throughput is flat in C).
 - **Correction.** An earlier version of this section reported MCP startup of ~6 ms versus ~230 ms for AST and a ~76× concurrency advantage. Both were artifacts of the previous harness (a synthetic stand-in as the MCP baseline, and MCP measured as 20 separate processes against a multiplexed AST connection). They are superseded by the numbers above.
 - Request size on the wire, from the previous harness (the encodings have not changed): `filesystem.read` request 57 B for AST, 91 B legacy, 117 B MCP JSON-RPC. Wire size is not part of the current suite.
+
+### After the wire-path optimization (commit 26fe02d)
+
+Two changes to `src/ast/wire.rs` and the connection setup: frames with payloads up to 16 KiB are written with one `write(2)` instead of two, and every connection's read half goes through a `BufReader`, with the payload read straight into its final buffer (no intermediate `Vec`, no copy). Wire bytes are unchanged (`tests/ast_vectors.rs` passes untouched). Same harness, same machine, same parameters, run separately from the table above; the real MCP server was unchanged and serves as the control (its cells moved between −0.2% and +6.7%, so changes smaller than ~7% are not distinguishable from noise).
+
+| Cell (p50 µs unless noted) | before (da7aa95) | after (26fe02d) | change |
+|---|---|---|---|
+| `system.noop` sequential | 33.7 | 32.7 | −3% (noise) |
+| `system.info` sequential | 34.1 | 32.3 | −5% (noise) |
+| AST `ping` (protocol floor) | 22.0 | 19.3 | −12% |
+| C=1, 1 multiplexed connection | 25.9 | 21.4 | −17% |
+| C=4, 1 multiplexed connection | 42.1 | 30.9 | −27% |
+| C=4 throughput, multiplexed (ops/s) | 91,963 | 124,545 | +35% |
+| C=64, 1 multiplexed connection | 580.7 | 460.5 | −21% |
+| Batch of 20: 20 sequential invokes | 695.6 | 604.4 | −13% |
+| 512 KiB read, streamed | 731.3 | 660.1 | −10% |
+| Server CPU per `system.noop` (µs) | 25.0 | 23.5 | −6% |
+| Allocator calls per `system.noop` (alloc-probe) | 18 | 16 | −2 |
+
+Reading: sequential single-call latency did not change beyond noise. In this run AST `system.noop` p50 was 32.7 µs against 32.1 µs for the real MCP server (30.9 µs in the earlier run), i.e. parity within noise, not a measured win. The gains are in concurrent and multiplexed cells, where per-frame syscalls matter: AST on one connection now reaches 2.8× the throughput of a pipelined MCP connection at C=4 (124,545 vs 43,803 ops/s; 2.1× before). One cell moved the wrong way — C=64 with one connection per caller, 411.0 → 457.8 µs (+11%) — and was not re-run, so it is reported as unexplained rather than as noise. The −2 allocator calls were not attributed to the read or the write side. Raw results: `docs/results/bench-2026-10-22-wire-opt.{md,json}`, `docs/results/alloc-baseline.json`, `docs/results/alloc-after-wire.json`.
 
 ## Cross-language interoperability
 
