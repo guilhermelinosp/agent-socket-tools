@@ -80,6 +80,12 @@ struct Cli {
     #[arg(long, default_value_t = 300)]
     idle_timeout_secs: u64,
 
+    /// Maximum time, in seconds, to write ONE frame to a peer's socket.
+    /// A peer that stops reading (or drains too slowly) has its connection
+    /// closed once a single frame write exceeds this.
+    #[arg(long, default_value_t = 30)]
+    write_timeout_secs: u64,
+
     /// Only accept connections from processes running as the same user as
     /// this server, checked via `SO_PEERCRED` (Linux) / `LOCAL_PEERCRED`
     /// (macOS) — independent of, and in addition to, the socket file's
@@ -129,6 +135,7 @@ async fn main() -> std::process::ExitCode {
         default_deadline: Duration::from_millis(cli.default_deadline_ms),
         handshake_timeout: Duration::from_secs(cli.handshake_timeout_secs),
         idle_timeout: Duration::from_secs(cli.idle_timeout_secs),
+        write_timeout: Duration::from_secs(cli.write_timeout_secs),
         peer_policy: if cli.require_same_uid {
             PeerPolicy::SameUid
         } else {

@@ -83,6 +83,11 @@ pub struct ConnectionConfig {
     /// `run_connection`), so misconfiguring this relative to
     /// `max_frame_bytes` can't produce an oversized frame.
     pub stream_chunk_bytes: usize,
+    /// Maximum time to write ONE frame to the socket. A peer that stops
+    /// reading (or reads too slowly to drain a frame in this window) has
+    /// its connection closed rather than holding the writer task and its
+    /// fd indefinitely.
+    pub write_timeout: Duration,
 }
 
 impl Default for ConnectionConfig {
@@ -98,11 +103,27 @@ impl Default for ConnectionConfig {
             max_batch_size: 100,
             max_batch_output_bytes: FrameLimits::default().max_frame_len as usize,
             stream_chunk_bytes: 64 * 1024,
+            write_timeout: Duration::from_secs(30),
         }
     }
 }
 
 type Cancellations = Arc<Mutex<HashMap<u64, Arc<Notify>>>>;
+
+/// Signals every in-flight request of a connection as cancelled when the
+/// connection's `serve_reads` ends, for any reason (including the select
+/// in `run_connection` dropping it). `notify_one` stores a permit, so a
+/// task that reaches `.notified()` after this runs is cancelled too.
+struct CancelAllOnDrop(Cancellations);
+
+impl Drop for CancelAllOnDrop {
+    fn drop(&mut self) {
+        let map = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        for notify in map.values() {
+            notify.notify_one();
+        }
+    }
+}
 
 /// Serves one accepted connection to completion. Returns once the
 /// connection ends for any reason (clean disconnect, framing error,
@@ -130,20 +151,45 @@ pub async fn run_connection(
 
     let (read_half, write_half) = stream.into_split();
     let (tx, mut rx) = mpsc::channel::<Frame>(64);
+    let write_timeout = config.write_timeout;
 
-    let writer_task = tokio::spawn(async move {
+    let mut writer_task = tokio::spawn(async move {
         let mut write_half = write_half;
         while let Some(frame) = rx.recv().await {
-            if wire::write_frame(&mut write_half, &frame).await.is_err() {
-                return;
+            match tokio::time::timeout(write_timeout, wire::write_frame(&mut write_half, &frame))
+                .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::debug!(error = %e, "closing connection: frame write failed");
+                    return;
+                }
+                Err(_elapsed) => {
+                    tracing::debug!(
+                        ?write_timeout,
+                        "closing connection: frame write timed out (peer not reading)"
+                    );
+                    return;
+                }
             }
         }
     });
 
-    serve_reads(read_half, tx.clone(), registry, config).await;
+    // Race the read side against the writer. If the writer dies (write
+    // error, timeout), the whole connection goes down: serving further
+    // requests would produce responses with nowhere to go. Losing the race
+    // only ever drops `serve_reads`; it is never polled again, so the
+    // non-cancel-safe `read_frame` is never resumed.
+    let mut writer_finished = false;
+    tokio::select! {
+        _ = serve_reads(read_half, tx.clone(), registry, config) => {}
+        _ = &mut writer_task => { writer_finished = true; }
+    }
 
     drop(tx); // lets the writer task's `rx.recv()` loop end
-    let _ = writer_task.await;
+    if !writer_finished {
+        let _ = writer_task.await;
+    }
 }
 
 fn check_same_uid(stream: &UnixStream) -> std::io::Result<bool> {
@@ -292,6 +338,8 @@ async fn serve_reads(
     let in_flight: Arc<Mutex<std::collections::HashSet<u64>>> =
         Arc::new(Mutex::new(Default::default()));
     let cancellations: Cancellations = Arc::new(Mutex::new(HashMap::new()));
+    // Cancels all in-flight work of this connection when `serve_reads` ends.
+    let _cancel_on_drop = CancelAllOnDrop(Arc::clone(&cancellations));
     let in_flight_limit = Arc::new(Semaphore::new(config.max_in_flight));
 
     loop {
@@ -2740,5 +2788,255 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn slow_reader_connection_is_closed_by_the_write_timeout() {
+        // A 4 MiB streamed result far exceeds the socket buffers, so the
+        // server's writer blocks as soon as this client stops reading. With
+        // a 300ms write timeout the server must drop the connection long
+        // before the stream could finish, so a client that resumes reading
+        // must never reach STREAM_END.
+        let fixture_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            fixture_dir.path().join("big.txt"),
+            "x".repeat(4 * 1024 * 1024),
+        )
+        .unwrap();
+        let read_tool = FilesystemReadTool::new(fixture_dir.path()).unwrap();
+        let registry = registry_with(vec![Box::new(read_tool)]);
+        let config = ConnectionConfig {
+            write_timeout: Duration::from_millis(300),
+            ..Default::default()
+        };
+        let (mut client, _dir) = connected_pair_with_registry(registry, config).await;
+        do_hello(&mut client).await;
+
+        let invoke = Invoke {
+            tool: "filesystem.read".to_string(),
+            args: serde_json::json!({"path": "big.txt"}),
+            deadline_ms: Some(60_000),
+            stream: Some(true),
+        };
+        send_raw(
+            &mut client,
+            Frame {
+                msg_type: MessageType::Invoke as u8,
+                correlation_id: 1,
+                payload: codec::encode(&invoke).unwrap(),
+            },
+        )
+        .await;
+
+        // Deliberately do not read while the server tries to write.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        let mut saw_stream_end = false;
+        let closed = tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                match read_frame(&mut client, FrameLimits::default()).await {
+                    Ok(Some(frame)) => {
+                        if MessageType::from_u8(frame.msg_type) == Some(MessageType::StreamEnd) {
+                            saw_stream_end = true;
+                            return;
+                        }
+                    }
+                    Ok(None) | Err(_) => return, // connection closed
+                }
+            }
+        })
+        .await;
+        assert!(
+            closed.is_ok(),
+            "the server did not close the connection within 8s"
+        );
+        assert!(
+            !saw_stream_end,
+            "the stream completed: the write timeout did not tear down the slow reader's connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_storm_does_not_wedge_the_connection() {
+        let registry = registry_with(vec![Box::new(SlowTool {
+            sleep: Duration::from_secs(1),
+        })]);
+        let config = ConnectionConfig {
+            max_in_flight: 8,
+            ..Default::default()
+        };
+        let (mut client, _dir) = connected_pair_with_registry(registry, config).await;
+        do_hello(&mut client).await;
+        let (mut read_half, mut write_half) = client.into_split();
+
+        // Send from its own task so the test reads responses concurrently;
+        // otherwise a full socket buffer on either side could stall the test
+        // itself rather than the server under test.
+        let sender = tokio::spawn(async move {
+            let frame = |msg_type: MessageType, correlation_id: u64, payload: Vec<u8>| Frame {
+                msg_type: msg_type as u8,
+                correlation_id,
+                payload,
+            };
+            for id in 1..=200u64 {
+                let invoke = Invoke {
+                    tool: "test.slow".to_string(),
+                    args: serde_json::json!({}),
+                    deadline_ms: Some(10_000),
+                    stream: None,
+                };
+                wire::write_frame(
+                    &mut write_half,
+                    &frame(MessageType::Invoke, id, codec::encode(&invoke).unwrap()),
+                )
+                .await
+                .unwrap();
+                wire::write_frame(
+                    &mut write_half,
+                    &frame(
+                        MessageType::Cancel,
+                        id,
+                        codec::encode(&Cancel {
+                            target_correlation_id: id,
+                        })
+                        .unwrap(),
+                    ),
+                )
+                .await
+                .unwrap();
+            }
+            wire::write_frame(
+                &mut write_half,
+                &frame(MessageType::Ping, 999, codec::encode(&Ping {}).unwrap()),
+            )
+            .await
+            .unwrap();
+            write_half
+        });
+
+        let pong = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let frame = read_frame(&mut read_half, FrameLimits::default())
+                    .await
+                    .unwrap()
+                    .expect("server closed the connection during the cancel storm");
+                match MessageType::from_u8(frame.msg_type) {
+                    Some(MessageType::Pong) => return,
+                    Some(MessageType::Result) => {}
+                    Some(MessageType::Error) => {
+                        let err: ErrorPayload = codec::decode(&frame.payload).unwrap();
+                        assert!(
+                            matches!(
+                                err.code,
+                                ErrorCode::Cancelled | ErrorCode::ResourceExhausted
+                            ),
+                            "unexpected error during the cancel storm: {err:?}"
+                        );
+                    }
+                    _ => panic!(
+                        "unexpected frame type {} during the cancel storm",
+                        frame.msg_type
+                    ),
+                }
+            }
+        })
+        .await;
+        assert!(
+            pong.is_ok(),
+            "PONG never arrived: the connection wedged under the cancel storm"
+        );
+        let _ = sender.await;
+    }
+
+    #[tokio::test]
+    async fn malformed_payloads_get_invalid_message_and_the_connection_survives() {
+        let registry = registry_with(vec![]);
+        let (mut client, _dir) =
+            connected_pair_with_registry(registry, ConnectionConfig::default()).await;
+        do_hello(&mut client).await;
+
+        // 0xc1 is the one msgpack byte that is never valid, so neither
+        // payload decodes as an INVOKE or a BATCH.
+        let garbage = vec![0xc1, 0xc1];
+        send_raw(
+            &mut client,
+            Frame {
+                msg_type: MessageType::Invoke as u8,
+                correlation_id: 1,
+                payload: garbage.clone(),
+            },
+        )
+        .await;
+        send_raw(
+            &mut client,
+            Frame {
+                msg_type: MessageType::Batch as u8,
+                correlation_id: 2,
+                payload: garbage,
+            },
+        )
+        .await;
+
+        for expected_id in [1u64, 2] {
+            let resp = recv_raw(&mut client).await;
+            assert_eq!(
+                MessageType::from_u8(resp.msg_type),
+                Some(MessageType::Error)
+            );
+            assert_eq!(resp.correlation_id, expected_id);
+            let err: ErrorPayload = codec::decode(&resp.payload).unwrap();
+            assert_eq!(err.code, ErrorCode::InvalidMessage);
+        }
+
+        send_raw(
+            &mut client,
+            Frame {
+                msg_type: MessageType::Ping as u8,
+                correlation_id: 3,
+                payload: codec::encode(&Ping {}).unwrap(),
+            },
+        )
+        .await;
+        let pong = recv_raw(&mut client).await;
+        assert_eq!(MessageType::from_u8(pong.msg_type), Some(MessageType::Pong));
+    }
+
+    #[tokio::test]
+    async fn oversized_frame_header_is_rejected() {
+        let config = ConnectionConfig {
+            frame_limits: FrameLimits {
+                max_frame_len: 1024,
+            },
+            ..Default::default()
+        };
+        let (mut client, _dir) = connected_pair_with_registry(registry_with(vec![]), config).await;
+        do_hello(&mut client).await;
+
+        // A length prefix claiming 10 MB, then 9 bytes of body the server
+        // must never need to read.
+        let mut bytes = 10_000_000u32.to_be_bytes().to_vec();
+        bytes.extend_from_slice(&[0u8; 9]);
+        tokio::io::AsyncWriteExt::write_all(&mut client, &bytes)
+            .await
+            .unwrap();
+
+        let resp = recv_raw(&mut client).await;
+        assert_eq!(
+            MessageType::from_u8(resp.msg_type),
+            Some(MessageType::Error)
+        );
+        let err: ErrorPayload = codec::decode(&resp.payload).unwrap();
+        assert_eq!(err.code, ErrorCode::InvalidFrame);
+
+        let after = tokio::time::timeout(
+            Duration::from_secs(2),
+            read_frame(&mut client, FrameLimits::default()),
+        )
+        .await
+        .expect("the server did not close the connection after the oversized header");
+        assert!(
+            matches!(after, Ok(None) | Err(_)),
+            "expected the connection to be closed, got another frame"
+        );
     }
 }

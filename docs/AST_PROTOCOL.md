@@ -184,7 +184,7 @@ the sense of a tool emitting partial output as it works; what it
 *does* provide: bounded per-chunk frame size and real backpressure,
 via the same mechanism every other response already uses (the
 connection's bounded outgoing-frame channel — `tx.send(...).await`
-naturally blocks when a slow reader can't keep up).
+naturally blocks when a slow reader can't keep up; a reader that stalls on one frame for longer than `--write-timeout-secs` has its connection closed).
 
 **2. Genuine incremental production** (`raw` present — implemented for
 `filesystem.read`). The tool produces its output chunk by chunk, as it
@@ -288,7 +288,7 @@ envelope.
 
 1. Client connects.
 2. Server checks the peer's credentials (see
-   [Security model](#security-model)); a mismatch closes the connection
+   [Threat model and security](#threat-model-and-security)); a mismatch closes the connection
    immediately, with no frame sent.
 3. Client sends `HELLO` as the very first frame. Any other first message
    is rejected with `ERROR{INVALID_MESSAGE}`, and the connection is
@@ -334,36 +334,29 @@ envelope.
   dropped: it means a prior wait already gave up (e.g. on a client-side
   timeout) before the response arrived. Not an error, just discarded.
 
-## Cancellation
+## Deadlines and cancellation
 
-`CANCEL{target_correlation_id}` has **no response of its own** — it
-either reaches an in-flight request in time (which then completes with
-`ERROR{CANCELLED}` through the normal `ERROR` path) or doesn't (the
-target already completed, or the id was never valid on this connection),
-and either way there's nothing further to acknowledge.
+**Deadlines**
 
-**What this guarantees:** the caller stops waiting (via the normal
-`ERROR{CANCELLED}` response) and the in-flight slot is freed.
+- `INVOKE.deadline_ms` is relative. v1 has no absolute deadline.
+- The clock starts when the server begins handling the request, not when the frame arrives on the wire.
+- When `deadline_ms` is absent, `--default-deadline-ms` applies (default 10000). There is no "no deadline" mode.
+- A streamed `INVOKE` has one budget covering the stream open and every chunk read. Exceeding it sends `ERROR{DEADLINE_EXCEEDED}` mid-stream.
 
-**What this does not guarantee:** that the tool's own work actually
-stopped. A tool invocation runs on a blocking-pool thread; Rust has no
-safe mechanism to forcibly preempt a thread that's already running
-synchronous code, and this crate does not claim one. `CANCEL` (and a
-deadline expiring, which behaves identically from the tool's
-perspective) stops the *caller* from waiting on it, full stop — the
-underlying `std::thread` keeps running until the tool's own code returns,
-whether or not anyone is still listening. The two MVP tools
-(`system.info`, `filesystem.read`) are both fast, bounded, local
-operations where this distinction is close to moot; it would matter a
-great deal for a hypothetical future tool that can block indefinitely.
+**Cancellation**
 
-## Deadlines
+- `CANCEL{target_correlation_id}` has no response of its own.
+- A live target completes with `ERROR{CANCELLED}`. A `CANCEL` for an unknown or already-completed id is ignored.
+- If completion, cancellation, or a deadline race, the first one wins. Each request receives exactly one terminal frame (`RESULT`, `BATCH_RESULT`, `STREAM_END`, or `ERROR`).
+- `CANCEL` is handled by the connection's asynchronous read loop, so a slow tool never delays it.
 
-Every `INVOKE` has a deadline — either the request's own `deadline_ms`
-or the server's `--default-deadline-ms` (default 10000) when omitted.
-There is no "wait forever" mode. A deadline exceeded produces
-`ERROR{DEADLINE_EXCEEDED}`, with the same non-guarantee about the
-underlying blocking work as [Cancellation](#cancellation) above.
+**What is not interrupted**
+
+- Synchronous tools run on `spawn_blocking` threads. Cancellation and deadlines do not stop them: the client gets its terminal frame and the in-flight slot is released, but the tool's thread runs until its own code returns. Tools must therefore be short and bounded.
+
+**Disconnects**
+
+- When a connection ends for any reason (peer disconnect, idle timeout, framing error, write failure, or write timeout), all of its in-flight requests are signalled as cancelled and their slots are released.
 
 ## Error model
 
@@ -382,8 +375,8 @@ carried in an `ERROR` frame's payload)
 | `TOOL_NOT_FOUND` | `INVOKE.tool` named something not in the registry. |
 | `INVALID_ARGUMENTS` | `args` failed the named tool's own validation. |
 | `PERMISSION_DENIED` | The tool refused the operation for a policy reason (today, exclusively: a `filesystem.read` path outside the authorized base directory). |
-| `DEADLINE_EXCEEDED` | See [Deadlines](#deadlines). |
-| `CANCELLED` | See [Cancellation](#cancellation). |
+| `DEADLINE_EXCEEDED` | See [Deadlines and cancellation](#deadlines-and-cancellation). |
+| `CANCELLED` | See [Deadlines and cancellation](#deadlines-and-cancellation). |
 | `RESOURCE_EXHAUSTED` | The connection was already serving its configured maximum of in-flight requests. |
 | `RESULT_TOO_LARGE` | A fully-formed response (`HELLO_ACK`, `DISCOVER_RESULT`, `RESULT`, or `ERROR`) would have exceeded `--max-frame-bytes`; this bounded error was sent in its place. See the note below. |
 | `INTERNAL_ERROR` | Any other server-side failure, including a tool task panicking. |
@@ -410,45 +403,40 @@ a wire version bump; clients should treat an unrecognized `code` as a
 generic failure. Changing what an existing code means, or removing one,
 is a breaking change requiring a `protocol_version` bump.
 
-## Security model
+## Threat model and security
 
-- **Socket directory and file permissions:** identical hardening to the
-  legacy protocol's — see `docs/PROTOCOL.md`'s "Security model" section
-  and `src/transport.rs`'s `BoundListener`, reused as-is by `ast-server`.
-- **Peer credentials, independent of a successful connection:**
-  `ast-server --require-same-uid` (the default) checks the connecting
-  process's real uid via `SO_PEERCRED` (Linux) or `LOCAL_PEERCRED`
-  (macOS) and closes the connection — before `HELLO` is even read — if it
-  doesn't match the server's own uid. This is authorization decoupled
-  from "the socket accepted the connection": on an unshared, single-user
-  machine the socket file's `0600` permissions already imply the same
-  property, so this is defense in depth there, but it's a real,
-  independent check on any host where that assumption doesn't hold
-  (shared accounts, a shared mount namespace, etc).
-  - **Linux/macOS difference:** `SO_PEERCRED` reports the peer's pid as
-    well as uid/gid; macOS's `LOCAL_PEERCRED` reports only uid-equivalent
-    credentials (`cr_uid`), no pid. `PeerCredentials::pid` is `Some` on
-    Linux, always `None` on macOS. Neither is implemented for any other
-    platform — `peer_credentials()` returns `Unsupported` there.
-- **Resource limits:** `--max-connections` (server-wide),
-  `--max-in-flight-per-connection`, `--max-frame-bytes` (both directions:
-  oversized requests are rejected before being fully read, oversized
-  responses are replaced with a bounded `RESULT_TOO_LARGE` error before
-  being sent), and per-request deadlines are all enforced.
-- **Filesystem confinement:** identical to the legacy protocol's
-  `filesystem.read` — same base-directory canonicalization,
-  `O_NOFOLLOW`-on-final-open TOCTOU narrowing, and the same explicitly
-  documented residual risk (no protection against intermediate-directory
-  races; the authorized directory is assumed not to be concurrently
-  modified by an untrusted actor). AST does not re-implement this tool;
-  it's shared, unmodified, from `src/tools/filesystem_read.rs`.
-- **No arbitrary shell execution,** by design, same as the legacy
-  protocol.
-- **`unsafe` usage:** confined to peer-credential FFI
-  (`SO_PEERCRED`/`LOCAL_PEERCRED` via `libc::getsockopt`) and the
-  socket-hardening FFI already used by the legacy protocol
-  (`getuid`/`umask`). Each call site has a `SAFETY` comment explaining
-  why it's sound. No other `unsafe` exists in AST's implementation.
+**Authentication vs authorization**
+
+- `--require-same-uid` (default) authenticates the peer's OS uid through `SO_PEERCRED` (Linux) or `LOCAL_PEERCRED` (macOS), before `HELLO` is read. It checks only that the peer runs as the server's user.
+- There is **no per-client and no per-tool authorization**. What a peer can do is limited by the tools registered on the server and by `filesystem.read`'s confinement. Any authenticated peer can invoke every registered tool.
+
+**Trust boundary**
+
+- Every process running as the server's uid is equally trusted and can invoke every tool.
+- For different trust levels, run separate server instances (distinct socket directories and `--read-dir`) or use distinct OS users.
+
+**Socket hardening**
+
+- The socket directory is `0700` and the socket file `0600`, as in the legacy protocol (see `docs/PROTOCOL.md` and `src/transport.rs`).
+- A stale socket file left by a dead server is reclaimed at bind. Anything else at that path is left alone.
+
+**`filesystem.read` confinement**
+
+- The requested path is canonicalized under `--read-dir`, the final component is opened with `O_NOFOLLOW`, and the opened file descriptor is checked with `fstat`.
+- Residual risk: intermediate directories can be swapped between `canonicalize` and `open` by anyone who can write inside the tree. `--read-dir` must therefore not be writable by untrusted principals. No portable Linux and macOS equivalent of `openat2`/`RESOLVE_BENEATH` is used, to avoid an OS-specific dependency.
+
+**Error messages**
+
+- `ToolError::Failed` messages are sent to the peer verbatim. Tools must not place secrets (credentials, tokens, unrelated file contents) in error messages.
+
+**Untrusted input**
+
+- Frame size, batch length and output, stream size, in-flight count, and duplicate correlation ids are bounded or rejected. See [Resource limits](#resource-limits).
+
+**Other**
+
+- No arbitrary shell execution, by design.
+- `unsafe` is confined to peer-credential FFI and the socket-hardening FFI shared with the legacy protocol. Each call site has a `SAFETY` comment.
 
 ## Compatibility and migration
 
@@ -653,6 +641,27 @@ code in AST beyond the `cfg(target_os = ...)`-gated peer-credential
 functions, which have their own Linux branch) but has not actually been
 run there.
 
+## Resource limits
+
+Defaults are for `ast-server`. Values marked *fixed* are constants in the code and have no flag.
+
+| Limit | Setting | Default | Behavior when exceeded |
+|---|---|---|---|
+| Connections | `--max-connections` | 256 | Extra connections are rejected. |
+| In-flight requests per connection | `--max-in-flight-per-connection` | 64 | `RESOURCE_EXHAUSTED`. A `BATCH` occupies one slot. |
+| Frame length, both directions | `--max-frame-bytes` | 4 MiB | Oversized inbound frame: `INVALID_FRAME`, then close. Oversized outbound frame: replaced by `RESULT_TOO_LARGE`. |
+| Calls per `BATCH` | `--max-batch-size` | 100 | `INVALID_MESSAGE`. |
+| Aggregate `BATCH` output | `--max-batch-output-bytes` | `--max-frame-bytes` | The call that would exceed it gets `RESULT_TOO_LARGE` and the batch stops. A 128-byte margin is kept for the envelope. |
+| Stream chunk target | `--stream-chunk-bytes` | 64 KiB | Clamped below the frame limit at connection start. |
+| Handshake | `--handshake-timeout-secs` | 5 | Connection closed if no valid `HELLO` arrives in time. |
+| Idle | `--idle-timeout-secs` | 300 | Connection closed. Counts only while no request is in flight. |
+| Write, per frame | `--write-timeout-secs` | 30 | Connection closed. |
+| Default deadline | `--default-deadline-ms` | 10000 | `DEADLINE_EXCEEDED`. |
+| Outgoing queue per connection | fixed | 64 frames | Bounded by frame count, not bytes. |
+| `filesystem.read`, invoke | fixed (tool) | 1 MiB | The tool rejects larger files. |
+| `filesystem.read`, streamed | fixed (tool) | 256 MiB | The tool rejects larger files. |
+| Client streamed result | client `max_stream_bytes` | 256 MiB | The client rejects the stream. |
+
 ## Known limitations
 
 - Streaming: `total_bytes` is only used for a size-ceiling check on the Rust client, which still preallocates up to `max_stream_bytes` (default 256 MiB) per in-flight stream when the server declares that much; a hostile server can therefore make a client reserve that much per concurrent stream.
@@ -661,6 +670,7 @@ run there.
 - BATCH serializes each entry twice (once to measure the running budget, once in the final BatchResult); unmeasured, a possible CPU optimization.
 - Several buffer copies per frame on the hot path (`wire.rs` read path, chunk assembly in `filesystem_read.rs` and the client); unmeasured, candidates only if profiling shows them.
 - The legacy JSON-Lines server rescans its read buffer from the start on every 4 KiB read while looking for a newline (O(n²) in the line length, bounded by the 1 MiB default message limit).
-- `wire::read_frame` is not cancel-safe once it has consumed part of a frame; callers must treat a lost race as a reason to close the connection, never to retry the read (the idle timeout is built that way).
+- `wire::read_frame` is not cancel-safe once it has consumed part of a frame; callers must treat a lost race as a reason to close the connection, never to retry the read (the idle timeout and the reader/writer race in `run_connection` are built that way).
 - A mid-transfer failure of a genuinely streamed response is reported as a terminal ERROR, but a failure to enqueue STREAM_CHUNK/STREAM_END themselves (broken outgoing channel) is, by necessity, silent.
+- The write timeout bounds each frame, not the whole transfer: a reader that drains just fast enough is never disconnected, and the request deadline does not cover frame writes.
 - Performance claims in this document are from single runs on one machine (see "MCP comparison"); they are not statistical distributions.
