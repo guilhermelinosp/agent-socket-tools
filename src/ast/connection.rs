@@ -89,6 +89,31 @@ pub struct ConnectionConfig {
     /// its connection closed rather than holding the writer task and its
     /// fd indefinitely.
     pub write_timeout: Duration,
+    /// Upper bound on any request's effective deadline. A requested
+    /// `deadline_ms` (or `default_deadline`) larger than this is clamped
+    /// down to it, for `INVOKE`, every call of a `BATCH`, and streams.
+    pub max_deadline: Duration,
+    /// Server-wide pool of slots for tool executions on blocking threads.
+    /// Every `spawn_blocking` that runs a tool first takes one slot and
+    /// holds it until the blocking closure actually returns — even after
+    /// the caller has already been answered with `DEADLINE_EXCEEDED` or
+    /// `CANCELLED`. Requests that find no free slot get `RESOURCE_EXHAUSTED`
+    /// instead of starting. Shared by every connection cloned from this
+    /// config; see [`ConnectionConfig::with_max_blocking_tasks`].
+    pub blocking_slots: Arc<Semaphore>,
+}
+
+/// Default number of tool executions allowed to run at once, server-wide.
+pub const DEFAULT_MAX_BLOCKING_TASKS: usize = 64;
+
+impl ConnectionConfig {
+    /// Replaces the blocking-execution slot pool with one of `n` slots.
+    /// Build the config fully before cloning it into connections: a clone
+    /// made earlier keeps the pool it was cloned with.
+    pub fn with_max_blocking_tasks(mut self, n: usize) -> Self {
+        self.blocking_slots = Arc::new(Semaphore::new(n));
+        self
+    }
 }
 
 impl Default for ConnectionConfig {
@@ -105,8 +130,25 @@ impl Default for ConnectionConfig {
             max_batch_output_bytes: FrameLimits::default().max_frame_len as usize,
             stream_chunk_bytes: 64 * 1024,
             write_timeout: Duration::from_secs(30),
+            max_deadline: Duration::from_secs(60),
+            blocking_slots: Arc::new(Semaphore::new(DEFAULT_MAX_BLOCKING_TASKS)),
         }
     }
+}
+
+/// The deadline a request runs under: its own `deadline_ms` (or the
+/// server default when it has none), clamped to `max_deadline`. A zero
+/// result means the request must be answered `DEADLINE_EXCEEDED` without
+/// starting the tool.
+fn effective_deadline(
+    deadline_ms: Option<u64>,
+    default_deadline: Duration,
+    max_deadline: Duration,
+) -> Duration {
+    deadline_ms
+        .map(Duration::from_millis)
+        .unwrap_or(default_deadline)
+        .min(max_deadline)
 }
 
 type Cancellations = Arc<Mutex<HashMap<u64, Arc<Notify>>>>;
@@ -532,6 +574,8 @@ async fn serve_reads(
                     invoke,
                     Arc::clone(&registry),
                     config.default_deadline,
+                    config.max_deadline,
+                    Arc::clone(&config.blocking_slots),
                     notify,
                     permit,
                     Arc::clone(&in_flight),
@@ -630,6 +674,8 @@ async fn serve_reads(
                     batch,
                     Arc::clone(&registry),
                     config.default_deadline,
+                    config.max_deadline,
+                    Arc::clone(&config.blocking_slots),
                     notify,
                     permit,
                     Arc::clone(&in_flight),
@@ -718,6 +764,8 @@ fn spawn_invoke(
     invoke: Invoke,
     registry: Arc<ToolRegistry>,
     default_deadline: Duration,
+    max_deadline: Duration,
+    blocking_slots: Arc<Semaphore>,
     cancel_notify: Arc<Notify>,
     permit: tokio::sync::OwnedSemaphorePermit,
     in_flight: Arc<Mutex<std::collections::HashSet<u64>>>,
@@ -742,18 +790,16 @@ fn spawn_invoke(
         // a while for a large stream.
         tokio::spawn(async move {
             let _permit = permit;
-            let deadline = invoke
-                .deadline_ms
-                .map(Duration::from_millis)
-                .unwrap_or(default_deadline);
+            let deadline = effective_deadline(invoke.deadline_ms, default_deadline, max_deadline);
             let started = Instant::now();
 
             let opened = run_invoke_streaming(
                 invoke,
-                registry,
+                Arc::clone(&registry),
                 deadline,
                 started,
                 Arc::clone(&cancel_notify),
+                Arc::clone(&blocking_slots),
             )
             .await;
             match opened {
@@ -766,6 +812,7 @@ fn spawn_invoke(
                         deadline,
                         started,
                         cancel_notify,
+                        &blocking_slots,
                         max_frame_len,
                     )
                     .await;
@@ -789,12 +836,9 @@ fn spawn_invoke(
 
     tokio::spawn(async move {
         let _permit = permit; // held for this task's whole lifetime
-        let deadline = invoke
-            .deadline_ms
-            .map(Duration::from_millis)
-            .unwrap_or(default_deadline);
+        let deadline = effective_deadline(invoke.deadline_ms, default_deadline, max_deadline);
 
-        let response = run_invoke(invoke, registry, deadline, cancel_notify).await;
+        let response = run_invoke(invoke, registry, deadline, cancel_notify, blocking_slots).await;
 
         in_flight
             .lock()
@@ -845,6 +889,7 @@ async fn run_invoke_streaming(
     deadline: Duration,
     started: Instant,
     cancel_notify: Arc<Notify>,
+    blocking_slots: Arc<Semaphore>,
 ) -> Result<crate::tools::StreamingToolOpen, (ErrorCode, String)> {
     let Some(_tool) = registry.get(&invoke.tool) else {
         return Err((
@@ -852,10 +897,17 @@ async fn run_invoke_streaming(
             format!("no such tool: {}", invoke.tool),
         ));
     };
+    if deadline.is_zero() {
+        return Err(zero_deadline_error());
+    }
+    let Ok(blocking_permit) = Arc::clone(&blocking_slots).try_acquire_owned() else {
+        return Err(blocking_slots_exhausted_error());
+    };
 
     let tool_name = invoke.tool.clone();
     let args = invoke.args;
     let task = tokio::task::spawn_blocking(move || {
+        let _blocking_permit = blocking_permit; // released only when the open returns
         let tool = registry
             .get(&tool_name)
             .expect("presence already checked before spawning");
@@ -908,6 +960,7 @@ async fn send_raw_streamed_result(
     deadline: Duration,
     started: Instant,
     cancel_notify: Arc<Notify>,
+    blocking_slots: &Arc<Semaphore>,
     max_frame_len: u32,
 ) {
     // Clients enforce `total_bytes` exactly, so a stream whose size is
@@ -964,7 +1017,23 @@ async fn send_raw_streamed_result(
             return;
         }
 
+        // Each chunk read is a blocking tool execution too, so it takes its
+        // own slot. Exhaustion here is a terminal error for this stream:
+        // STREAM_START has already gone out, so it can only be reported as
+        // an ERROR, not retracted.
+        let Ok(blocking_permit) = Arc::clone(blocking_slots).try_acquire_owned() else {
+            let _ = send_error(
+                tx,
+                correlation_id,
+                ErrorCode::ResourceExhausted,
+                blocking_slots_exhausted_message(),
+                max_frame_len,
+            )
+            .await;
+            return;
+        };
         let read_task = tokio::task::spawn_blocking(move || {
+            let _blocking_permit = blocking_permit; // released only when the read returns
             let chunk = reader.next_chunk(chunk_bytes.max(1));
             (reader, chunk)
         });
@@ -1114,6 +1183,8 @@ fn spawn_batch(
     batch: Batch,
     registry: Arc<ToolRegistry>,
     default_deadline: Duration,
+    max_deadline: Duration,
+    blocking_slots: Arc<Semaphore>,
     cancel_notify: Arc<Notify>,
     permit: tokio::sync::OwnedSemaphorePermit,
     in_flight: Arc<Mutex<std::collections::HashSet<u64>>>,
@@ -1155,16 +1226,14 @@ fn spawn_batch(
                 // entry within a batch."
                 stream: None,
             };
-            let deadline = invoke
-                .deadline_ms
-                .map(Duration::from_millis)
-                .unwrap_or(default_deadline);
+            let deadline = effective_deadline(invoke.deadline_ms, default_deadline, max_deadline);
 
             let outcome = run_invoke(
                 invoke,
                 Arc::clone(&registry),
                 deadline,
                 Arc::clone(&cancel_notify),
+                Arc::clone(&blocking_slots),
             )
             .await;
             let was_cancelled = matches!(outcome, Err((ErrorCode::Cancelled, _)));
@@ -1234,17 +1303,33 @@ fn spawn_batch(
     });
 }
 
+/// Runs one tool invocation on a blocking thread, racing its deadline and
+/// cancellation. Used by `INVOKE` and by every call of a `BATCH`.
+///
+/// The caller is answered as soon as the deadline or a cancellation wins
+/// the race, but the blocking closure is not interrupted: Rust cannot stop
+/// a running thread. Its `blocking_slots` permit moves into the closure, so
+/// the slot stays taken until the tool really returns. A tool that ignores
+/// its deadline therefore keeps occupying one slot; once all slots are
+/// taken, new executions are refused with `RESOURCE_EXHAUSTED`.
 async fn run_invoke(
     invoke: Invoke,
     registry: Arc<ToolRegistry>,
     deadline: Duration,
     cancel_notify: Arc<Notify>,
+    blocking_slots: Arc<Semaphore>,
 ) -> Result<serde_json::Value, (ErrorCode, String)> {
     let Some(_tool) = registry.get(&invoke.tool) else {
         return Err((
             ErrorCode::ToolNotFound,
             format!("no such tool: {}", invoke.tool),
         ));
+    };
+    if deadline.is_zero() {
+        return Err(zero_deadline_error());
+    }
+    let Ok(blocking_permit) = Arc::clone(&blocking_slots).try_acquire_owned() else {
+        return Err(blocking_slots_exhausted_error());
     };
 
     // Looked up again inside the blocking closure (an `Arc` bump, not a
@@ -1253,6 +1338,7 @@ async fn run_invoke(
     let tool_name = invoke.tool.clone();
     let args = invoke.args;
     let task = tokio::task::spawn_blocking(move || {
+        let _blocking_permit = blocking_permit; // released only when the tool returns
         let tool = registry
             .get(&tool_name)
             .expect("presence already checked before spawning");
@@ -1279,6 +1365,24 @@ async fn run_invoke(
             Err((ErrorCode::Cancelled, "the request was cancelled".to_string()))
         }
     }
+}
+
+fn zero_deadline_error() -> (ErrorCode, String) {
+    (
+        ErrorCode::DeadlineExceeded,
+        "the request's effective deadline is zero, so the tool was not started".to_string(),
+    )
+}
+
+fn blocking_slots_exhausted_message() -> &'static str {
+    "too many tool executions in progress"
+}
+
+fn blocking_slots_exhausted_error() -> (ErrorCode, String) {
+    (
+        ErrorCode::ResourceExhausted,
+        blocking_slots_exhausted_message().to_string(),
+    )
 }
 
 fn tool_error_to_code(err: ToolError) -> (ErrorCode, String) {
@@ -1364,8 +1468,8 @@ mod tests {
     use super::*;
     use crate::ast::wire::read_frame;
     use crate::tools::{
-        FilesystemReadTool, IncrementalBytes, StreamingTool, StreamingToolOpen, SystemInfoTool,
-        Tool, ToolError as RegistryToolError,
+        FilesystemReadTool, IncrementalBytes, NoopTool, StreamingTool, StreamingToolOpen,
+        SystemInfoTool, Tool, ToolError as RegistryToolError,
     };
     use serde_json::Value as JsonValue;
     use tokio::net::UnixListener;
@@ -3273,5 +3377,311 @@ mod tests {
         let pong = recv_raw(&mut client).await;
         assert_eq!(MessageType::from_u8(pong.msg_type), Some(MessageType::Pong));
         assert_eq!(pong.correlation_id, 2);
+    }
+
+    /// A one-shot latch a test opens to release a blocked tool. Waiting
+    /// uses a condvar with a safety timeout, so a broken test fails
+    /// instead of hanging.
+    #[derive(Clone, Default)]
+    struct Gate(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+
+    impl Gate {
+        fn open(&self) {
+            let (lock, cvar) = &*self.0;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
+        }
+
+        /// Blocks for at most `max`; returns whether the gate was opened.
+        fn wait(&self, max: Duration) -> bool {
+            let (lock, cvar) = &*self.0;
+            let open = lock.lock().unwrap();
+            let (open, _) = cvar.wait_timeout_while(open, max, |o| !*o).unwrap();
+            *open
+        }
+    }
+
+    /// Test tool that announces it started, then holds its blocking slot
+    /// until its gate opens. It never checks the cancellation token, so it
+    /// models a tool that ignores cancellation.
+    struct GateTool {
+        name: &'static str,
+        started: mpsc::UnboundedSender<()>,
+        gate: Gate,
+        finished: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl Tool for GateTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            "test tool that holds its blocking slot until released"
+        }
+        fn input_schema(&self) -> JsonValue {
+            serde_json::json!({})
+        }
+        fn invoke(&self, _args: JsonValue) -> Result<JsonValue, RegistryToolError> {
+            let _ = self.started.send(());
+            let opened = self.gate.wait(Duration::from_secs(5));
+            self.finished
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            if opened {
+                Ok(serde_json::json!({"gate": "opened"}))
+            } else {
+                Err(RegistryToolError::Failed("gate safety timeout".to_string()))
+            }
+        }
+    }
+
+    /// Polls `cond` until it holds; fails the test after a safety timeout.
+    async fn wait_until(what: &str, cond: impl Fn() -> bool) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !cond() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for: {what}"));
+    }
+
+    async fn recv_within(stream: &mut UnixStream) -> Frame {
+        tokio::time::timeout(Duration::from_secs(5), recv_raw(stream))
+            .await
+            .expect("no frame within the safety timeout")
+    }
+
+    async fn send_invoke(stream: &mut UnixStream, id: u64, tool: &str, deadline_ms: Option<u64>) {
+        let invoke = Invoke {
+            tool: tool.to_string(),
+            args: serde_json::json!({}),
+            deadline_ms,
+            stream: None,
+        };
+        send_raw(
+            stream,
+            Frame {
+                msg_type: MessageType::Invoke as u8,
+                correlation_id: id,
+                payload: codec::encode(&invoke).unwrap(),
+            },
+        )
+        .await;
+    }
+
+    /// Reads one frame that must be an ERROR and returns its id and code.
+    async fn recv_error_frame(stream: &mut UnixStream) -> (u64, ErrorCode) {
+        let frame = recv_within(stream).await;
+        assert_eq!(
+            MessageType::from_u8(frame.msg_type),
+            Some(MessageType::Error),
+            "expected an ERROR frame"
+        );
+        let err: ErrorPayload = codec::decode(&frame.payload).unwrap();
+        (frame.correlation_id, err.code)
+    }
+
+    fn gate_tool(
+        name: &'static str,
+        gate: &Gate,
+        finished: &Arc<std::sync::atomic::AtomicBool>,
+        started: &mpsc::UnboundedSender<()>,
+    ) -> Box<dyn Tool> {
+        Box::new(GateTool {
+            name,
+            started: started.clone(),
+            gate: gate.clone(),
+            finished: Arc::clone(finished),
+        })
+    }
+
+    #[tokio::test]
+    async fn deadline_expiry_keeps_the_blocking_slot_until_the_tool_finishes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let gate = Gate::default();
+        let finished = Arc::new(AtomicBool::new(false));
+        let registry = registry_with(vec![
+            gate_tool("test.gate", &gate, &finished, &started_tx),
+            Box::new(NoopTool),
+        ]);
+        let config = ConnectionConfig::default().with_max_blocking_tasks(1);
+        let slots = Arc::clone(&config.blocking_slots);
+        let (mut client, _dir) = connected_pair_with_registry(registry, config).await;
+        do_hello(&mut client).await;
+
+        // 1. The gate tool takes the only slot, then its deadline expires.
+        send_invoke(&mut client, 1, "test.gate", Some(200)).await;
+        assert_eq!(
+            recv_error_frame(&mut client).await,
+            (1, ErrorCode::DeadlineExceeded)
+        );
+        assert_eq!(
+            slots.available_permits(),
+            0,
+            "the slot must stay taken while the tool still runs"
+        );
+
+        // 2. With the slot still held, a new execution is refused.
+        send_invoke(&mut client, 2, "system.noop", Some(5_000)).await;
+        assert_eq!(
+            recv_error_frame(&mut client).await,
+            (2, ErrorCode::ResourceExhausted)
+        );
+
+        // 3. Releasing the tool frees the slot once it actually returns.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), started_rx.recv())
+                .await
+                .expect("tool never started")
+                .is_some()
+        );
+        gate.open();
+        wait_until("the gate tool to finish", || {
+            finished.load(Ordering::SeqCst)
+        })
+        .await;
+        wait_until("the slot to be returned", || slots.available_permits() == 1).await;
+
+        // 4. Recovered: a new execution runs and succeeds.
+        send_invoke(&mut client, 3, "system.noop", Some(5_000)).await;
+        let frame = recv_within(&mut client).await;
+        assert_eq!(frame.correlation_id, 3);
+        assert_eq!(
+            MessageType::from_u8(frame.msg_type),
+            Some(MessageType::Result)
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_deadline_never_starts_the_tool() {
+        use std::sync::atomic::AtomicBool;
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let gate = Gate::default(); // never opened: a started tool would block
+        let finished = Arc::new(AtomicBool::new(false));
+        let registry = registry_with(vec![gate_tool("test.gate", &gate, &finished, &started_tx)]);
+        let config = ConnectionConfig::default().with_max_blocking_tasks(1);
+        let slots = Arc::clone(&config.blocking_slots);
+        let (mut client, _dir) = connected_pair_with_registry(registry, config).await;
+        do_hello(&mut client).await;
+
+        send_invoke(&mut client, 1, "test.gate", Some(0)).await;
+        assert_eq!(
+            recv_error_frame(&mut client).await,
+            (1, ErrorCode::DeadlineExceeded)
+        );
+        assert!(
+            started_rx.try_recv().is_err(),
+            "a zero-deadline request must never start the tool"
+        );
+        assert_eq!(
+            slots.available_permits(),
+            1,
+            "a zero-deadline request must not take a blocking slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn deadline_is_clamped_to_max_deadline() {
+        use std::sync::atomic::AtomicBool;
+        let (started_tx, _started_rx) = mpsc::unbounded_channel();
+        let gate = Gate::default();
+        let finished = Arc::new(AtomicBool::new(false));
+        let registry = registry_with(vec![gate_tool("test.gate", &gate, &finished, &started_tx)]);
+        let config = ConnectionConfig {
+            max_deadline: Duration::from_millis(100),
+            ..Default::default()
+        };
+        let (mut client, _dir) = connected_pair_with_registry(registry, config).await;
+        do_hello(&mut client).await;
+
+        let started = std::time::Instant::now();
+        send_invoke(&mut client, 1, "test.gate", Some(3_600_000)).await;
+        assert_eq!(
+            recv_error_frame(&mut client).await,
+            (1, ErrorCode::DeadlineExceeded)
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "an hour-long request deadline must be clamped to max_deadline ({:?} elapsed)",
+            started.elapsed()
+        );
+
+        gate.open(); // let the blocked tool return so the test runtime can shut down
+    }
+
+    #[tokio::test]
+    async fn batch_calls_respect_blocking_slots() {
+        use std::sync::atomic::AtomicBool;
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let gate = Gate::default();
+        let finished = Arc::new(AtomicBool::new(false));
+        let registry = registry_with(vec![
+            gate_tool("test.gate", &gate, &finished, &started_tx),
+            Box::new(NoopTool),
+        ]);
+        let config = ConnectionConfig::default().with_max_blocking_tasks(1);
+        let (mut client, _dir) = connected_pair_with_registry(registry, config).await;
+        do_hello(&mut client).await;
+
+        // Occupy the only slot with a standalone INVOKE.
+        send_invoke(&mut client, 1, "test.gate", Some(5_000)).await;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), started_rx.recv())
+                .await
+                .expect("tool never started")
+                .is_some()
+        );
+
+        let batch = Batch {
+            calls: vec![
+                BatchInvoke {
+                    id: 10,
+                    tool: "system.noop".to_string(),
+                    args: serde_json::json!({}),
+                    deadline_ms: Some(5_000),
+                },
+                BatchInvoke {
+                    id: 11,
+                    tool: "system.noop".to_string(),
+                    args: serde_json::json!({}),
+                    deadline_ms: Some(5_000),
+                },
+            ],
+        };
+        send_raw(
+            &mut client,
+            Frame {
+                msg_type: MessageType::Batch as u8,
+                correlation_id: 2,
+                payload: codec::encode(&batch).unwrap(),
+            },
+        )
+        .await;
+        let frame = recv_within(&mut client).await;
+        assert_eq!(
+            MessageType::from_u8(frame.msg_type),
+            Some(MessageType::BatchResult)
+        );
+        let result: BatchResult = codec::decode(&frame.payload).unwrap();
+        assert_eq!(result.results.len(), 2);
+        for entry in &result.results {
+            match &entry.outcome {
+                BatchOutcome::Error { code, .. } => {
+                    assert_eq!(*code, ErrorCode::ResourceExhausted, "call {}", entry.id)
+                }
+                BatchOutcome::Ok { .. } => {
+                    panic!("call {} ran although the only slot was taken", entry.id)
+                }
+            }
+        }
+
+        // Release the holder so its own RESULT arrives and the slot returns.
+        gate.open();
+        let holder = recv_within(&mut client).await;
+        assert_eq!(holder.correlation_id, 1);
+        assert_eq!(
+            MessageType::from_u8(holder.msg_type),
+            Some(MessageType::Result)
+        );
     }
 }

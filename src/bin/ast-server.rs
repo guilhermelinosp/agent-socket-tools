@@ -6,6 +6,7 @@ use clap::Parser;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Semaphore;
 
 /// Starts an AST (Agent Socket Transport) server.
 ///
@@ -47,6 +48,19 @@ struct Cli {
     /// Maximum concurrent connections, server-wide.
     #[arg(long, default_value_t = 256)]
     max_connections: usize,
+
+    /// Maximum number of tool executions running at once on blocking
+    /// threads, server-wide. A tool keeps its slot until it actually
+    /// returns, even after its request was answered with a deadline or
+    /// cancellation; requests that find no free slot get RESOURCE_EXHAUSTED.
+    /// The blocking thread pool is sized to this value plus a small margin.
+    #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(u64).range(1..))]
+    max_blocking_tasks: u64,
+
+    /// Upper bound, in milliseconds, on any request's deadline. A larger
+    /// `deadline_ms` (or a larger `--default-deadline-ms`) is clamped to it.
+    #[arg(long, default_value_t = 60_000, value_parser = clap::value_parser!(u64).range(1..))]
+    max_deadline_ms: u64,
 
     /// Maximum number of calls in one `BATCH` message. A whole batch
     /// still counts as a single in-flight slot (see
@@ -96,8 +110,7 @@ struct Cli {
     require_same_uid: bool,
 }
 
-#[tokio::main]
-async fn main() -> std::process::ExitCode {
+fn main() -> std::process::ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -106,6 +119,35 @@ async fn main() -> std::process::ExitCode {
         .init();
 
     let cli = Cli::parse();
+    if cli.max_blocking_tasks > Semaphore::MAX_PERMITS as u64 {
+        tracing::error!(
+            max_blocking_tasks = cli.max_blocking_tasks,
+            limit = Semaphore::MAX_PERMITS,
+            "--max-blocking-tasks exceeds the semaphore's permit limit"
+        );
+        return std::process::ExitCode::FAILURE;
+    }
+
+    // Same worker-thread default as `#[tokio::main]`; only the blocking pool
+    // is sized explicitly. Tool executions are capped by `blocking_slots`
+    // (see `ConnectionConfig`), so the pool never needs more than that plus
+    // a small margin for other blocking work.
+    let blocking_threads = (cli.max_blocking_tasks as usize).saturating_add(8);
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .max_blocking_threads(blocking_threads)
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to build the async runtime");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    runtime.block_on(run(cli))
+}
+
+async fn run(cli: Cli) -> std::process::ExitCode {
     let socket_path = cli.socket_path.unwrap_or_else(default_ast_socket_path);
 
     let mut registry = ToolRegistry::new();
@@ -148,7 +190,10 @@ async fn main() -> std::process::ExitCode {
             .max_batch_output_bytes
             .unwrap_or(cli.max_frame_bytes as usize),
         stream_chunk_bytes: cli.stream_chunk_bytes,
-    };
+        max_deadline: Duration::from_millis(cli.max_deadline_ms),
+        ..Default::default()
+    }
+    .with_max_blocking_tasks(cli.max_blocking_tasks as usize);
 
     tracing::info!(
         path = ?listener.path(),
