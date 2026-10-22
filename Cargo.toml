@@ -37,6 +37,10 @@ path = "src/bin/mcp-server.rs"
 name = "ast-mcp-adapter"
 path = "src/bin/ast-mcp-adapter.rs"
 
+[[bin]]
+name = "alloc-probe"
+path = "src/bin/alloc-probe.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time", "sync", "signal", "process"] }
 serde = { version = "1", features = ["derive"] }
