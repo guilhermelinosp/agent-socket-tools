@@ -15,9 +15,20 @@ pub struct Cell {
     pub latencies_us: Vec<f64>,
     pub ok: u64,
     pub errors: u64,
-    pub first_error: Option<String>,
+    /// The first distinct error messages seen, at most [`MAX_ERROR_SAMPLES`].
+    pub error_samples: Vec<String>,
     pub start: Option<Instant>,
     pub end: Option<Instant>,
+}
+
+/// How many distinct error messages are kept per cell, run and entry.
+pub const MAX_ERROR_SAMPLES: usize = 5;
+
+/// Adds `message` to `samples` unless it is already there or the list is full.
+pub fn push_error_sample(samples: &mut Vec<String>, message: String) {
+    if samples.len() < MAX_ERROR_SAMPLES && !samples.contains(&message) {
+        samples.push(message);
+    }
 }
 
 impl Cell {
@@ -26,6 +37,11 @@ impl Cell {
             (Some(s), Some(e)) => e.saturating_duration_since(s),
             _ => Duration::ZERO,
         }
+    }
+
+    /// The first error message recorded, if any.
+    pub fn first_error(&self) -> Option<&str> {
+        self.error_samples.first().map(String::as_str)
     }
 
     /// Records one completed operation that was started at `started`.
@@ -47,9 +63,9 @@ impl Cell {
         self.note_error(message);
     }
 
-    /// Keeps the first error message for diagnostics without counting it.
+    /// Keeps an error message for diagnostics without counting it.
     pub fn note_error(&mut self, message: String) {
-        self.first_error.get_or_insert(message);
+        push_error_sample(&mut self.error_samples, message);
     }
 
     pub fn merge(cells: Vec<Cell>) -> Cell {
@@ -58,7 +74,9 @@ impl Cell {
             out.latencies_us.extend(c.latencies_us);
             out.ok += c.ok;
             out.errors += c.errors;
-            out.first_error = out.first_error.or(c.first_error);
+            for message in c.error_samples {
+                push_error_sample(&mut out.error_samples, message);
+            }
             out.start = earliest(out.start, c.start);
             out.end = latest(out.end, c.end);
         }
@@ -123,6 +141,8 @@ pub struct Run {
     pub throughput_ops_s: Option<f64>,
     pub ops: u64,
     pub errors: u64,
+    /// The first distinct error messages of this run (empty when none).
+    pub error_samples: Vec<String>,
     /// Named scalar measurements specific to a scenario.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -141,6 +161,7 @@ impl Run {
             throughput_ops_s: (secs > 0.0).then(|| cell.ok as f64 / secs),
             ops: cell.ok,
             errors: cell.errors,
+            error_samples: cell.error_samples.clone(),
             extra: Map::new(),
             raw_us: keep_raw.then(|| cell.latencies_us.clone()),
         }
@@ -178,6 +199,8 @@ pub struct Entry {
     pub params: Value,
     pub runs: Vec<Run>,
     pub summary: Map<String, Value>,
+    /// The first distinct error messages across all repeats (empty when none).
+    pub error_samples: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_us: Option<Vec<Vec<f64>>>,
 }
@@ -196,12 +219,19 @@ impl Entry {
                 .collect()
         });
         let summary = summarize(&runs);
+        let mut error_samples = Vec::new();
+        for run in &runs {
+            for message in &run.error_samples {
+                push_error_sample(&mut error_samples, message.clone());
+            }
+        }
         Entry {
             scenario: scenario.to_string(),
             protocol: protocol.to_string(),
             params,
             runs,
             summary,
+            error_samples,
             raw_us,
         }
     }
@@ -295,5 +325,53 @@ mod tests {
         assert_eq!(e.stat("startup_ms", "min"), Some(1.0));
         assert_eq!(e.stat("startup_ms", "max"), Some(3.0));
         assert_eq!(e.errors_total(), 1);
+    }
+
+    #[test]
+    fn error_samples_are_distinct_and_capped_at_five() {
+        let mut cell = Cell::default();
+        for i in 0..20 {
+            cell.fail(format!("error {}", i % 7));
+        }
+        // 20 failures, but only the first five distinct messages are kept.
+        assert_eq!(cell.errors, 20);
+        assert_eq!(
+            cell.error_samples,
+            ["error 0", "error 1", "error 2", "error 3", "error 4"]
+        );
+        assert_eq!(cell.first_error(), Some("error 0"));
+    }
+
+    #[test]
+    fn error_samples_merge_across_cells_without_exceeding_the_cap() {
+        let mut a = Cell::default();
+        a.fail("x".into());
+        a.fail("y".into());
+        let mut b = Cell::default();
+        b.fail("y".into());
+        for m in ["p", "q", "r", "s"] {
+            b.fail(m.into());
+        }
+        let merged = Cell::merge(vec![a, b]);
+        assert_eq!(merged.errors, 7);
+        assert_eq!(merged.error_samples, ["x", "y", "p", "q", "r"]);
+    }
+
+    #[test]
+    fn entry_aggregates_error_samples_across_repeats() {
+        let mut first = Cell::default();
+        first.fail("timeout".into());
+        let mut second = Cell::default();
+        second.fail("timeout".into());
+        second.fail("connection reset".into());
+        let runs = vec![
+            Run::from_cell(&first, false),
+            Run::from_cell(&second, false),
+            Run::from_cell(&Cell::default(), false),
+        ];
+        let e = Entry::new("concurrency", "ast", json!({}), runs, false);
+        assert_eq!(e.errors_total(), 3);
+        assert_eq!(e.error_samples, ["timeout", "connection reset"]);
+        assert_eq!(e.runs[2].error_samples, Vec::<String>::new());
     }
 }

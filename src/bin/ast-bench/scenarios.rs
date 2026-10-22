@@ -54,7 +54,7 @@ fn note_failures(phase: &str, cell: &Cell) {
         eprintln!(
             "  WARNING: {} {phase} errors; first: {}",
             cell.errors,
-            cell.first_error.as_deref().unwrap_or("unknown")
+            cell.first_error().unwrap_or("unknown")
         );
     }
 }
@@ -382,7 +382,7 @@ async fn run_group(mode: BatchMode, p: &mut Persistent) -> Result<(), String> {
         BatchMode::AstSequential => {
             let mut ast = AstHandle(p.ast.clone());
             let cell = sequential(&mut ast, &Op::noop(), GROUP).await;
-            match cell.first_error {
+            match cell.first_error().map(str::to_owned) {
                 Some(e) => Err(e),
                 None => Ok(()),
             }
@@ -414,7 +414,7 @@ async fn run_group(mode: BatchMode, p: &mut Persistent) -> Result<(), String> {
                 .mcp_real
                 .pipelined(GROUP, GROUP, "system.noop", &json!({}), Expect::Empty)
                 .await;
-            match cell.first_error {
+            match cell.first_error().map(str::to_owned) {
                 Some(e) if cell.errors > 0 => Err(e),
                 _ => Ok(()),
             }
@@ -769,7 +769,11 @@ async fn measure_cpu<T: Target>(cfg: &Config, target: &mut T, pid: u32) -> Vec<R
                 run.extra
                     .insert("server_cpu_us_per_op".to_string(), json!(per_op));
             }
-            _ => run.errors += 1,
+            _ => {
+                run.errors += 1;
+                run.error_samples
+                    .push("server CPU time unavailable (ps failed or no successful calls)".into());
+            }
         }
         runs.push(run);
     }

@@ -343,6 +343,30 @@ fn headers_ref(v: &[String]) -> Vec<&str> {
     v.iter().map(String::as_str).collect()
 }
 
+/// After a table: one line per cell that has errors, naming the cell and
+/// listing its first distinct error messages (at most five).
+fn error_notes<'a>(
+    md: &mut String,
+    entries: impl IntoIterator<Item = &'a Entry>,
+    name: impl Fn(&Entry) -> String,
+) {
+    for e in entries {
+        if e.errors_total() == 0 {
+            continue;
+        }
+        let samples = if e.error_samples.is_empty() {
+            "none recorded".to_string()
+        } else {
+            e.error_samples
+                .iter()
+                .map(|m| format!("`{}`", m.replace(['\n', '`'], " ")))
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        let _ = writeln!(md, "Error samples ({}): {samples}\n", name(e));
+    }
+}
+
 fn select<'a>(entries: &'a [Entry], scenario: &str) -> Vec<&'a Entry> {
     entries.iter().filter(|e| e.scenario == scenario).collect()
 }
@@ -371,6 +395,9 @@ fn section_startup(md: &mut String, entries: &[Entry]) {
         &["Server", "startup median (min–max)", "errors"],
         &rows,
     ));
+    error_notes(md, select(entries, "startup"), |e| {
+        label(&e.protocol).to_string()
+    });
 }
 
 fn section_sequential(md: &mut String, entries: &[Entry], scenario: &str, title: &str, note: &str) {
@@ -390,6 +417,9 @@ fn section_sequential(md: &mut String, entries: &[Entry], scenario: &str, title:
         &headers_ref(&latency_headers("Protocol", "throughput median (ops/s)")),
         &table_rows,
     ));
+    error_notes(md, select(entries, scenario), |e| {
+        label(&e.protocol).to_string()
+    });
 }
 
 fn section_payloads(md: &mut String, entries: &[Entry]) {
@@ -408,6 +438,13 @@ fn section_payloads(md: &mut String, entries: &[Entry]) {
             &headers_ref(&latency_headers("Protocol", "throughput median (ops/s)")),
             &rows,
         ));
+        error_notes(
+            md,
+            select(entries, "payload_sequential")
+                .into_iter()
+                .filter(|e| e.params["size"] == size),
+            |e| format!("{size}, {}", label(&e.protocol)),
+        );
     }
 }
 
@@ -425,6 +462,9 @@ fn section_discovery(md: &mut String, entries: &[Entry]) {
         &headers_ref(&latency_headers("Protocol", "throughput median (ops/s)")),
         &table_rows,
     ));
+    error_notes(md, select(entries, "discovery"), |e| {
+        label(&e.protocol).to_string()
+    });
 }
 
 fn section_batch(md: &mut String, entries: &[Entry]) {
@@ -442,6 +482,9 @@ fn section_batch(md: &mut String, entries: &[Entry]) {
         &headers_ref(&latency_headers("Mode", "groups/s median")),
         &table_rows,
     ));
+    error_notes(md, select(entries, "batch"), |e| {
+        e.params["mode"].as_str().unwrap_or("").to_string()
+    });
 }
 
 fn section_concurrency(md: &mut String, entries: &[Entry]) {
@@ -467,6 +510,14 @@ fn section_concurrency(md: &mut String, entries: &[Entry]) {
         )),
         &table_rows,
     ));
+    error_notes(md, select(entries, "concurrency"), |e| {
+        format!(
+            "{} · C={} · connections={}",
+            e.params["model"].as_str().unwrap_or(""),
+            e.params["concurrency"].as_u64().unwrap_or(0),
+            e.params["connections"].as_u64().unwrap_or(0)
+        )
+    });
 }
 
 fn section_deployment(md: &mut String, entries: &[Entry]) {
@@ -502,6 +553,9 @@ fn section_deployment(md: &mut String, entries: &[Entry]) {
         ],
         &table_rows,
     ));
+    error_notes(md, select(entries, "deployment_per_process"), |e| {
+        format!("{} processes", e.params["processes"])
+    });
 }
 
 fn section_cpu(md: &mut String, entries: &[Entry], cfg: &Config) {
@@ -544,6 +598,9 @@ fn section_cpu(md: &mut String, entries: &[Entry], cfg: &Config) {
         ],
         &table_rows,
     ));
+    error_notes(md, select(entries, "server_cpu"), |e| {
+        label(&e.protocol).to_string()
+    });
 }
 
 fn section_rss(md: &mut String, entries: &[Entry]) {
