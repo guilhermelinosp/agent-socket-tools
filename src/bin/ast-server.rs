@@ -25,6 +25,17 @@ struct Cli {
     #[arg(long)]
     read_dir: PathBuf,
 
+    /// Comma-separated allowlist of tools to register. Default: all of
+    /// them. Unknown names are a usage error (exit code 2). Only the listed
+    /// tools are registered, so `DISCOVER` and `INVOKE` see nothing else.
+    #[arg(
+        long,
+        value_delimiter = ',',
+        default_value = "system.info,system.noop,filesystem.read",
+        value_parser = parse_tool_name
+    )]
+    tools: Vec<String>,
+
     /// Maximum frame size, in bytes, for one AST message (request or
     /// response). See `docs/AST_PROTOCOL.md`'s framing section — this is
     /// checked against the frame's own length field before any buffer
@@ -159,17 +170,38 @@ fn main() -> std::process::ExitCode {
     code
 }
 
+/// Every tool this binary knows how to register, in `--tools` terms.
+const KNOWN_TOOLS: &[&str] = &["system.info", "system.noop", "filesystem.read"];
+
+fn parse_tool_name(name: &str) -> Result<String, String> {
+    if KNOWN_TOOLS.contains(&name) {
+        Ok(name.to_string())
+    } else {
+        Err(format!(
+            "unknown tool {name:?}; expected one of: {}",
+            KNOWN_TOOLS.join(", ")
+        ))
+    }
+}
+
 async fn run(cli: Cli) -> std::process::ExitCode {
     let socket_path = cli.socket_path.unwrap_or_else(default_ast_socket_path);
 
+    let selected = |name: &str| cli.tools.iter().any(|t| t == name);
     let mut registry = ToolRegistry::new();
-    registry.register(Box::new(SystemInfoTool));
-    registry.register(Box::new(NoopTool));
-    match FilesystemReadTool::new(&cli.read_dir) {
-        Ok(tool) => registry.register(Box::new(tool)),
-        Err(e) => {
-            tracing::error!(dir = ?cli.read_dir, error = %e, "cannot authorize read directory");
-            return std::process::ExitCode::FAILURE;
+    if selected("system.info") {
+        registry.register(Box::new(SystemInfoTool));
+    }
+    if selected("system.noop") {
+        registry.register(Box::new(NoopTool));
+    }
+    if selected("filesystem.read") {
+        match FilesystemReadTool::new(&cli.read_dir) {
+            Ok(tool) => registry.register(Box::new(tool)),
+            Err(e) => {
+                tracing::error!(dir = ?cli.read_dir, error = %e, "cannot authorize read directory");
+                return std::process::ExitCode::FAILURE;
+            }
         }
     }
     let registry = Arc::new(registry);
