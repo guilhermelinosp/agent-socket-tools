@@ -40,6 +40,11 @@ pub struct ConnectionConfig {
     pub handshake_timeout: Duration,
     pub peer_policy: PeerPolicy,
     pub server_name: String,
+    /// Maximum number of calls in one `BATCH`. A whole `BATCH` counts as
+    /// a single in-flight slot (see `max_in_flight`) regardless of this
+    /// value — this bounds how much sequential work one slot can demand,
+    /// not how many slots a batch consumes.
+    pub max_batch_size: usize,
 }
 
 impl Default for ConnectionConfig {
@@ -51,6 +56,7 @@ impl Default for ConnectionConfig {
             handshake_timeout: Duration::from_secs(5),
             peer_policy: PeerPolicy::SameUid,
             server_name: "agent-socket-tools/ast".to_string(),
+            max_batch_size: 100,
         }
     }
 }
@@ -356,6 +362,103 @@ async fn serve_reads(
                     max_frame_len,
                 );
             }
+            Some(MessageType::Batch) => {
+                let already_in_flight = {
+                    let mut set = in_flight.lock().unwrap_or_else(|p| p.into_inner());
+                    !set.insert(frame.correlation_id)
+                };
+                if already_in_flight {
+                    let _ = send_error(
+                        &tx,
+                        frame.correlation_id,
+                        ErrorCode::InvalidMessage,
+                        "duplicate correlation_id: a request with this id is already in flight",
+                        max_frame_len,
+                    )
+                    .await;
+                    continue;
+                }
+
+                // A whole BATCH occupies exactly one in-flight slot,
+                // regardless of how many calls it contains — see
+                // `ConnectionConfig::max_batch_size`'s doc comment.
+                let permit = match Arc::clone(&in_flight_limit).try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        in_flight
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .remove(&frame.correlation_id);
+                        let _ = send_error(
+                            &tx,
+                            frame.correlation_id,
+                            ErrorCode::ResourceExhausted,
+                            "server is already handling its configured maximum of in-flight requests on this connection",
+                            max_frame_len,
+                        )
+                        .await;
+                        continue;
+                    }
+                };
+
+                let batch: Batch = match codec::decode(&frame.payload) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        in_flight
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .remove(&frame.correlation_id);
+                        let _ = send_error(
+                            &tx,
+                            frame.correlation_id,
+                            ErrorCode::InvalidMessage,
+                            &e.to_string(),
+                            max_frame_len,
+                        )
+                        .await;
+                        continue;
+                    }
+                };
+
+                if batch.calls.len() > config.max_batch_size {
+                    in_flight
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .remove(&frame.correlation_id);
+                    let _ = send_error(
+                        &tx,
+                        frame.correlation_id,
+                        ErrorCode::InvalidMessage,
+                        &format!(
+                            "batch has {} calls, exceeding the configured maximum of {}",
+                            batch.calls.len(),
+                            config.max_batch_size
+                        ),
+                        max_frame_len,
+                    )
+                    .await;
+                    continue;
+                }
+
+                let notify = Arc::new(Notify::new());
+                cancellations
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .insert(frame.correlation_id, Arc::clone(&notify));
+
+                spawn_batch(
+                    frame.correlation_id,
+                    batch,
+                    Arc::clone(&registry),
+                    config.default_deadline,
+                    notify,
+                    permit,
+                    Arc::clone(&in_flight),
+                    Arc::clone(&cancellations),
+                    tx.clone(),
+                    max_frame_len,
+                );
+            }
             Some(MessageType::Cancel) => {
                 if let Ok(cancel) = codec::decode::<Cancel>(&frame.payload) {
                     if let Some(notify) = cancellations
@@ -386,7 +489,8 @@ async fn serve_reads(
                 | MessageType::DiscoverResult
                 | MessageType::Result
                 | MessageType::Error
-                | MessageType::Pong,
+                | MessageType::Pong
+                | MessageType::BatchResult,
             ) => {
                 // These are server->client-only message types; receiving
                 // one from a client is a protocol violation, not a crash.
@@ -459,6 +563,87 @@ fn spawn_invoke(
                 let _ = send_error(&tx, correlation_id, code, &message, max_frame_len).await;
             }
         }
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_batch(
+    correlation_id: u64,
+    batch: Batch,
+    registry: Arc<ToolRegistry>,
+    default_deadline: Duration,
+    cancel_notify: Arc<Notify>,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    in_flight: Arc<Mutex<std::collections::HashSet<u64>>>,
+    cancellations: Cancellations,
+    tx: mpsc::Sender<Frame>,
+    max_frame_len: u32,
+) {
+    tokio::spawn(async move {
+        let _permit = permit; // held for the whole batch's lifetime
+
+        // Sequential, in array order, never concurrently with each other
+        // — see `Batch`'s doc comment for why. Each call still goes
+        // through the exact same `run_invoke` a standalone `INVOKE` does,
+        // including its own deadline and racing the same shared
+        // `cancel_notify`, so a `CANCEL` targeting this batch stops
+        // whichever call is currently running the same way it would stop
+        // a single in-flight `INVOKE`.
+        let mut results = Vec::with_capacity(batch.calls.len());
+        for call in batch.calls {
+            let id = call.id;
+            let invoke = Invoke {
+                tool: call.tool,
+                args: call.args,
+                deadline_ms: call.deadline_ms,
+            };
+            let deadline = invoke
+                .deadline_ms
+                .map(Duration::from_millis)
+                .unwrap_or(default_deadline);
+
+            let outcome = run_invoke(
+                invoke,
+                Arc::clone(&registry),
+                deadline,
+                Arc::clone(&cancel_notify),
+            )
+            .await;
+            let was_cancelled = matches!(outcome, Err((ErrorCode::Cancelled, _)));
+
+            results.push(BatchResultEntry {
+                id,
+                outcome: match outcome {
+                    Ok(value) => BatchOutcome::Ok { value },
+                    Err((code, message)) => BatchOutcome::Error { code, message },
+                },
+            });
+
+            if was_cancelled {
+                // Stop processing the rest of the batch; the entries that
+                // never ran simply have no entry in `results` (see
+                // `BatchResult`'s doc comment).
+                break;
+            }
+        }
+
+        in_flight
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&correlation_id);
+        cancellations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&correlation_id);
+
+        let _ = send(
+            &tx,
+            MessageType::BatchResult,
+            correlation_id,
+            &BatchResult { results },
+            max_frame_len,
+        )
+        .await;
     });
 }
 
@@ -634,6 +819,26 @@ mod tests {
         }
         fn invoke(&self, _args: JsonValue) -> Result<JsonValue, RegistryToolError> {
             Ok(serde_json::json!({ "data": "x".repeat(self.result_bytes) }))
+        }
+    }
+
+    /// A test-only tool that always fails, for exercising `BATCH`'s
+    /// partial-failure handling.
+    struct FailingTool;
+    impl Tool for FailingTool {
+        fn name(&self) -> &str {
+            "test.failing"
+        }
+        fn description(&self) -> &str {
+            "always fails, for tests"
+        }
+        fn input_schema(&self) -> JsonValue {
+            serde_json::json!({})
+        }
+        fn invoke(&self, _args: JsonValue) -> Result<JsonValue, RegistryToolError> {
+            Err(RegistryToolError::Failed(
+                "deliberate test failure".to_string(),
+            ))
         }
     }
 
@@ -1071,5 +1276,250 @@ mod tests {
         };
         let (mut client, _dir) = connected_pair_with_registry(registry, config).await;
         do_hello(&mut client).await; // would hang/fail if the connection were rejected pre-handshake
+    }
+
+    #[tokio::test]
+    async fn batch_runs_all_calls_and_correlates_results_by_id() {
+        let registry = registry_with(vec![Box::new(SystemInfoTool)]);
+        let (mut client, _dir) =
+            connected_pair_with_registry(registry, ConnectionConfig::default()).await;
+        do_hello(&mut client).await;
+
+        let batch = Batch {
+            calls: vec![
+                BatchInvoke {
+                    id: 10,
+                    tool: "system.info".to_string(),
+                    args: serde_json::json!({}),
+                    deadline_ms: None,
+                },
+                BatchInvoke {
+                    id: 20,
+                    tool: "system.info".to_string(),
+                    args: serde_json::json!({}),
+                    deadline_ms: None,
+                },
+            ],
+        };
+        send_raw(
+            &mut client,
+            Frame {
+                msg_type: MessageType::Batch as u8,
+                correlation_id: 1,
+                payload: codec::encode(&batch).unwrap(),
+            },
+        )
+        .await;
+
+        let resp = recv_raw(&mut client).await;
+        assert_eq!(
+            MessageType::from_u8(resp.msg_type),
+            Some(MessageType::BatchResult)
+        );
+        let result: BatchResult = codec::decode(&resp.payload).unwrap();
+        assert_eq!(result.results.len(), 2);
+        assert_eq!(result.results[0].id, 10);
+        assert_eq!(result.results[1].id, 20);
+        for entry in &result.results {
+            assert!(matches!(entry.outcome, BatchOutcome::Ok { .. }));
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_partial_failure_does_not_stop_remaining_calls() {
+        let registry = registry_with(vec![Box::new(SystemInfoTool), Box::new(FailingTool)]);
+        let (mut client, _dir) =
+            connected_pair_with_registry(registry, ConnectionConfig::default()).await;
+        do_hello(&mut client).await;
+
+        let batch = Batch {
+            calls: vec![
+                BatchInvoke {
+                    id: 1,
+                    tool: "test.failing".to_string(),
+                    args: serde_json::json!({}),
+                    deadline_ms: None,
+                },
+                BatchInvoke {
+                    id: 2,
+                    tool: "system.info".to_string(),
+                    args: serde_json::json!({}),
+                    deadline_ms: None,
+                },
+            ],
+        };
+        send_raw(
+            &mut client,
+            Frame {
+                msg_type: MessageType::Batch as u8,
+                correlation_id: 1,
+                payload: codec::encode(&batch).unwrap(),
+            },
+        )
+        .await;
+
+        let resp = recv_raw(&mut client).await;
+        let result: BatchResult = codec::decode(&resp.payload).unwrap();
+        assert_eq!(result.results.len(), 2);
+        assert!(matches!(
+            result.results[0].outcome,
+            BatchOutcome::Error { .. }
+        ));
+        // The second call still ran, despite the first one failing.
+        assert!(matches!(result.results[1].outcome, BatchOutcome::Ok { .. }));
+    }
+
+    #[tokio::test]
+    async fn batch_exceeding_max_batch_size_is_rejected() {
+        let registry = registry_with(vec![Box::new(SystemInfoTool)]);
+        let config = ConnectionConfig {
+            max_batch_size: 2,
+            ..Default::default()
+        };
+        let (mut client, _dir) = connected_pair_with_registry(registry, config).await;
+        do_hello(&mut client).await;
+
+        let batch = Batch {
+            calls: (0..3)
+                .map(|id| BatchInvoke {
+                    id,
+                    tool: "system.info".to_string(),
+                    args: serde_json::json!({}),
+                    deadline_ms: None,
+                })
+                .collect(),
+        };
+        send_raw(
+            &mut client,
+            Frame {
+                msg_type: MessageType::Batch as u8,
+                correlation_id: 1,
+                payload: codec::encode(&batch).unwrap(),
+            },
+        )
+        .await;
+
+        let resp = recv_raw(&mut client).await;
+        assert_eq!(
+            MessageType::from_u8(resp.msg_type),
+            Some(MessageType::Error)
+        );
+        let err: ErrorPayload = codec::decode(&resp.payload).unwrap();
+        assert_eq!(err.code, ErrorCode::InvalidMessage);
+    }
+
+    #[tokio::test]
+    async fn cancel_of_an_in_flight_batch_stops_remaining_calls() {
+        let registry = registry_with(vec![Box::new(SlowTool {
+            sleep: Duration::from_secs(5),
+        })]);
+        let (mut client, _dir) =
+            connected_pair_with_registry(registry, ConnectionConfig::default()).await;
+        do_hello(&mut client).await;
+
+        let batch = Batch {
+            calls: vec![
+                BatchInvoke {
+                    id: 1,
+                    tool: "test.slow".to_string(),
+                    args: serde_json::json!({}),
+                    deadline_ms: Some(10_000),
+                },
+                BatchInvoke {
+                    id: 2,
+                    tool: "test.slow".to_string(),
+                    args: serde_json::json!({}),
+                    deadline_ms: Some(10_000),
+                },
+            ],
+        };
+        send_raw(
+            &mut client,
+            Frame {
+                msg_type: MessageType::Batch as u8,
+                correlation_id: 1,
+                payload: codec::encode(&batch).unwrap(),
+            },
+        )
+        .await;
+
+        tokio::time::sleep(Duration::from_millis(50)).await; // let the first call start
+        let cancel = Cancel {
+            target_correlation_id: 1,
+        };
+        send_raw(
+            &mut client,
+            Frame {
+                msg_type: MessageType::Cancel as u8,
+                correlation_id: 2,
+                payload: codec::encode(&cancel).unwrap(),
+            },
+        )
+        .await;
+
+        let resp = tokio::time::timeout(Duration::from_secs(2), recv_raw(&mut client))
+            .await
+            .unwrap();
+        assert_eq!(
+            MessageType::from_u8(resp.msg_type),
+            Some(MessageType::BatchResult)
+        );
+        let result: BatchResult = codec::decode(&resp.payload).unwrap();
+        // Only the call that was actually running when CANCEL arrived is
+        // in the result, marked Cancelled; the second call never started.
+        assert_eq!(result.results.len(), 1);
+        assert_eq!(result.results[0].id, 1);
+        assert!(matches!(
+            result.results[0].outcome,
+            BatchOutcome::Error {
+                code: ErrorCode::Cancelled,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn duplicate_batch_correlation_id_is_rejected() {
+        let registry = registry_with(vec![Box::new(SlowTool {
+            sleep: Duration::from_millis(500),
+        })]);
+        let (mut client, _dir) =
+            connected_pair_with_registry(registry, ConnectionConfig::default()).await;
+        do_hello(&mut client).await;
+
+        let batch = Batch {
+            calls: vec![BatchInvoke {
+                id: 1,
+                tool: "test.slow".to_string(),
+                args: serde_json::json!({}),
+                deadline_ms: Some(10_000),
+            }],
+        };
+        send_raw(
+            &mut client,
+            Frame {
+                msg_type: MessageType::Batch as u8,
+                correlation_id: 1,
+                payload: codec::encode(&batch).unwrap(),
+            },
+        )
+        .await;
+        send_raw(
+            &mut client,
+            Frame {
+                msg_type: MessageType::Batch as u8,
+                correlation_id: 1,
+                payload: codec::encode(&batch).unwrap(),
+            },
+        )
+        .await;
+
+        let resp = recv_raw(&mut client).await;
+        assert_eq!(
+            MessageType::from_u8(resp.msg_type),
+            Some(MessageType::Error)
+        );
+        let err: ErrorPayload = codec::decode(&resp.payload).unwrap();
+        assert_eq!(err.code, ErrorCode::InvalidMessage);
     }
 }

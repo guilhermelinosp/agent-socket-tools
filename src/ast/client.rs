@@ -274,6 +274,30 @@ impl AstClient {
         }
     }
 
+    /// Runs `calls` as a single `BATCH`. The server executes them
+    /// sequentially, in order (see `Batch`'s doc comment in
+    /// `src/ast/message.rs` for exactly why no concurrency), so this
+    /// waits roughly as long as the sum of each call's own work —
+    /// `deadline` bounds the whole batch's wait, not any individual
+    /// call's (each entry still carries its own `deadline_ms`).
+    pub async fn batch(
+        &self,
+        calls: Vec<BatchInvoke>,
+        deadline: Option<Duration>,
+    ) -> Result<Vec<BatchResultEntry>, AstClientError> {
+        let batch = Batch { calls };
+        let wait = deadline.unwrap_or(self.default_timeout) + Duration::from_secs(1);
+        let frame = self.request(MessageType::Batch, &batch, wait).await?;
+        match MessageType::from_u8(frame.msg_type) {
+            Some(MessageType::BatchResult) => {
+                let result: BatchResult = codec::decode(&frame.payload)?;
+                Ok(result.results)
+            }
+            Some(MessageType::Error) => Err(self.decode_server_error(&frame.payload)?),
+            _ => Err(AstClientError::UnexpectedResponseType(frame.msg_type)),
+        }
+    }
+
     fn decode_server_error(&self, payload: &[u8]) -> Result<AstClientError, AstClientError> {
         let err: ErrorPayload = codec::decode(payload)?;
         Ok(AstClientError::Server {

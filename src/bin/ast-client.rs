@@ -43,6 +43,16 @@ enum Command {
         #[arg(long)]
         deadline_ms: Option<u64>,
     },
+    /// Runs several tool calls as one BATCH. The server executes them
+    /// sequentially, in order — see `docs/AST_PROTOCOL.md`'s "Batch
+    /// execution" section.
+    Batch {
+        /// A JSON array of `{"id": <u64>, "tool": <string>, "args":
+        /// <object>, "deadline_ms": <u64, optional>}` objects. `id` must
+        /// be unique within this one batch.
+        #[arg(long)]
+        calls: String,
+    },
 }
 
 #[tokio::main]
@@ -106,6 +116,26 @@ async fn main() -> std::process::ExitCode {
                     println!(
                         "{}",
                         serde_json::to_string_pretty(&value).expect("serializes")
+                    );
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        }
+        Command::Batch { calls } => {
+            let calls: Vec<agent_socket_tools::ast::message::BatchInvoke> =
+                match serde_json::from_str(&calls) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("invalid --calls JSON: {e}");
+                        return std::process::ExitCode::FAILURE;
+                    }
+                };
+            match client.batch(calls, None).await {
+                Ok(results) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&results).expect("serializes")
                     );
                     Ok(())
                 }

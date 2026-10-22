@@ -122,21 +122,56 @@ numbers on your own machine; they're real but machine-specific.
 | 8 | `PING` | C→S | Implemented |
 | 9 | `PONG` | S→C | Implemented |
 | 10 | `CANCEL` | C→S | Implemented |
-| 11 | `BATCH` | — | **Reserved, not implemented** |
-| 12–14 | `STREAM_START`/`STREAM_CHUNK`/`STREAM_END` | — | **Reserved, not implemented** |
+| 11 | `BATCH` | C→S | Implemented |
+| 12 | `BATCH_RESULT` | S→C | Implemented |
+| 13–15 | `STREAM_START`/`STREAM_CHUNK`/`STREAM_END` | — | **Reserved, not implemented** |
 
-### Deferred: `BATCH` and streaming
+### Batch execution
 
-Neither has a demonstrated need yet in this crate's own tools
-(`system.info`, `filesystem.read` — neither produces incremental or
-unbounded output, and neither benefits from being grouped with other
-calls beyond what concurrent `INVOKE`s on one connection already provide).
-Implementing either now would be speculative. The byte values above are
+`BATCH` groups independent tool calls under one frame `correlation_id`,
+answered by a single `BATCH_RESULT`. Semantics, chosen conservatively:
+
+- **Ordering & concurrency**: calls run **sequentially, in array order,
+  never concurrently with each other.** This crate has no mechanism to
+  mark a tool "safe to run concurrently," and sequential execution is
+  correct regardless of what a future tool might do — including a
+  destructive one. (`system.info`/`filesystem.read`, this crate's only
+  tools today, are both read-only, so concurrent execution would also
+  have been safe for them specifically; the conservative default is
+  about tools that don't exist here yet, not these two.)
+- **Result correlation**: each `BatchInvoke` carries a caller-chosen
+  `id` (unique within that one batch, not connection-wide); each
+  `BatchResultEntry` echoes that `id` paired with its outcome. Callers
+  must correlate by `id`, not array position — in the normal case the
+  two coincide, but see cancellation below for when they don't.
+- **Partial failure**: one call failing does not stop the rest. Each
+  entry's outcome is independent — `BatchOutcome::Ok { value }` or
+  `BatchOutcome::Error { code, message }`, using the same `ErrorCode`s a
+  standalone `INVOKE` would report.
+- **Authorization**: identical to a standalone `INVOKE` — every call
+  goes through the same per-tool checks (e.g. `filesystem.read`'s
+  confinement to its authorized directory); `BATCH` grants no
+  additional authorization and bypasses none.
+- **Cancellation**: a `CANCEL` targeting the batch's `correlation_id`
+  stops whichever call is *currently* running (the same deadline/cancel
+  race a standalone `INVOKE` uses) and the batch ends there — entries
+  for calls that never started are simply absent from `results`, never
+  padded with a placeholder.
+- **Size limit**: `ast-server --max-batch-size` (default 100) bounds
+  calls-per-batch; exceeding it is rejected with `INVALID_MESSAGE`
+  before any call runs. A whole `BATCH` still occupies exactly one
+  in-flight slot (`--max-in-flight-per-connection`), regardless of how
+  many calls it contains.
+
+### Deferred: streaming
+
+No demonstrated need yet in this crate's own tools (`system.info`,
+`filesystem.read` — neither produces incremental or unbounded output).
+Implementing it now would be speculative. The byte values above are
 reserved so a future version can add them without reassigning a type
-code already in use. If/when a real tool needs incremental output
-(a genuinely large or streaming result) or batched execution with its
-own ordering/partial-failure/authorization semantics, that's the trigger
-to specify and implement these — not before.
+code already in use. If/when a real tool needs incremental output (a
+genuinely large or streaming result), that's the trigger to specify and
+implement this — not before.
 
 ## Payloads per type
 
@@ -156,6 +191,8 @@ names and optionality are exactly as declared there via `serde`).
 | `PING` | `Ping` | *(empty)* |
 | `PONG` | `Pong` | *(empty)* |
 | `CANCEL` | `Cancel` | `target_correlation_id: u64` |
+| `BATCH` | `Batch` | `calls: Vec<BatchInvoke>` — each `{id: u64, tool: String, args: <JSON>, deadline_ms: Option<u64>}` |
+| `BATCH_RESULT` | `BatchResult` | `results: Vec<BatchResultEntry>` — each `{id: u64, status: "ok" \| "error", value / code+message}` |
 
 Tool `args`/`value` are themselves arbitrary JSON values, re-encoded as
 MessagePack at the envelope level — a client library in any language can

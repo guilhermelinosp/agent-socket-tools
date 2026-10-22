@@ -2,9 +2,10 @@
 //!
 //! Every payload struct here is encoded as a MessagePack named-field map
 //! (see [`crate::ast::codec`]). `HELLO`/`HELLO_ACK`, `DISCOVER`, `INVOKE`,
-//! `RESULT`, `ERROR`, `PING`/`PONG`, and `CANCEL` are implemented. `BATCH`
-//! and `STREAM_*` are reserved type codes — see `docs/AST_PROTOCOL.md` for
-//! why they're deferred rather than implemented in v1.
+//! `RESULT`, `ERROR`, `PING`/`PONG`, `CANCEL`, and `BATCH`/`BATCH_RESULT`
+//! are implemented. `STREAM_*` are reserved type codes — see
+//! `docs/AST_PROTOCOL.md` for why that one's deferred rather than
+//! implemented in v1.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -24,11 +25,12 @@ pub enum MessageType {
     Ping = 8,
     Pong = 9,
     Cancel = 10,
+    Batch = 11,
+    BatchResult = 12,
     // Reserved, not implemented in v1 — see docs/AST_PROTOCOL.md §"Deferred".
-    // Batch = 11,
-    // StreamStart = 12,
-    // StreamChunk = 13,
-    // StreamEnd = 14,
+    // StreamStart = 13,
+    // StreamChunk = 14,
+    // StreamEnd = 15,
 }
 
 impl MessageType {
@@ -44,6 +46,8 @@ impl MessageType {
             8 => Some(Self::Ping),
             9 => Some(Self::Pong),
             10 => Some(Self::Cancel),
+            11 => Some(Self::Batch),
+            12 => Some(Self::BatchResult),
             _ => None,
         }
     }
@@ -136,6 +140,61 @@ pub struct ErrorPayload {
 pub struct Ping {}
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Pong {}
+
+/// One call within a `BATCH`. `id` is chosen by the client and must be
+/// unique *within this batch* (not connection-wide like
+/// `correlation_id` — a fresh `Batch` can reuse `id`s a previous one
+/// used). Otherwise identical in meaning to the matching fields on
+/// [`Invoke`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchInvoke {
+    pub id: u64,
+    pub tool: String,
+    pub args: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_ms: Option<u64>,
+}
+
+/// Grouped execution of independent tool calls under a single frame
+/// `correlation_id`. See `docs/AST_PROTOCOL.md`'s "Batch execution"
+/// section for the full ordering/concurrency/partial-failure contract —
+/// in short: calls run **sequentially, in array order, never
+/// concurrently with each other**, by design (this crate has no
+/// mechanism yet to mark a tool "safe to run concurrently," and the
+/// conservative default is correct until one exists), and a failure in
+/// one call does not stop the rest — except a `CANCEL` targeting this
+/// batch's `correlation_id`, which does stop it, after whichever call is
+/// currently running finishes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Batch {
+    pub calls: Vec<BatchInvoke>,
+}
+
+/// One call's outcome within a [`BatchResult`]. `id` matches the
+/// `BatchInvoke.id` it answers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum BatchOutcome {
+    Ok { value: Value },
+    Error { code: ErrorCode, message: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchResultEntry {
+    pub id: u64,
+    #[serde(flatten)]
+    pub outcome: BatchOutcome,
+}
+
+/// Response to `BATCH`. `results` always has one entry per call that
+/// actually ran — fewer than `calls.len()` iff the batch was cancelled
+/// partway through (see [`Batch`]'s doc comment), never more, and never
+/// reordered relative to the calls that did run (though see [`Batch`]
+/// regarding why callers should still correlate by `id`, not position).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchResult {
+    pub results: Vec<BatchResultEntry>,
+}
 
 /// Best-effort request to stop an in-flight `INVOKE`. See
 /// `docs/AST_PROTOCOL.md`'s "Cancellation" section for exactly what this

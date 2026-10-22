@@ -48,6 +48,12 @@ struct Cli {
     #[arg(long, default_value_t = 256)]
     max_connections: usize,
 
+    /// Maximum number of calls in one `BATCH` message. A whole batch
+    /// still counts as a single in-flight slot (see
+    /// `max_in_flight_per_connection`) regardless of this value.
+    #[arg(long, default_value_t = 100)]
+    max_batch_size: usize,
+
     /// Timeout, in seconds, to receive a valid `HELLO` after a connection
     /// is accepted. A peer that doesn't send one in time is disconnected.
     #[arg(long, default_value_t = 5)]
@@ -107,6 +113,7 @@ async fn main() -> std::process::ExitCode {
             PeerPolicy::AllowAny
         },
         server_name: "agent-socket-tools/ast".to_string(),
+        max_batch_size: cli.max_batch_size,
     };
 
     tracing::info!(

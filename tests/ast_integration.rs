@@ -275,3 +275,40 @@ async fn rejects_the_connection_beyond_max_connections() {
         "a connection after the holder's handshake completed and exited should still succeed"
     );
 }
+
+#[tokio::test]
+async fn batch_runs_multiple_calls_and_reports_each_outcome() {
+    let server = start_server().await;
+    let calls = r#"[
+        {"id": 1, "tool": "system.info", "args": {}},
+        {"id": 2, "tool": "filesystem.read", "args": {"path": "hello.txt"}},
+        {"id": 3, "tool": "does.not.exist", "args": {}}
+    ]"#;
+    let (success, stdout) = run_client(&server.socket_path, &["batch", "--calls", calls]);
+    assert!(success);
+    let results: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let results = results.as_array().unwrap();
+    assert_eq!(results.len(), 3);
+
+    assert_eq!(results[0]["id"], 1);
+    assert_eq!(results[0]["status"], "ok");
+
+    assert_eq!(results[1]["id"], 2);
+    assert_eq!(results[1]["status"], "ok");
+    assert_eq!(results[1]["value"]["contents"], "hello world\n");
+
+    assert_eq!(results[2]["id"], 3);
+    assert_eq!(results[2]["status"], "error");
+    assert_eq!(results[2]["code"], "TOOL_NOT_FOUND");
+}
+
+#[tokio::test]
+async fn batch_exceeding_configured_max_size_is_rejected() {
+    let server = start_server_with_args(&["--max-batch-size", "1"]).await;
+    let calls = r#"[
+        {"id": 1, "tool": "system.info", "args": {}},
+        {"id": 2, "tool": "system.info", "args": {}}
+    ]"#;
+    let (success, _stdout) = run_client(&server.socket_path, &["batch", "--calls", calls]);
+    assert!(!success);
+}

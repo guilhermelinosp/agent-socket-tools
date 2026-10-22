@@ -1,7 +1,7 @@
 //! Interoperability test vectors for `docs/AST_PROTOCOL.md`.
 //!
 //! These are the exact bytes a conforming client or server in *any*
-//! language must produce/accept for these four canonical messages. They
+//! language must produce/accept for these five canonical messages. They
 //! are generated from this crate's own encoder (not hand-written), then
 //! frozen here as a regression test: if the wire format ever drifts —
 //! intentionally or not — this test catches it, and the hex dumps quoted
@@ -98,5 +98,29 @@ async fn error_vector() {
         hex(&bytes),
         "00 00 00 39 07 00 00 00 00 00 00 00 03 82 a4 63 6f 64 65 ae 54 4f 4f 4c 5f 4e 4f 54 5f 46 4f \
          55 4e 44 a7 6d 65 73 73 61 67 65 b2 6e 6f 20 73 75 63 68 20 74 6f 6f 6c 3a 20 6e 6f 70 65"
+    );
+}
+
+#[tokio::test]
+async fn batch_vector() {
+    let batch = Batch {
+        calls: vec![BatchInvoke {
+            id: 1,
+            tool: "system.info".to_string(),
+            args: serde_json::json!({}),
+            deadline_ms: None,
+        }],
+    };
+    let frame = Frame {
+        msg_type: MessageType::Batch as u8,
+        correlation_id: 4,
+        payload: codec::encode(&batch).unwrap(),
+    };
+    let bytes = encode_frame(&frame).await;
+    assert_eq!(bytes.len(), 49);
+    assert_eq!(
+        hex(&bytes),
+        "00 00 00 2d 0b 00 00 00 00 00 00 00 04 81 a5 63 61 6c 6c 73 91 83 a2 69 64 01 a4 74 6f 6f 6c \
+         ab 73 79 73 74 65 6d 2e 69 6e 66 6f a4 61 72 67 73 80"
     );
 }
