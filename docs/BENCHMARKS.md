@@ -23,10 +23,25 @@ cargo run --release --bin ast-bench -- --quick --json-out bench-quick.json   # s
 - Every option and its default is listed by `cargo run --bin ast-bench -- --help`.
 - A debug build prints a `DEBUG BUILD — numbers are not valid` warning at the
   top of the report. Only `--release` numbers are meaningful.
+- `--only LIST` runs only the named scenarios (comma-separated): `startup`,
+  `noop`, `info`, `payload`, `discovery`, `batch`, `concurrency`,
+  `deployment`, `cpu`, `rss`. Default: all. Unselected scenarios are neither
+  run nor reported, and the report's header lists the scenarios that ran.
+  Each run uses fresh servers and samplers, so partial runs are comparable
+  with each other but not row-for-row with a full run. The `rss` samplers
+  only run when `rss` is selected.
+- To reproduce just the concurrency table at one level:
+  `cargo run --release --bin ast-bench -- --only concurrency --concurrency-levels 64 --repeats 10`.
+- Reproducible, archived runs go through
+  [`scripts/run-benchmarks.sh`](../scripts/run-benchmarks.sh). It writes a
+  dated, non-overwriting directory under `docs/results/` with the JSON and
+  Markdown reports, the allocator probe, and an `ENV.txt` (toolchain, host,
+  CPU, git SHA, dirty-tree count).
 
 Options: `--iterations` (500), `--warmup` (100), `--repeats` (5),
 `--concurrency-levels` (1,4,16,64), `--total-ops` (2000, operations per
-concurrency cell), `--cpu-ops` (20000), `--json-out`, `--raw`, `--quick`.
+concurrency cell), `--cpu-ops` (20000), `--json-out`, `--raw`, `--quick`,
+`--only` (all scenarios).
 
 ## Fairness rules
 

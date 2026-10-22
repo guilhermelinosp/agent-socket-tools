@@ -147,6 +147,8 @@ impl Config {
             "quick": self.quick,
             "debug_build": self.debug_build,
             "json_out": self.json_out.as_ref().map(|p| p.display().to_string()),
+            "only": self.only,
+            "scenarios_run": self.selected(),
             "batch_group_size": 20,
             "payload_sizes_bytes": { "tiny": 2, "medium": 16 * 1024, "large": 512 * 1024 },
             "request_timeout_s": 10,
@@ -174,23 +176,45 @@ pub fn markdown(env: &Environment, cfg: &Config, entries: &[Entry]) -> String {
     md.push_str("## Methodology\n\n");
     let _ = writeln!(md, "{METHODOLOGY}\n");
 
-    section_startup(&mut md, entries);
-    section_sequential(&mut md, entries, "noop_sequential", "## No-op (`system.noop`), sequential, persistent connection",
-        "The same call on every protocol. The AST ping row is the protocol floor and is not comparable to tool calls.");
-    section_sequential(
-        &mut md,
-        entries,
-        "info_sequential",
-        "## Info (`system.info`), sequential, persistent connection",
-        "",
-    );
-    section_payloads(&mut md, entries);
-    section_discovery(&mut md, entries);
-    section_batch(&mut md, entries);
-    section_concurrency(&mut md, entries);
-    section_deployment(&mut md, entries);
-    section_cpu(&mut md, entries, cfg);
-    section_rss(&mut md, entries);
+    let _ = writeln!(md, "**Scenarios run:** {}\n", cfg.selected().join(", "));
+
+    if cfg.wants("startup") {
+        section_startup(&mut md, entries);
+    }
+    if cfg.wants("noop") {
+        section_sequential(&mut md, entries, "noop_sequential", "## No-op (`system.noop`), sequential, persistent connection",
+            "The same call on every protocol. The AST ping row is the protocol floor and is not comparable to tool calls.");
+    }
+    if cfg.wants("info") {
+        section_sequential(
+            &mut md,
+            entries,
+            "info_sequential",
+            "## Info (`system.info`), sequential, persistent connection",
+            "",
+        );
+    }
+    if cfg.wants("payload") {
+        section_payloads(&mut md, entries);
+    }
+    if cfg.wants("discovery") {
+        section_discovery(&mut md, entries);
+    }
+    if cfg.wants("batch") {
+        section_batch(&mut md, entries);
+    }
+    if cfg.wants("concurrency") {
+        section_concurrency(&mut md, entries);
+    }
+    if cfg.wants("deployment") {
+        section_deployment(&mut md, entries);
+    }
+    if cfg.wants("cpu") {
+        section_cpu(&mut md, entries, cfg);
+    }
+    if cfg.wants("rss") {
+        section_rss(&mut md, entries);
+    }
 
     md.push_str("## Not measured\n\n");
     for item in NOT_MEASURED {
@@ -201,7 +225,17 @@ pub fn markdown(env: &Environment, cfg: &Config, entries: &[Entry]) -> String {
         let _ = writeln!(md, "- {item}");
     }
     md.push_str("\n---\n\n");
-    md.push_str("Reproduce with: `cargo build --release && cargo run --release --bin ast-bench`\n");
+    if cfg.only.is_empty() {
+        md.push_str(
+            "Reproduce with: `cargo build --release && cargo run --release --bin ast-bench`\n",
+        );
+    } else {
+        let _ = writeln!(
+            md,
+            "Reproduce with: `cargo build --release && cargo run --release --bin ast-bench -- --only {}`\n",
+            cfg.only.join(",")
+        );
+    }
     md
 }
 
@@ -553,6 +587,7 @@ mod tests {
             quick: false,
             debug_build: false,
             json_out: None,
+            only: Vec::new(),
         };
         let env = Environment::collect();
         let doc = json_document(&env, &cfg, &[]);

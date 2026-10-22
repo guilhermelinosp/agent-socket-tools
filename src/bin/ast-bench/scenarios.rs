@@ -170,10 +170,13 @@ async fn startup_once(proto: &str, fixtures: &Path, sockets: &Path) -> Result<f6
 /// `system.info`. AST `ping` is reported as a separate, non-comparable row.
 pub async fn noop_and_info(cfg: &Config, p: &mut Persistent) -> Vec<Entry> {
     let mut out = Vec::new();
-    for (scenario, op) in [
-        ("noop_sequential", Op::noop()),
-        ("info_sequential", Op::info()),
+    for (name, scenario, op) in [
+        ("noop", "noop_sequential", Op::noop()),
+        ("info", "info_sequential", Op::info()),
     ] {
+        if !cfg.wants(name) {
+            continue;
+        }
         let params = json!({ "tool": op_tool(&op), "iterations": cfg.iterations, "connection": "persistent" });
         out.push(Entry::new(
             scenario,
@@ -206,20 +209,23 @@ pub async fn noop_and_info(cfg: &Config, p: &mut Persistent) -> Vec<Entry> {
         ));
     }
 
-    let mut runs = Vec::with_capacity(cfg.repeats);
-    for r in 1..=cfg.repeats {
-        progress("noop_sequential", AST_PING, r, cfg.repeats);
-        let _ = ping_sequential(&p.ast, cfg.warmup).await;
-        let cell = ping_sequential(&p.ast, cfg.iterations).await;
-        runs.push(Run::from_cell(&cell, cfg.raw));
+    // The AST ping floor belongs to the no-op scenario's table.
+    if cfg.wants("noop") {
+        let mut runs = Vec::with_capacity(cfg.repeats);
+        for r in 1..=cfg.repeats {
+            progress("noop_sequential", AST_PING, r, cfg.repeats);
+            let _ = ping_sequential(&p.ast, cfg.warmup).await;
+            let cell = ping_sequential(&p.ast, cfg.iterations).await;
+            runs.push(Run::from_cell(&cell, cfg.raw));
+        }
+        out.push(Entry::new(
+            "noop_sequential",
+            AST_PING,
+            json!({ "op": "ping", "note": "protocol floor, not comparable to tool calls" }),
+            runs,
+            cfg.raw,
+        ));
     }
-    out.push(Entry::new(
-        "noop_sequential",
-        AST_PING,
-        json!({ "op": "ping", "note": "protocol floor, not comparable to tool calls" }),
-        runs,
-        cfg.raw,
-    ));
     out
 }
 

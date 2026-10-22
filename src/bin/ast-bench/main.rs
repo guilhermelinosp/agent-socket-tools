@@ -62,6 +62,36 @@ struct Cli {
     /// cpu-ops 2000, concurrency-levels 1,4,16. Overrides the values above.
     #[arg(long)]
     quick: bool,
+    /// Run only these scenarios, comma-separated. Values: startup, noop,
+    /// info, payload, discovery, batch, concurrency, deployment, cpu, rss.
+    /// Default: all. Unselected scenarios are neither run nor reported.
+    #[arg(long, value_delimiter = ',', value_parser = parse_scenario)]
+    only: Vec<String>,
+}
+
+/// Scenario names accepted by `--only`, in the order they run.
+pub const SCENARIO_NAMES: &[&str] = &[
+    "startup",
+    "noop",
+    "info",
+    "payload",
+    "discovery",
+    "batch",
+    "concurrency",
+    "deployment",
+    "cpu",
+    "rss",
+];
+
+fn parse_scenario(name: &str) -> Result<String, String> {
+    if SCENARIO_NAMES.contains(&name) {
+        Ok(name.to_string())
+    } else {
+        Err(format!(
+            "unknown scenario {name:?}; expected one of: {}",
+            SCENARIO_NAMES.join(", ")
+        ))
+    }
 }
 
 /// The effective configuration of one run.
@@ -77,9 +107,25 @@ pub struct Config {
     pub quick: bool,
     pub debug_build: bool,
     pub json_out: Option<PathBuf>,
+    /// Empty means every scenario runs. See [`Config::wants`].
+    pub only: Vec<String>,
 }
 
 impl Config {
+    /// Whether scenario `name` is selected by `--only` (or by default).
+    pub fn wants(&self, name: &str) -> bool {
+        self.only.is_empty() || self.only.iter().any(|s| s == name)
+    }
+
+    /// The scenarios that will run, in run order. Reported in the output.
+    pub fn selected(&self) -> Vec<&'static str> {
+        SCENARIO_NAMES
+            .iter()
+            .copied()
+            .filter(|n| self.wants(n))
+            .collect()
+    }
+
     fn from_cli(cli: Cli) -> Result<Config, String> {
         let mut cfg = Config {
             iterations: cli.iterations,
@@ -92,6 +138,7 @@ impl Config {
             quick: cli.quick,
             debug_build: cfg!(debug_assertions),
             json_out: cli.json_out,
+            only: cli.only,
         };
         if cfg.quick {
             cfg.iterations = 50;
@@ -165,12 +212,18 @@ async fn run(cfg: &Config) -> Result<(), String> {
     let mut mcp_like = McpStdio::spawn("mcp-like-server", fixtures.path())?;
     mcp_like.initialize().await?;
 
-    let samplers = [
-        ("legacy", ResourceSampler::start(legacy_server.pid())),
-        ("ast", ResourceSampler::start(ast_server.pid())),
-        ("mcp-server", ResourceSampler::start(mcp_real.pid())),
-        ("mcp-like-server", ResourceSampler::start(mcp_like.pid())),
-    ];
+    // Resource samplers poll `ps` while the scenarios run, so they are only
+    // started when the RSS scenario was selected.
+    let samplers: Vec<(&str, ResourceSampler)> = if cfg.wants("rss") {
+        vec![
+            ("legacy", ResourceSampler::start(legacy_server.pid())),
+            ("ast", ResourceSampler::start(ast_server.pid())),
+            ("mcp-server", ResourceSampler::start(mcp_real.pid())),
+            ("mcp-like-server", ResourceSampler::start(mcp_like.pid())),
+        ]
+    } else {
+        Vec::new()
+    };
 
     let paths = Paths {
         legacy: legacy_path,
@@ -186,26 +239,44 @@ async fn run(cfg: &Config) -> Result<(), String> {
     };
 
     let mut entries = Vec::new();
-    eprintln!("startup");
-    entries.extend(scenarios::startup(cfg, fixtures.path(), sockets.path()).await);
-    eprintln!("sequential latency");
-    entries.extend(scenarios::noop_and_info(cfg, &mut p).await);
-    entries.extend(scenarios::payloads(cfg, &mut p).await);
-    entries.extend(scenarios::discovery(cfg, &mut p).await);
-    eprintln!("batch");
-    entries.extend(scenarios::batch(cfg, &mut p).await);
-    eprintln!("concurrency");
-    entries.extend(scenarios::concurrency(cfg, &mut p, &paths).await);
-    eprintln!("deployment comparison");
-    entries.extend(scenarios::deployment(cfg, fixtures.path()).await);
-    eprintln!("server CPU");
-    entries.extend(scenarios::cpu(cfg, &mut p).await);
+    if cfg.wants("startup") {
+        eprintln!("startup");
+        entries.extend(scenarios::startup(cfg, fixtures.path(), sockets.path()).await);
+    }
+    if cfg.wants("noop") || cfg.wants("info") {
+        eprintln!("sequential latency");
+        entries.extend(scenarios::noop_and_info(cfg, &mut p).await);
+    }
+    if cfg.wants("payload") {
+        entries.extend(scenarios::payloads(cfg, &mut p).await);
+    }
+    if cfg.wants("discovery") {
+        entries.extend(scenarios::discovery(cfg, &mut p).await);
+    }
+    if cfg.wants("batch") {
+        eprintln!("batch");
+        entries.extend(scenarios::batch(cfg, &mut p).await);
+    }
+    if cfg.wants("concurrency") {
+        eprintln!("concurrency");
+        entries.extend(scenarios::concurrency(cfg, &mut p, &paths).await);
+    }
+    if cfg.wants("deployment") {
+        eprintln!("deployment comparison");
+        entries.extend(scenarios::deployment(cfg, fixtures.path()).await);
+    }
+    if cfg.wants("cpu") {
+        eprintln!("server CPU");
+        entries.extend(scenarios::cpu(cfg, &mut p).await);
+    }
 
     let peaks: Vec<(&str, u64)> = samplers
         .into_iter()
         .map(|(name, sampler)| (name, sampler.stop()))
         .collect();
-    entries.extend(scenarios::peak_rss(&peaks));
+    if cfg.wants("rss") {
+        entries.extend(scenarios::peak_rss(&peaks));
+    }
     drop(p);
 
     let env = report::Environment::collect();
@@ -218,4 +289,46 @@ async fn run(cfg: &Config) -> Result<(), String> {
         eprintln!("wrote JSON results to {}", path.display());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_with(only: &[&str]) -> Config {
+        Config {
+            iterations: 1,
+            warmup: 0,
+            repeats: 1,
+            total_ops: 1,
+            cpu_ops: 1,
+            levels: vec![1],
+            raw: false,
+            quick: false,
+            debug_build: false,
+            json_out: None,
+            only: only.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn default_selects_every_scenario() {
+        let cfg = config_with(&[]);
+        assert_eq!(cfg.selected(), SCENARIO_NAMES.to_vec());
+        assert!(cfg.wants("rss"));
+    }
+
+    #[test]
+    fn only_selects_just_the_named_scenarios_in_run_order() {
+        let cfg = config_with(&["concurrency", "noop"]);
+        assert_eq!(cfg.selected(), vec!["noop", "concurrency"]);
+        assert!(!cfg.wants("info"));
+    }
+
+    #[test]
+    fn unknown_scenario_names_are_rejected() {
+        assert!(parse_scenario("concurrency").is_ok());
+        let err = parse_scenario("latency").unwrap_err();
+        assert!(err.contains("latency"));
+    }
 }
