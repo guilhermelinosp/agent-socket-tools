@@ -2,7 +2,7 @@ use agent_socket_tools::config::{
     default_socket_path, DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_MESSAGE_BYTES,
 };
 use agent_socket_tools::protocol::{ErrorCode, Response};
-use agent_socket_tools::tools::{FilesystemReadTool, SystemInfoTool, ToolRegistry};
+use agent_socket_tools::tools::{FilesystemReadTool, NoopTool, SystemInfoTool, ToolRegistry};
 use agent_socket_tools::transport::{handle_connection, BoundListener, ConnectionLimiter};
 use clap::Parser;
 use std::path::PathBuf;
@@ -63,6 +63,7 @@ async fn main() -> std::process::ExitCode {
 
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(SystemInfoTool));
+    registry.register(Box::new(NoopTool));
     match FilesystemReadTool::new(&cli.read_dir) {
         Ok(tool) => registry.register(Box::new(tool)),
         Err(e) => {

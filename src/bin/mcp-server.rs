@@ -12,7 +12,7 @@
 //! against this binary is comparing protocols and transports, not
 //! comparing different tool logic dressed up as the same tools.
 
-use agent_socket_tools::tools::{FilesystemReadTool, SystemInfoTool, ToolRegistry};
+use agent_socket_tools::tools::{FilesystemReadTool, NoopTool, SystemInfoTool, ToolRegistry};
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
@@ -99,6 +99,7 @@ async fn main() -> std::process::ExitCode {
 
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(SystemInfoTool));
+    registry.register(Box::new(NoopTool));
     match FilesystemReadTool::new(&read_dir) {
         Ok(tool) => registry.register(Box::new(tool)),
         Err(e) => {

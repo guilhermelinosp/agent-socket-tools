@@ -21,7 +21,7 @@
 //! so all three baselines in `ast-bench` do identical work — only the
 //! transport and wire format differ.
 
-use agent_socket_tools::tools::{FilesystemReadTool, SystemInfoTool, ToolRegistry};
+use agent_socket_tools::tools::{FilesystemReadTool, NoopTool, SystemInfoTool, ToolRegistry};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
@@ -36,6 +36,7 @@ fn main() {
         });
 
     let mut registry = ToolRegistry::new();
+    registry.register(Box::new(NoopTool));
     registry.register(Box::new(SystemInfoTool));
     match FilesystemReadTool::new(&read_dir) {
         Ok(tool) => registry.register(Box::new(tool)),

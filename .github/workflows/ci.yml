@@ -48,6 +48,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --all-targets
       - run: cargo test --all-targets
+      - name: ast-bench smoke test (quick profile, Linux only)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo run --bin ast-bench -- --quick --json-out /tmp/bench-quick.json
 
   audit:
     name: cargo audit

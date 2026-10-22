@@ -23,7 +23,7 @@ path = "src/bin/ast-client.rs"
 
 [[bin]]
 name = "ast-bench"
-path = "src/bin/ast-bench.rs"
+path = "src/bin/ast-bench/main.rs"
 
 [[bin]]
 name = "mcp-like-server"

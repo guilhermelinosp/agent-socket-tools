@@ -1,6 +1,6 @@
 use agent_socket_tools::ast::connection::{run_connection, ConnectionConfig, PeerPolicy};
 use agent_socket_tools::config::default_ast_socket_path;
-use agent_socket_tools::tools::{FilesystemReadTool, SystemInfoTool, ToolRegistry};
+use agent_socket_tools::tools::{FilesystemReadTool, NoopTool, SystemInfoTool, ToolRegistry};
 use agent_socket_tools::transport::BoundListener;
 use clap::Parser;
 use std::path::PathBuf;
@@ -110,6 +110,7 @@ async fn main() -> std::process::ExitCode {
 
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(SystemInfoTool));
+    registry.register(Box::new(NoopTool));
     match FilesystemReadTool::new(&cli.read_dir) {
         Ok(tool) => registry.register(Box::new(tool)),
         Err(e) => {
