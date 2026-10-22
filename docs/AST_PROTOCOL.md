@@ -450,8 +450,16 @@ is a breaking change requiring a `protocol_version` bump.
 
 **`filesystem.read` confinement**
 
-- The requested path is canonicalized under `--read-dir`, the final component is opened with `O_NOFOLLOW`, and the opened file descriptor is checked with `fstat`.
-- Residual risk: intermediate directories can be swapped between `canonicalize` and `open` by anyone who can write inside the tree. `--read-dir` must therefore not be writable by untrusted principals. No portable Linux and macOS equivalent of `openat2`/`RESOLVE_BENEATH` is used, to avoid an OS-specific dependency.
+- The base directory (`--read-dir`) is opened once at startup. Each request is resolved relative to that descriptor, one component at a time, with `openat` and `O_NOFOLLOW` on every component. The client's path never reaches a path-based syscall, so a directory swapped for a symlink during a request is refused, not followed.
+- Refused before any filesystem access: empty paths, absolute paths (even ones inside the base), paths containing NUL, and any `..` component. `.` and empty components are ignored.
+- Refused: any symlink in the requested path, including one that points inside the base. This is a deliberate rule, not a side effect.
+- FIFOs, sockets and devices are refused without blocking. The final open uses `O_NONBLOCK`, and the regular-file check runs on the opened descriptor.
+- Reads are bounded: 1 MiB for `INVOKE`, 256 MiB for streamed reads. A file that grows past the limit during an `INVOKE` read is an error, not a truncated result. Cancellation is checked between 64 KiB blocks.
+- Error messages contain only the client's own text or a generic phrase. They never contain the host's base path.
+- Residual risks, not solved by the server:
+  - **Hardlinks.** A hardlink inside the tree to a file outside it cannot be detected. A writer who can create that link must already be able to write into the tree and read the target.
+  - **Mounts.** A bind mount or other mount point inside the tree is followed. Only symlinks are refused.
+  - **Same-UID processes.** A process running as the server's uid can read the same files directly and can also talk to the socket. The security boundary is the UID, not this tool. Keep `--read-dir` writable only by principals you trust at the server's level.
 
 **Error messages**
 
@@ -464,7 +472,7 @@ is a breaking change requiring a `protocol_version` bump.
 **Other**
 
 - No arbitrary shell execution, by design.
-- `unsafe` is confined to peer-credential FFI and the socket-hardening FFI shared with the legacy protocol. Each call site has a `SAFETY` comment.
+- `unsafe` is confined to peer-credential FFI, the socket-hardening FFI shared with the legacy protocol, and the single `openat` wrapper behind `filesystem.read`. Each call site has a `SAFETY` comment.
 
 ## Compatibility and migration
 
@@ -692,6 +700,7 @@ Defaults are for `ast-server`. Values marked *fixed* are constants in the code a
 | `filesystem.read`, invoke | fixed (tool) | 1 MiB | The tool rejects larger files. |
 | `filesystem.read`, streamed | fixed (tool) | 256 MiB | The tool rejects larger files. |
 | Client streamed result | client `max_stream_bytes` | 256 MiB | The client rejects the stream. |
+| Registered tools | `--tools` (comma-separated) | `system.info,system.noop,filesystem.read` | Not a limit, but the attack-surface setting. Unknown names fail at startup with exit code 2. Unlisted tools are not registered, so `INVOKE` answers `ToolNotFound`. `filesystem.read` is built only when listed, but `--read-dir` stays required. |
 
 ## Known limitations
 
