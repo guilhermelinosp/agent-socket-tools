@@ -45,6 +45,9 @@ TYPE_PONG = 9
 TYPE_CANCEL = 10
 TYPE_BATCH = 11
 TYPE_BATCH_RESULT = 12
+TYPE_STREAM_START = 13
+TYPE_STREAM_CHUNK = 14
+TYPE_STREAM_END = 15
 
 
 class AstProtocolError(Exception):
@@ -168,6 +171,70 @@ class AstClient:
         if frame.msg_type != TYPE_RESULT:
             raise AstProtocolError(f"expected RESULT, got type {frame.msg_type}")
         return _unpack(frame.payload)["value"]
+
+    def invoke_stream(
+        self, tool: str, args: dict[str, Any] | None = None, deadline_ms: int | None = None
+    ) -> Any:
+        """Like :meth:`invoke`, but requests chunked/streamed delivery —
+        returns the exact same reassembled value either way.
+
+        Two wire modes exist (see ``docs/AST_PROTOCOL.md``'s "Chunked
+        streaming" section), both handled here:
+
+        - Chunked delivery of an already-computed result (``StreamStart``
+          has no ``raw`` key): concatenated chunk bytes are the
+          MessagePack encoding of the result value itself.
+        - Genuine incremental streaming (``StreamStart["raw"]`` present,
+          e.g. for ``filesystem.read``): concatenated chunk bytes are the
+          raw UTF-8 bytes of one field (``raw["field_name"]``), inserted
+          into ``raw["metadata"]`` to reassemble the full result — never
+          MessagePack-decoded, since they were never MessagePack-encoded
+          in the first place.
+        """
+        payload: dict[str, Any] = {"tool": tool, "args": args or {}, "stream": True}
+        if deadline_ms is not None:
+            payload["deadline_ms"] = deadline_ms
+        cid = self._correlation_id()
+        self._send(TYPE_INVOKE, cid, payload)
+
+        first = self._recv_matching(cid)
+        self._raise_if_error(first)
+        if first.msg_type != TYPE_STREAM_START:
+            raise AstProtocolError(f"expected STREAM_START, got type {first.msg_type}")
+        start = _unpack(first.payload)
+
+        encoded = bytearray()
+        while True:
+            frame = self._recv_matching(cid)
+            if frame.msg_type == TYPE_STREAM_CHUNK:
+                chunk = _unpack(frame.payload)
+                encoded.extend(chunk["data"])
+            elif frame.msg_type == TYPE_STREAM_END:
+                break
+            else:
+                raise AstProtocolError(f"unexpected message type during stream: {frame.msg_type}")
+
+        raw = start.get("raw")
+        if raw is None:
+            return _unpack(bytes(encoded))
+        value = dict(raw["metadata"])
+        value[raw["field_name"]] = bytes(encoded).decode("utf-8")
+        return value
+
+    def _recv_matching(self, correlation_id: int) -> Frame:
+        """Reads frames until one matches `correlation_id`. This client is
+        synchronous and single-request-at-a-time (see the module
+        docstring), so in practice the very next frame always matches —
+        this just makes that assumption explicit and fails loudly rather
+        than silently misattributing a frame if it's ever violated.
+        """
+        frame = read_frame(self.sock)
+        if frame.correlation_id != correlation_id:
+            raise AstProtocolError(
+                f"expected a frame for correlation_id={correlation_id}, got {frame.correlation_id} "
+                "(this client does not support concurrent in-flight requests)"
+            )
+        return frame
 
     def batch(self, calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """`calls`: a list of `{"id", "tool", "args", "deadline_ms"?}`.

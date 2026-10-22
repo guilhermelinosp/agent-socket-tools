@@ -1,13 +1,25 @@
-use super::{Tool, ToolError};
+use super::{IncrementalBytes, StreamingTool, StreamingToolOpen, Tool, ToolError};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-/// Caps how much of a file is read into memory for a single `invoke`, to
-/// bound server memory use regardless of the on-disk file size.
+/// Caps how much of a file `invoke` (the non-streaming path) reads into
+/// memory at once, to bound server memory use regardless of the on-disk
+/// file size.
 const MAX_READ_BYTES: u64 = 1024 * 1024; // 1 MiB
+
+/// Caps how much of a file `open_stream` (the genuine-incremental path)
+/// will stream, total. Much larger than `MAX_READ_BYTES` because the
+/// whole point of streaming is that peak server memory stays bounded to
+/// one chunk's size *regardless* of this limit — unlike `invoke`, where
+/// the cap itself is the only thing bounding memory. Still finite, not
+/// unbounded: an operator exposing this tool to untrusted callers should
+/// not have to trust that every caller behaves, and a deadline alone
+/// doesn't bound how many bytes a slow, deadline-respecting stream can
+/// still produce before it fires.
+const MAX_STREAM_READ_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB
 
 #[derive(Debug, Deserialize)]
 struct Args {
@@ -90,6 +102,45 @@ impl FilesystemReadTool {
 
         Ok(canonical)
     }
+
+    /// Resolves, opens (`O_NOFOLLOW`), and `fstat`s the requested file —
+    /// every authorization/validation step `invoke` and `open_stream`
+    /// both need, with no size cap applied yet (each caller enforces its
+    /// own, different, limit). Returns the open file, its path relative
+    /// to the base directory (for the result's `path` field), and its
+    /// size from the file descriptor's own metadata.
+    fn open_validated(&self, args: Value) -> Result<(std::fs::File, PathBuf, u64), ToolError> {
+        let args: Args =
+            serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
+
+        let resolved = self.resolve(&args.path)?;
+
+        // `O_NOFOLLOW`: if the final path component was swapped for a
+        // symlink after `resolve`'s canonicalization but before this open,
+        // fail loudly (ELOOP) instead of transparently following it
+        // somewhere unauthorized. See the TOCTOU note on this struct.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&resolved)
+            .map_err(|e| ToolError::Failed(format!("open failed: {e}")))?;
+
+        // Checked on the already-open descriptor (`fstat`), not via a
+        // second path-based `stat`, so there's no separate race between
+        // this check and the read below.
+        let metadata = file
+            .metadata()
+            .map_err(|e| ToolError::Failed(format!("stat failed: {e}")))?;
+        if !metadata.is_file() {
+            return Err(ToolError::Failed("not a regular file".into()));
+        }
+
+        let relative = resolved
+            .strip_prefix(&self.base_dir)
+            .unwrap_or(&resolved)
+            .to_path_buf();
+        Ok((file, relative, metadata.len()))
+    }
 }
 
 impl Tool for FilesystemReadTool {
@@ -116,47 +167,126 @@ impl Tool for FilesystemReadTool {
     }
 
     fn invoke(&self, args: Value) -> Result<Value, ToolError> {
-        let args: Args =
-            serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
-
-        let resolved = self.resolve(&args.path)?;
-
-        // `O_NOFOLLOW`: if the final path component was swapped for a
-        // symlink after `resolve`'s canonicalization but before this open,
-        // fail loudly (ELOOP) instead of transparently following it
-        // somewhere unauthorized. See the TOCTOU note on this struct.
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&resolved)
-            .map_err(|e| ToolError::Failed(format!("open failed: {e}")))?;
-
-        // Checked on the already-open descriptor (`fstat`), not via a
-        // second path-based `stat`, so there's no separate race between
-        // this check and the read below.
-        let metadata = file
-            .metadata()
-            .map_err(|e| ToolError::Failed(format!("stat failed: {e}")))?;
-        if !metadata.is_file() {
-            return Err(ToolError::Failed("not a regular file".into()));
-        }
-        if metadata.len() > MAX_READ_BYTES {
+        let (mut file, relative, size) = self.open_validated(args)?;
+        if size > MAX_READ_BYTES {
             return Err(ToolError::Failed(format!(
                 "file exceeds the {MAX_READ_BYTES}-byte read limit"
             )));
         }
 
-        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        let mut bytes = Vec::with_capacity(size as usize);
         file.read_to_end(&mut bytes)
             .map_err(|e| ToolError::Failed(format!("read failed: {e}")))?;
         let contents = String::from_utf8(bytes)
             .map_err(|_| ToolError::Failed("file is not valid UTF-8".into()))?;
 
         Ok(json!({
-            "path": resolved.strip_prefix(&self.base_dir).unwrap_or(&resolved),
-            "size_bytes": metadata.len(),
+            "path": relative,
+            "size_bytes": size,
             "contents": contents,
         }))
+    }
+
+    fn as_streaming(&self) -> Option<&dyn StreamingTool> {
+        Some(self)
+    }
+}
+
+impl StreamingTool for FilesystemReadTool {
+    fn open_stream(&self, args: Value) -> Result<StreamingToolOpen, ToolError> {
+        let (file, relative, size) = self.open_validated(args)?;
+        if size > MAX_STREAM_READ_BYTES {
+            return Err(ToolError::Failed(format!(
+                "file exceeds the {MAX_STREAM_READ_BYTES}-byte streaming limit"
+            )));
+        }
+
+        Ok(StreamingToolOpen {
+            metadata: json!({
+                "path": relative,
+                "size_bytes": size,
+            }),
+            field_name: "contents",
+            reader: Box::new(Utf8FileChunkReader {
+                file,
+                remaining: size,
+                leftover: Vec::new(),
+            }),
+        })
+    }
+}
+
+/// Reads a file's bytes incrementally, validating UTF-8 *across* chunk
+/// boundaries rather than requiring the whole file in memory first.
+///
+/// A multi-byte UTF-8 character can straddle two reads from disk (a
+/// 4-byte character split 3-and-1 across a chunk boundary, say); `leftover`
+/// holds whatever trailing bytes of the last read couldn't yet be
+/// confirmed as a complete, valid sequence, and is prepended to the next
+/// read before re-validating. At most 3 bytes can ever be held this way —
+/// the longest possible *incomplete* prefix of a 4-byte UTF-8 sequence.
+struct Utf8FileChunkReader {
+    file: std::fs::File,
+    remaining: u64,
+    leftover: Vec<u8>,
+}
+
+impl IncrementalBytes for Utf8FileChunkReader {
+    fn total_bytes_hint(&self) -> Option<u64> {
+        Some(self.remaining + self.leftover.len() as u64)
+    }
+
+    fn next_chunk(&mut self, max_len: usize) -> Result<Option<Vec<u8>>, ToolError> {
+        loop {
+            if self.remaining == 0 && self.leftover.is_empty() {
+                return Ok(None);
+            }
+
+            let want = max_len.saturating_sub(self.leftover.len()).max(1);
+            let to_read = want.min(self.remaining as usize);
+            let mut buf = vec![0u8; to_read];
+            let n = self
+                .file
+                .read(&mut buf)
+                .map_err(|e| ToolError::Failed(format!("read failed: {e}")))?;
+            buf.truncate(n);
+            self.remaining -= n as u64;
+
+            let mut combined = std::mem::take(&mut self.leftover);
+            combined.extend_from_slice(&buf);
+
+            if n == 0 {
+                // EOF. Any leftover here is a genuinely incomplete/invalid
+                // trailing sequence — there's no more data coming to
+                // complete it.
+                if combined.is_empty() {
+                    return Ok(None);
+                }
+                return Err(ToolError::Failed("file is not valid UTF-8".into()));
+            }
+
+            match std::str::from_utf8(&combined) {
+                Ok(_) => return Ok(Some(combined)),
+                Err(e) if e.error_len().is_some() => {
+                    // A genuinely invalid byte, not just an incomplete
+                    // sequence at the end — not something more data could
+                    // ever fix.
+                    return Err(ToolError::Failed("file is not valid UTF-8".into()));
+                }
+                Err(e) => {
+                    let valid_up_to = e.valid_up_to();
+                    let rest = combined.split_off(valid_up_to);
+                    self.leftover = rest;
+                    if combined.is_empty() {
+                        // Nothing confirmed-valid yet this call; read more
+                        // before returning anything. `remaining` strictly
+                        // decreased above, so this loop always terminates.
+                        continue;
+                    }
+                    return Ok(Some(combined));
+                }
+            }
+        }
     }
 }
 
@@ -305,6 +435,113 @@ mod tests {
         let (dir, tool) = tool_with_fixture();
         fs::write(dir.path().join("binary.bin"), [0xff, 0xfe, 0x00, 0x01]).unwrap();
         let err = tool.invoke(json!({"path": "binary.bin"})).unwrap_err();
+        assert!(matches!(err, ToolError::Failed(_)));
+    }
+
+    /// Drains an `IncrementalBytes` reader with a small `max_len`, so
+    /// multi-call chunk-boundary behavior is actually exercised rather
+    /// than returning everything in one call.
+    fn drain(reader: &mut dyn IncrementalBytes, max_len: usize) -> Result<Vec<u8>, ToolError> {
+        let mut out = Vec::new();
+        while let Some(chunk) = reader.next_chunk(max_len)? {
+            out.extend_from_slice(&chunk);
+        }
+        Ok(out)
+    }
+
+    #[test]
+    fn open_stream_reassembles_to_the_same_contents_invoke_would_return() {
+        let (dir, tool) = tool_with_fixture();
+        fs::write(dir.path().join("stream.txt"), "x".repeat(10_000)).unwrap();
+
+        let via_invoke = tool.invoke(json!({"path": "stream.txt"})).unwrap();
+
+        let mut opened = tool.open_stream(json!({"path": "stream.txt"})).unwrap();
+        assert_eq!(opened.field_name, "contents");
+        let bytes = drain(opened.reader.as_mut(), 777).unwrap(); // deliberately not a divisor of 10_000
+        let contents = String::from_utf8(bytes).unwrap();
+
+        assert_eq!(contents, via_invoke["contents"]);
+        assert_eq!(opened.metadata["size_bytes"], 10_000);
+        assert_eq!(opened.metadata["path"], via_invoke["path"]);
+    }
+
+    #[test]
+    fn open_stream_reassembles_correctly_when_a_multibyte_char_straddles_a_chunk_boundary() {
+        // "a" (1 byte) + "😀" (4 bytes, U+1F600) + "b" (1 byte) = 6 bytes.
+        // With max_len=2, the reader is forced to split mid-character:
+        // byte 1 of "😀" lands in one read alongside "a", and the
+        // remaining 3 bytes need another read (or two) before the
+        // character is confirmed valid and emitted.
+        let (dir, tool) = tool_with_fixture();
+        let text = "a😀b";
+        fs::write(dir.path().join("emoji.txt"), text).unwrap();
+
+        let mut opened = tool.open_stream(json!({"path": "emoji.txt"})).unwrap();
+        let bytes = drain(opened.reader.as_mut(), 2).unwrap();
+        assert_eq!(String::from_utf8(bytes).unwrap(), text);
+    }
+
+    #[test]
+    fn open_stream_rejects_invalid_utf8_discovered_only_at_eof() {
+        let (dir, tool) = tool_with_fixture();
+        // A valid ASCII prefix followed by a truncated multi-byte
+        // sequence that never completes — only detectable once EOF
+        // proves no more bytes are coming.
+        fs::write(dir.path().join("truncated.bin"), [b'o', b'k', 0xe2, 0x82]).unwrap();
+
+        let mut opened = tool.open_stream(json!({"path": "truncated.bin"})).unwrap();
+        let err = drain(opened.reader.as_mut(), 4096).unwrap_err();
+        assert!(matches!(err, ToolError::Failed(_)));
+    }
+
+    #[test]
+    fn open_stream_rejects_genuinely_invalid_utf8_bytes() {
+        let (dir, tool) = tool_with_fixture();
+        fs::write(dir.path().join("binary.bin"), [0xff, 0xfe, 0x00, 0x01]).unwrap();
+
+        let mut opened = tool.open_stream(json!({"path": "binary.bin"})).unwrap();
+        let err = drain(opened.reader.as_mut(), 4096).unwrap_err();
+        assert!(matches!(err, ToolError::Failed(_)));
+    }
+
+    #[test]
+    fn open_stream_rejects_traversal_the_same_way_invoke_does() {
+        let (_dir, tool) = tool_with_fixture();
+        let err = tool
+            .open_stream(json!({"path": "../../etc/passwd"}))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ToolError::Unauthorized(_) | ToolError::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn open_stream_accepts_a_file_past_invokes_smaller_cap() {
+        // Exceeds MAX_READ_BYTES (invoke's 1 MiB cap) but is nowhere near
+        // open_stream's own, much larger cap — proves the two caps are
+        // genuinely independent, not the same limit under two names.
+        let (dir, tool) = tool_with_fixture();
+        let past_invoke_cap = vec![b'a'; (MAX_READ_BYTES + 1) as usize];
+        fs::write(dir.path().join("big.txt"), &past_invoke_cap).unwrap();
+        assert!(tool.invoke(json!({"path": "big.txt"})).is_err());
+        assert!(tool.open_stream(json!({"path": "big.txt"})).is_ok());
+    }
+
+    #[test]
+    fn open_stream_rejects_a_file_over_its_own_streaming_size_limit() {
+        let (dir, tool) = tool_with_fixture();
+        // A sparse file: `set_len` extends the apparent size without
+        // writing real data, so this test doesn't actually allocate or
+        // write hundreds of MiB to disk — only `fstat`'s reported size
+        // is exercised, which is all `open_stream`'s cap check reads.
+        let path = dir.path().join("huge.bin");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(MAX_STREAM_READ_BYTES + 1).unwrap();
+        drop(file);
+
+        let err = tool.open_stream(json!({"path": "huge.bin"})).unwrap_err();
         assert!(matches!(err, ToolError::Failed(_)));
     }
 }

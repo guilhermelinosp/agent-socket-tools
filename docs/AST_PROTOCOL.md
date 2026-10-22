@@ -168,46 +168,90 @@ answered by a single `BATCH_RESULT`. Semantics, chosen conservatively:
 
 `STREAM_START`/`STREAM_CHUNK`/`STREAM_END` let a client ask for a
 result as a bounded sequence of chunks instead of one `RESULT` frame.
-Be precise about what this is: **chunked delivery of a result the
-server has already fully computed**, not incremental execution-time
-production. No tool in this crate (`system.info`, `filesystem.read`)
-produces output incrementally — `filesystem.read` still reads the
-whole file and returns one value before any chunk is sent — so this
-doesn't claim to be "true" streaming in the sense of a tool emitting
-partial output as it works. What it *does* provide, which was the
-actual deferred need: bounded per-chunk frame size and real
-backpressure for a large result, via the same mechanism every other
-response already uses (the connection's bounded outgoing-frame
-channel — `tx.send(...).await` naturally blocks when a slow reader
-can't keep up), rather than one `RESULT` frame sized to the whole
-result.
+There are **two distinct modes**, both opted into the same way
+(`Invoke.stream: true`) and both using the same three message types —
+`StreamStart.raw` (present or absent) tells a client which one it's
+getting for a given call:
+
+**1. Chunked delivery of an already-computed result** (`raw` absent).
+Most tools use this: the server has already fully computed the
+result — `system.info` always does, and `filesystem.read` does too
+when streaming isn't requested — and this mode just splits the
+already-encoded `RESULT.value` into bounded pieces rather than sending
+one `RESULT` frame sized to the whole result. Not "true" streaming in
+the sense of a tool emitting partial output as it works; what it
+*does* provide: bounded per-chunk frame size and real backpressure,
+via the same mechanism every other response already uses (the
+connection's bounded outgoing-frame channel — `tx.send(...).await`
+naturally blocks when a slow reader can't keep up).
+
+**2. Genuine incremental production** (`raw` present — implemented for
+`filesystem.read`). The tool produces its output chunk by chunk, as it
+goes, and the server never holds the complete streamed field in
+memory at once — see [`src/tools/mod.rs`'s `StreamingTool`
+trait](../src/tools/mod.rs). `STREAM_CHUNK.data` in this mode is the
+tool's own raw output bytes for `raw.field_name` (UTF-8 text, for
+`filesystem.read`'s `contents` field) — **not** a slice of an encoded
+`Value` — and `raw.metadata` carries every other field the full result
+needs (`path`, `size_bytes`). A conforming client reassembles the full
+result by concatenating every chunk's `data` in `sequence` order,
+decoding it per the field's own contract (UTF-8 text, for
+`filesystem.read`), and inserting it into `raw.metadata` under
+`raw.field_name`.
+
+`filesystem.read`'s genuinely-streamed path also has its own, much
+larger size ceiling (`MAX_STREAM_READ_BYTES`, 256 MiB) than its
+non-streaming `invoke` path (`MAX_READ_BYTES`, 1 MiB) — deliberately:
+peak server memory for the streamed path is bounded by chunk size
+regardless of this ceiling, unlike `invoke`, where the ceiling itself
+is the only thing bounding memory. The two caps are independent; a
+file past `invoke`'s cap can still be read via streaming.
+
+Shared across both modes:
 
 - **Opt-in per call**: `Invoke.stream: true` requests it; absent or
   `false` (the default, and what every client in this crate other than
-  the explicit `--stream` flag uses) gets the normal `RESULT`. Any
-  tool's result can be streamed — this is a delivery-mode choice, not a
-  tool capability, so no "is this tool streamable" flag exists or is
-  needed.
+  the explicit `--stream` flag uses) gets the normal `RESULT`. Whether
+  a given call ends up using mode 1 or mode 2 is decided by the server
+  (does the invoked tool implement `StreamingTool`?), not by the
+  client — a client that only understands "concatenate chunks,
+  msgpack-decode the result" can be upgraded to support mode 2 without
+  the wire format itself changing shape in an incompatible way, since
+  both modes use the same three message types; a client that predates
+  `StreamStart.raw` simply doesn't know what to do with a stream that
+  sets it (this crate's own Rust and Python clients both handle it).
 - **Failure before streaming starts**: if the invoked tool itself
-  fails, the server still has the complete outcome (an error) before
-  anything is sent, so it reports a normal `ERROR` — `STREAM_START` is
-  never sent for a call that didn't succeed. A client doesn't need a
-  special code path for "this failed partway through a stream" because
-  that case cannot occur.
+  fails (including a genuinely-streaming tool's own validation, e.g.
+  path traversal or non-UTF-8 content — `open_stream` validates
+  synchronously before any chunk is produced, same as `invoke`), the
+  server still has the complete outcome (an error) before anything is
+  sent, so it reports a normal `ERROR` — `STREAM_START` is never sent
+  for a call that didn't succeed.
+- **Mid-transfer failure has no equivalent guarantee, for genuine
+  streaming specifically**: once `STREAM_START` has gone out, there is
+  no way to retract it. A deadline or cancellation firing *during* a
+  genuinely-streamed transfer simply stops sending further frames (no
+  `STREAM_END`, no error frame) rather than retroactively reporting
+  `DeadlineExceeded`/`Cancelled` for a response shape already committed
+  to — a documented limitation, not an oversight. A client's own
+  overall timeout on the call eventually surfaces this (as a timeout,
+  not a precise error code). Mode 1 doesn't have this gap, because by
+  the time any chunk is sent the tool has already either fully
+  succeeded or fully failed.
 - **Ordering**: `STREAM_CHUNK.sequence` is 0-indexed and strictly
-  increasing with no gaps or reordering; concatenating every chunk's
-  `data` in that order reconstructs exactly the MessagePack-encoded
-  bytes a non-streamed `RESULT.value` would have carried.
+  increasing with no gaps or reordering in either mode.
 - **Chunk size**: `ast-server --stream-chunk-bytes` (default 64 KiB)
   targets a per-chunk size; the last chunk is typically smaller.
   Clamped down automatically at connection start if it wouldn't fit
   under `--max-frame-bytes`, so misconfiguring the two relative to each
   other can't produce an oversized frame.
 
-If a tool that genuinely needs incremental, execution-time output ever
-exists, that would be the trigger to extend this (or add a distinct
-mechanism) — not a reason to have withheld chunked delivery of large,
-already-computed results until then.
+Extending genuine incremental streaming to a future tool means
+implementing `StreamingTool` for it — there is no generic way to
+"turn on" mode 2 for a tool that only implements the plain `Tool`
+trait, by design: a tool author has to actually write the incremental
+reader, not merely flip a flag on a tool that still computes its whole
+result up front.
 
 ## Payloads per type
 
@@ -229,7 +273,7 @@ names and optionality are exactly as declared there via `serde`).
 | `CANCEL` | `Cancel` | `target_correlation_id: u64` |
 | `BATCH` | `Batch` | `calls: Vec<BatchInvoke>` — each `{id: u64, tool: String, args: <JSON>, deadline_ms: Option<u64>}` |
 | `BATCH_RESULT` | `BatchResult` | `results: Vec<BatchResultEntry>` — each `{id: u64, status: "ok" \| "error", value / code+message}` |
-| `STREAM_START` | `StreamStart` | `total_chunks: u32`, `total_bytes: u64` (informational — see "Chunked streaming") |
+| `STREAM_START` | `StreamStart` | `total_chunks: u32`, `total_bytes: u64` (informational — see "Chunked streaming"), `raw: Option<RawStreamInfo>` (present only for genuine incremental streaming — `{metadata: <JSON>, field_name: String}`) |
 | `STREAM_CHUNK` | `StreamChunk` | `sequence: u32`, `data: bytes` (a MessagePack `bin`, not an array — see `src/ast/message.rs`'s `serde_bytes` usage) |
 | `STREAM_END` | `StreamEnd` | *(empty)* |
 
@@ -518,19 +562,23 @@ any mainstream language.
 **This is now verified for one other language.** `sdks/python/` is a
 minimal, synchronous Python client (stdlib `socket` + `msgpack`, no
 other dependencies) implementing `HELLO`/`PING`/`DISCOVER`/`INVOKE`/
-`CANCEL`/`BATCH` from this spec alone. `sdks/python/tests/test_interop.py`
+`CANCEL`/`BATCH`/`STREAM_START`/`STREAM_CHUNK`/`STREAM_END` from this
+spec alone — including both streaming modes, chunked-delivery and
+genuine incremental streaming. `sdks/python/tests/test_interop.py`
 spawns the real, unmodified `ast-server` binary as a subprocess and
 drives it entirely through that Python client — not a mock of the
 server, not a second Rust process pretending to be a different
 language. Every scenario the Rust integration tests cover for these
 message types also passes from Python: handshake, ping, discovery,
-successful and failing invokes, path-traversal rejection, and batched
-calls with mixed success/failure correlated by id. This is run in CI
+successful and failing invokes, path-traversal rejection, batched calls
+with mixed success/failure correlated by id, and — the genuine-streaming
+case specifically — a real 200 KB file streamed from the Rust server's
+`filesystem.read` `StreamingTool` implementation and reassembled
+correctly by the Python client's `raw`-mode handling. This is run in CI
 (see `.github/workflows/ci.yml`'s `python-interop` job) on every push,
 so it stays true rather than becoming a one-time claim.
 
-**What's still unverified**: `STREAM_*` (not implemented on either
-side, so there's nothing to check), the Python client's behavior under
+**What's still unverified**: the Python client's behavior under
 concurrent multiplexing (it only ever has one request in flight, by
 design — see `sdks/python/README.md`), and any implementation outside
 this repository in a third language. Per this document's own standard,

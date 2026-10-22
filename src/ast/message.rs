@@ -129,15 +129,46 @@ pub struct InvokeResult {
 }
 
 /// First message of a streamed response. `total_bytes` is the size, in
-/// bytes, of the MessagePack-encoded result value *before* chunking —
-/// informational (e.g. for a progress bar), not load-bearing: a
-/// conforming client reassembles the result from exactly the chunks it
-/// receives, in `sequence` order, regardless of whether their total
-/// matches this number.
+/// bytes, of the streamed content *before* chunking — informational
+/// (e.g. for a progress bar), not load-bearing: a conforming client
+/// reassembles the result from exactly the chunks it receives, in
+/// `sequence` order, regardless of whether their total matches this
+/// number.
+///
+/// Two distinct streaming modes, distinguished by `raw`:
+///
+/// - **`raw` absent** (chunked delivery of an already-computed result —
+///   the only mode in v1 of this document): `STREAM_CHUNK.data` is a raw
+///   slice of the MessagePack-encoded `RESULT.value` that would have
+///   been sent as one `RESULT` frame; concatenating every chunk's `data`
+///   in `sequence` order and decoding the result as that value
+///   reconstructs it exactly.
+/// - **`raw` present** (genuine incremental production — see
+///   `docs/AST_PROTOCOL.md`'s "Chunked streaming" section): the tool is
+///   producing one field's value incrementally, chunk by chunk, without
+///   ever holding the complete value in memory. `STREAM_CHUNK.data`
+///   across this stream is the tool's own raw output bytes for
+///   `raw.field_name` (e.g. a file's UTF-8 content, for
+///   `filesystem.read`) — *not* a slice of an encoded `Value` — and
+///   `raw.metadata` carries every other field the full result needs.
+///   The full, reassembled result is `raw.metadata` with `raw.field_name`
+///   set to the UTF-8 string decoded from every chunk's `data`
+///   concatenated in `sequence` order.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamStart {
     pub total_chunks: u32,
     pub total_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw: Option<RawStreamInfo>,
+}
+
+/// See `raw` on [`StreamStart`]: present only for a genuinely incremental
+/// stream, naming which result field is being streamed and carrying
+/// every other field's value, known upfront.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RawStreamInfo {
+    pub metadata: Value,
+    pub field_name: String,
 }
 
 /// One chunk of a streamed response's encoded result value. `sequence`

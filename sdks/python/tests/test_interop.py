@@ -55,6 +55,7 @@ def server():
     binary = _find_ast_server_binary()
     with tempfile.TemporaryDirectory() as socket_dir, tempfile.TemporaryDirectory() as read_dir:
         Path(read_dir, "hello.txt").write_text("hello from python interop test\n")
+        Path(read_dir, "large.txt").write_text("y" * 200_000)
         socket_path = Path(socket_dir) / "ast-py-interop.sock"
         proc = subprocess.Popen(
             [str(binary), "--socket-path", str(socket_path), "--read-dir", read_dir],
@@ -137,3 +138,32 @@ def test_multiple_sequential_calls_on_one_connection(server):
     with AstClient.connect(str(server)) as client:
         for _ in range(5):
             client.invoke("system.info")
+
+
+def test_invoke_stream_matches_invoke_for_a_non_streaming_tool(server):
+    with AstClient.connect(str(server)) as client:
+        plain = client.invoke("system.info")
+        streamed = client.invoke_stream("system.info")
+    assert plain == streamed
+
+
+def test_invoke_stream_against_a_genuinely_streaming_tool_matches_invoke(server):
+    with AstClient.connect(str(server)) as client:
+        plain = client.invoke("filesystem.read", {"path": "hello.txt"})
+        streamed = client.invoke_stream("filesystem.read", {"path": "hello.txt"})
+    assert plain == streamed
+    assert streamed["contents"] == "hello from python interop test\n"
+
+
+def test_invoke_stream_of_a_large_genuinely_streamed_file(server):
+    with AstClient.connect(str(server)) as client:
+        streamed = client.invoke_stream("filesystem.read", {"path": "large.txt"})
+    assert streamed["contents"] == "y" * 200_000
+    assert streamed["size_bytes"] == 200_000
+
+
+def test_invoke_stream_of_an_unknown_tool_reports_the_same_error_invoke_would(server):
+    with AstClient.connect(str(server)) as client:
+        with pytest.raises(AstServerError) as exc_info:
+            client.invoke_stream("does.not.exist")
+    assert exc_info.value.code == "TOOL_NOT_FOUND"

@@ -50,6 +50,8 @@ pub enum AstClientError {
         declared_or_received: u64,
         limit: usize,
     },
+    #[error("genuinely-streamed content failed client-side validation: {0}")]
+    InvalidStreamContent(String),
 }
 
 type Waiters = Arc<Mutex<HashMap<u64, oneshot::Sender<Frame>>>>;
@@ -422,7 +424,32 @@ impl AstClient {
                         _ => return Err(AstClientError::UnexpectedResponseType(frame.msg_type)),
                     }
                 }
-                Ok(codec::decode(&encoded)?)
+                match start.raw {
+                    None => Ok(codec::decode(&encoded)?),
+                    Some(raw) => {
+                        // Genuinely-streamed mode: `encoded` is the raw
+                        // field's own bytes (UTF-8 text, for every
+                        // current streaming tool), not a slice of an
+                        // encoded `Value` — reassemble by inserting it
+                        // into `raw.metadata` under `raw.field_name`,
+                        // rather than msgpack-decoding it.
+                        let text = String::from_utf8(encoded).map_err(|_| {
+                            AstClientError::InvalidStreamContent(
+                                "streamed bytes were not valid UTF-8".to_string(),
+                            )
+                        })?;
+                        let mut value = raw.metadata;
+                        match value.as_object_mut() {
+                            Some(map) => {
+                                map.insert(raw.field_name, Value::String(text));
+                                Ok(value)
+                            }
+                            None => Err(AstClientError::InvalidStreamContent(
+                                "StreamStart.raw.metadata was not a JSON object".to_string(),
+                            )),
+                        }
+                    }
+                }
             }
             _ => Err(AstClientError::UnexpectedResponseType(first.msg_type)),
         }
@@ -475,7 +502,7 @@ impl AstClient {
 mod tests {
     use super::*;
     use crate::ast::connection::{run_connection, ConnectionConfig};
-    use crate::tools::{SystemInfoTool, ToolRegistry};
+    use crate::tools::{FilesystemReadTool, SystemInfoTool, ToolRegistry};
 
     async fn start_test_server() -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
@@ -501,6 +528,72 @@ mod tests {
         });
 
         (dir, socket_path)
+    }
+
+    async fn start_test_server_with_filesystem_read(
+        read_dir: &std::path::Path,
+    ) -> std::path::PathBuf {
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("ast-client-fs-test.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(FilesystemReadTool::new(read_dir).unwrap()));
+        let registry = Arc::new(registry);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _addr)) = listener.accept().await else {
+                    return;
+                };
+                let registry = Arc::clone(&registry);
+                tokio::spawn(run_connection(
+                    stream,
+                    registry,
+                    ConnectionConfig::default(),
+                ));
+            }
+        });
+        // Leaked deliberately: the socket directory must outlive this
+        // function's return for the server task (spawned above, still
+        // running) to keep serving it — this is test-only code, not a
+        // pattern used anywhere in the shipped server/client.
+        std::mem::forget(socket_dir);
+        socket_path
+    }
+
+    #[tokio::test]
+    async fn invoke_stream_against_a_genuinely_streaming_tool_matches_invoke() {
+        let fixture_dir = tempfile::tempdir().unwrap();
+        let contents = "genuine streaming via AstClient::invoke_stream\n".repeat(200);
+        std::fs::write(fixture_dir.path().join("big.txt"), &contents).unwrap();
+        let socket_path = start_test_server_with_filesystem_read(fixture_dir.path()).await;
+
+        let client = AstClient::connect(&socket_path, AstClientConfig::default())
+            .await
+            .unwrap();
+
+        let plain = client
+            .invoke(
+                "filesystem.read",
+                serde_json::json!({"path": "big.txt"}),
+                None,
+            )
+            .await
+            .unwrap();
+        let streamed = client
+            .invoke_stream(
+                "filesystem.read",
+                serde_json::json!({"path": "big.txt"}),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(plain, streamed);
+        assert_eq!(streamed["contents"], contents);
+
+        client.close().await;
     }
 
     #[tokio::test]
@@ -703,6 +796,7 @@ mod tests {
             codec::encode(&StreamStart {
                 total_chunks: 1,
                 total_bytes: 10 * 1024 * 1024 * 1024, // 10 GiB — absurd for a test payload
+                raw: None,
             })
             .unwrap(),
         )])
@@ -739,6 +833,7 @@ mod tests {
                 codec::encode(&StreamStart {
                     total_chunks: 1,
                     total_bytes: 10, // lies small, to get past the first check
+                    raw: None,
                 })
                 .unwrap(),
             ),

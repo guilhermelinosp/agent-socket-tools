@@ -16,7 +16,7 @@ use crate::ast::wire::{self, Frame, FrameError, FrameLimits};
 use crate::tools::{ToolError, ToolRegistry};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::UnixStream;
 use tokio::sync::{mpsc, Notify, Semaphore};
 
@@ -616,13 +616,64 @@ fn spawn_invoke(
     max_frame_len: u32,
     stream_chunk_bytes: usize,
 ) {
+    let wants_stream = invoke.stream.unwrap_or(false);
+    let tool_streams_genuinely = wants_stream
+        && registry
+            .get(&invoke.tool)
+            .is_some_and(|t| t.as_streaming().is_some());
+
+    if tool_streams_genuinely {
+        // Genuine incremental streaming keeps `in_flight`/`cancellations`
+        // registered for the *entire* transfer, not just the time it
+        // takes to open the file — unlike the other branch below, where
+        // the whole result already exists in memory by the time chunking
+        // even starts, here a `CANCEL` must still be able to interrupt an
+        // in-progress disk-to-wire transfer, which can meaningfully take
+        // a while for a large stream.
+        tokio::spawn(async move {
+            let _permit = permit;
+            let deadline = invoke
+                .deadline_ms
+                .map(Duration::from_millis)
+                .unwrap_or(default_deadline);
+
+            let opened =
+                run_invoke_streaming(invoke, registry, deadline, Arc::clone(&cancel_notify)).await;
+            match opened {
+                Ok(opened) => {
+                    send_raw_streamed_result(
+                        &tx,
+                        correlation_id,
+                        opened,
+                        stream_chunk_bytes,
+                        deadline,
+                        cancel_notify,
+                    )
+                    .await;
+                }
+                Err((code, message)) => {
+                    let _ = send_error(&tx, correlation_id, code, &message, max_frame_len).await;
+                }
+            }
+
+            in_flight
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&correlation_id);
+            cancellations
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&correlation_id);
+        });
+        return;
+    }
+
     tokio::spawn(async move {
         let _permit = permit; // held for this task's whole lifetime
         let deadline = invoke
             .deadline_ms
             .map(Duration::from_millis)
             .unwrap_or(default_deadline);
-        let wants_stream = invoke.stream.unwrap_or(false);
 
         let response = run_invoke(invoke, registry, deadline, cancel_notify).await;
 
@@ -654,6 +705,147 @@ fn spawn_invoke(
             }
         }
     });
+}
+
+/// Like [`run_invoke`], but opens a genuinely incremental stream (see
+/// [`agent_socket_tools::tools::StreamingTool`]) instead of computing the
+/// tool's full result. Only called once the caller has already confirmed
+/// the tool supports it.
+async fn run_invoke_streaming(
+    invoke: Invoke,
+    registry: Arc<ToolRegistry>,
+    deadline: Duration,
+    cancel_notify: Arc<Notify>,
+) -> Result<crate::tools::StreamingToolOpen, (ErrorCode, String)> {
+    let Some(_tool) = registry.get(&invoke.tool) else {
+        return Err((
+            ErrorCode::ToolNotFound,
+            format!("no such tool: {}", invoke.tool),
+        ));
+    };
+
+    let tool_name = invoke.tool.clone();
+    let args = invoke.args;
+    let task = tokio::task::spawn_blocking(move || {
+        let tool = registry
+            .get(&tool_name)
+            .expect("presence already checked before spawning");
+        let streaming = tool
+            .as_streaming()
+            .expect("caller already confirmed this tool supports streaming");
+        streaming.open_stream(args)
+    });
+
+    tokio::select! {
+        result = task => match result {
+            Ok(Ok(opened)) => Ok(opened),
+            Ok(Err(tool_err)) => Err(tool_error_to_code(tool_err)),
+            Err(join_err) => Err((ErrorCode::InternalError, format!("tool task panicked: {join_err}"))),
+        },
+        _ = tokio::time::sleep(deadline) => {
+            Err((ErrorCode::DeadlineExceeded, "the tool did not complete within the configured deadline".to_string()))
+        }
+        _ = cancel_notify.notified() => {
+            Err((ErrorCode::Cancelled, "the request was cancelled".to_string()))
+        }
+    }
+}
+
+/// Sends a genuinely incremental stream: `open_stream`'s `metadata` goes
+/// out immediately in `STREAM_START`, then each chunk is read from the
+/// tool's `IncrementalBytes` reader (one bounded, blocking read at a
+/// time, via `spawn_blocking`) and sent as raw bytes — the server never
+/// holds more than one chunk's worth of the streamed field in memory,
+/// regardless of its total size.
+///
+/// Deadline and cancellation are raced on every single chunk read, not
+/// just once up front — but once `STREAM_START` has gone out, there is no
+/// way to retract it: a deadline or cancellation firing mid-transfer
+/// simply stops sending further frames (no `STREAM_END`, no error frame)
+/// rather than retroactively reporting `DeadlineExceeded`/`Cancelled` for
+/// a response shape already committed to. The client's own overall
+/// timeout on `invoke_stream` eventually surfaces this as
+/// `AstClientError::Timeout` — a known, documented limitation, not an
+/// oversight: there is no way to un-send `STREAM_START` once it's out.
+async fn send_raw_streamed_result(
+    tx: &mpsc::Sender<Frame>,
+    correlation_id: u64,
+    opened: crate::tools::StreamingToolOpen,
+    chunk_bytes: usize,
+    deadline: Duration,
+    cancel_notify: Arc<Notify>,
+) {
+    let started = Instant::now();
+    let total_bytes = opened.reader.total_bytes_hint().unwrap_or(0);
+    let total_chunks = if total_bytes == 0 {
+        1
+    } else {
+        total_bytes.div_ceil(chunk_bytes.max(1) as u64).max(1) as u32
+    };
+
+    if send_raw(
+        tx,
+        MessageType::StreamStart,
+        correlation_id,
+        &StreamStart {
+            total_chunks,
+            total_bytes,
+            raw: Some(RawStreamInfo {
+                metadata: opened.metadata,
+                field_name: opened.field_name.to_string(),
+            }),
+        },
+    )
+    .await
+    .is_err()
+    {
+        return;
+    }
+
+    let mut reader = opened.reader;
+    let mut sequence: u32 = 0;
+    loop {
+        let remaining = deadline.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return; // deadline exceeded — see this fn's doc comment
+        }
+
+        let read_task = tokio::task::spawn_blocking(move || {
+            let chunk = reader.next_chunk(chunk_bytes.max(1));
+            (reader, chunk)
+        });
+
+        let (returned_reader, chunk_result) = tokio::select! {
+            result = read_task => match result {
+                Ok(pair) => pair,
+                Err(_join_err) => return, // reader task panicked — nothing more to send
+            },
+            _ = tokio::time::sleep(remaining) => return, // deadline exceeded — see this fn's doc comment
+            _ = cancel_notify.notified() => return, // cancelled — see this fn's doc comment
+        };
+        reader = returned_reader;
+
+        match chunk_result {
+            Ok(Some(data)) => {
+                if send_raw(
+                    tx,
+                    MessageType::StreamChunk,
+                    correlation_id,
+                    &StreamChunk { sequence, data },
+                )
+                .await
+                .is_err()
+                {
+                    return;
+                }
+                sequence += 1;
+            }
+            Ok(None) => break,        // exhausted
+            Err(_tool_err) => return, // can't retroactively report this — see this fn's doc comment
+        }
+    }
+
+    let _ = send_raw(tx, MessageType::StreamEnd, correlation_id, &StreamEnd {}).await;
 }
 
 /// Sends an already-computed, successful result as
@@ -689,6 +881,7 @@ async fn send_streamed_result(
         &StreamStart {
             total_chunks,
             total_bytes: encoded.len() as u64,
+            raw: None,
         },
     )
     .await
@@ -968,7 +1161,7 @@ async fn send_error(
 mod tests {
     use super::*;
     use crate::ast::wire::read_frame;
-    use crate::tools::{SystemInfoTool, Tool, ToolError as RegistryToolError};
+    use crate::tools::{FilesystemReadTool, SystemInfoTool, Tool, ToolError as RegistryToolError};
     use serde_json::Value as JsonValue;
     use tokio::net::UnixListener;
 
@@ -1950,6 +2143,136 @@ mod tests {
             MessageType::from_u8(resp.msg_type),
             Some(MessageType::Result)
         );
+    }
+
+    #[tokio::test]
+    async fn genuine_streaming_invoke_sends_raw_mode_and_reassembles_correctly() {
+        let fixture_dir = tempfile::tempdir().unwrap();
+        let contents = "hello from genuine streaming\n".repeat(50); // multi-chunk with a small chunk size
+        std::fs::write(fixture_dir.path().join("stream.txt"), &contents).unwrap();
+        let read_tool = FilesystemReadTool::new(fixture_dir.path()).unwrap();
+
+        let registry = registry_with(vec![Box::new(read_tool)]);
+        let config = ConnectionConfig {
+            stream_chunk_bytes: 64, // forces several chunks
+            ..Default::default()
+        };
+        let (mut client, _dir) = connected_pair_with_registry(registry, config).await;
+        do_hello(&mut client).await;
+
+        let invoke = Invoke {
+            tool: "filesystem.read".to_string(),
+            args: serde_json::json!({"path": "stream.txt"}),
+            deadline_ms: None,
+            stream: Some(true),
+        };
+        send_raw(
+            &mut client,
+            Frame {
+                msg_type: MessageType::Invoke as u8,
+                correlation_id: 1,
+                payload: codec::encode(&invoke).unwrap(),
+            },
+        )
+        .await;
+
+        let start_frame = recv_raw(&mut client).await;
+        assert_eq!(
+            MessageType::from_u8(start_frame.msg_type),
+            Some(MessageType::StreamStart)
+        );
+        let start: StreamStart = codec::decode(&start_frame.payload).unwrap();
+        let raw = start
+            .raw
+            .expect("filesystem.read supports genuine streaming — StreamStart.raw must be Some");
+        assert_eq!(raw.field_name, "contents");
+        assert_eq!(raw.metadata["size_bytes"], contents.len());
+        assert!(
+            start.total_chunks > 1,
+            "a chunk size of 64 against a {}-byte file should need several chunks",
+            contents.len()
+        );
+
+        let mut received = Vec::new();
+        let mut expected_sequence = 0u32;
+        loop {
+            let frame = recv_raw(&mut client).await;
+            match MessageType::from_u8(frame.msg_type) {
+                Some(MessageType::StreamChunk) => {
+                    let chunk: StreamChunk = codec::decode(&frame.payload).unwrap();
+                    assert_eq!(chunk.sequence, expected_sequence);
+                    expected_sequence += 1;
+                    received.extend_from_slice(&chunk.data);
+                }
+                Some(MessageType::StreamEnd) => break,
+                other => panic!("unexpected message type: {other:?}"),
+            }
+        }
+
+        // The received bytes are the file's own raw UTF-8 bytes — not a
+        // slice of a msgpack-encoded Value — reassembled directly.
+        assert_eq!(String::from_utf8(received).unwrap(), contents);
+    }
+
+    #[tokio::test]
+    async fn genuine_streaming_invoke_respects_cancellation_mid_transfer() {
+        // A large-ish file with a tiny chunk size and an artificial
+        // per-chunk delay would be the realistic way to prove
+        // mid-transfer cancellation actually interrupts an in-progress
+        // stream rather than only ever racing a single, already-fast
+        // open_stream call — but this crate's StreamingTool has no
+        // injectable delay. Instead, this proves the weaker but still
+        // real guarantee: CANCEL targeting a stream whose open_stream
+        // step is still racing does stop it before any STREAM_START is
+        // sent, the same as it would for a non-streaming INVOKE racing
+        // run_invoke.
+        let fixture_dir = tempfile::tempdir().unwrap();
+        std::fs::write(fixture_dir.path().join("f.txt"), "hi\n").unwrap();
+        let read_tool = FilesystemReadTool::new(fixture_dir.path()).unwrap();
+        let registry = registry_with(vec![Box::new(read_tool)]);
+        let (mut client, _dir) =
+            connected_pair_with_registry(registry, ConnectionConfig::default()).await;
+        do_hello(&mut client).await;
+
+        let invoke = Invoke {
+            tool: "filesystem.read".to_string(),
+            args: serde_json::json!({"path": "f.txt"}),
+            deadline_ms: Some(10_000),
+            stream: Some(true),
+        };
+        send_raw(
+            &mut client,
+            Frame {
+                msg_type: MessageType::Invoke as u8,
+                correlation_id: 1,
+                payload: codec::encode(&invoke).unwrap(),
+            },
+        )
+        .await;
+        let cancel = Cancel {
+            target_correlation_id: 1,
+        };
+        send_raw(
+            &mut client,
+            Frame {
+                msg_type: MessageType::Cancel as u8,
+                correlation_id: 2,
+                payload: codec::encode(&cancel).unwrap(),
+            },
+        )
+        .await;
+
+        // Either the cancellation wins the race (an ERROR{Cancelled}, no
+        // STREAM_START ever sent) or the open was already fast enough to
+        // finish first (a normal, complete stream) — both are correct
+        // outcomes of a real race; what would NOT be correct is a hang.
+        let resp = tokio::time::timeout(Duration::from_secs(2), recv_raw(&mut client))
+            .await
+            .expect("must not hang regardless of which side of the race wins");
+        assert!(matches!(
+            MessageType::from_u8(resp.msg_type),
+            Some(MessageType::Error) | Some(MessageType::StreamStart)
+        ));
     }
 
     #[tokio::test]

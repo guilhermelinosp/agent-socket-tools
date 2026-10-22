@@ -39,6 +39,76 @@ pub trait Tool: Send + Sync {
     /// them via `spawn_blocking` rather than requiring every tool to be
     /// written against an async trait.
     fn invoke(&self, args: Value) -> Result<Value, ToolError>;
+
+    /// Returns `Some(self)` only for a tool whose output can be *produced*
+    /// incrementally (see [`StreamingTool`]). Most tools don't override
+    /// this — their result is small and/or inherently non-incremental, so
+    /// an `INVOKE` requesting `stream: true` against them still gets
+    /// ordinary chunked delivery of their fully-computed result (see
+    /// `docs/AST_PROTOCOL.md`'s "Chunked streaming" section). Overriding
+    /// this is only for a tool where true incremental production is both
+    /// possible and worth the extra complexity — not a default every tool
+    /// should reach for.
+    fn as_streaming(&self) -> Option<&dyn StreamingTool> {
+        None
+    }
+}
+
+/// A tool whose output can be produced incrementally, chunk by chunk, as
+/// it's generated — not merely chunked *after* being fully computed (that
+/// generic, no-opt-in-required chunking is what `INVOKE.stream: true`
+/// already gets against any [`Tool`] via `src/ast/connection.rs`'s
+/// `send_streamed_result`). This is for the narrower case where a tool can
+/// actually avoid holding its whole result in memory at once.
+pub trait StreamingTool: Tool {
+    /// Validates `args` and opens an incremental read, exactly as
+    /// [`Tool::invoke`] would validate and execute — a failure here is a
+    /// normal [`ToolError`], same meaning as a failing `invoke`. Must do
+    /// all authorization/validation synchronously before returning; the
+    /// returned reader is assumed already-authorized.
+    fn open_stream(&self, args: Value) -> Result<StreamingToolOpen, ToolError>;
+}
+
+/// What [`StreamingTool::open_stream`] returns: everything about the
+/// result that's known upfront (`metadata`), plus a reader for the one
+/// field whose value is produced incrementally (`field_name`, `reader`).
+/// The full result, once reassembled, is `metadata` with `field_name` set
+/// to the concatenation of everything `reader` ever returned, decoded per
+/// the reader's own contract (e.g. UTF-8 text).
+pub struct StreamingToolOpen {
+    pub metadata: Value,
+    pub field_name: &'static str,
+    pub reader: Box<dyn IncrementalBytes>,
+}
+
+impl std::fmt::Debug for StreamingToolOpen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamingToolOpen")
+            .field("metadata", &self.metadata)
+            .field("field_name", &self.field_name)
+            .field("reader", &"<dyn IncrementalBytes>")
+            .finish()
+    }
+}
+
+/// Bounded, incremental byte production for one streamed field.
+///
+/// Implementations must enforce their own content validation (e.g. UTF-8)
+/// *as bytes are produced*, across chunk boundaries — never by buffering
+/// everything and validating once at the end, which would defeat the
+/// entire point of this trait existing instead of just calling
+/// [`Tool::invoke`].
+pub trait IncrementalBytes: Send {
+    /// Total size in bytes, if known upfront (used for `StreamStart`'s
+    /// `total_bytes`/`total_chunks` — informational, per that message's
+    /// own doc comment, not load-bearing).
+    fn total_bytes_hint(&self) -> Option<u64>;
+
+    /// Returns the next chunk of up to `max_len` bytes, or `Ok(None)`
+    /// once exhausted. May return fewer than `max_len` bytes even before
+    /// exhaustion (e.g. because validating a content boundary held some
+    /// bytes back for the next call).
+    fn next_chunk(&mut self, max_len: usize) -> Result<Option<Vec<u8>>, ToolError>;
 }
 
 #[derive(Debug, serde::Serialize)]
