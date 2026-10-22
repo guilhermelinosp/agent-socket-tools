@@ -33,6 +33,10 @@ path = "src/bin/mcp-like-server.rs"
 name = "mcp-server"
 path = "src/bin/mcp-server.rs"
 
+[[bin]]
+name = "ast-mcp-adapter"
+path = "src/bin/ast-mcp-adapter.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time", "sync", "signal", "process"] }
 serde = { version = "1", features = ["derive"] }

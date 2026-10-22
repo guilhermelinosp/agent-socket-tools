@@ -183,4 +183,12 @@ Each entry has the shape below. The numbers are illustrative, not measurements:
 
 ## Results
 
-Results are recorded in docs/AST_PROTOCOL.md's 'MCP comparison' section together with the commit and machine they were measured on.
+The full release run is stored in the repository:
+
+- Markdown report: [`results/bench-2026-10-22.md`](results/bench-2026-10-22.md)
+- Machine-readable JSON: [`results/bench-2026-10-22.json`](results/bench-2026-10-22.json)
+
+Measured at commit `4f716f1` on an Apple M3 Pro (macOS arm64), rustc 1.99.1, with `rmcp =3.6.0`. Zero errors in every cell.
+
+The interpretation and the target-by-target verdicts are in the
+["MCP comparison"](AST_PROTOCOL.md#mcp-comparison) section of `docs/AST_PROTOCOL.md`.

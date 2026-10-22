@@ -28,6 +28,7 @@ A minimal Python client for AST also lives here —
 is actually sufficient to implement a conforming client in a second
 language, by running its tests against the real, unmodified
 `ast-server` binary.
+An optional MCP stdio bridge, **`ast-mcp-adapter`**, lets MCP hosts use tools served by a running `ast-server` — see **[`docs/MCP_ADAPTER.md`](docs/MCP_ADAPTER.md)**. Benchmark results and the MCP comparison are in **[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md#results)** and **[`docs/AST_PROTOCOL.md`](docs/AST_PROTOCOL.md#mcp-comparison)**.
 
 ## Why
 
@@ -306,7 +307,9 @@ the code under test.
 ## What this intentionally does not do
 
 - No arbitrary shell/command execution tool.
-- No MCP compatibility layer, adapters, or dynamic plugin loading.
+- No MCP compatibility layer inside AST, and no dynamic plugin loading. The
+  optional `ast-mcp-adapter` is a separate bridge binary, not part of the protocol
+  (see `docs/MCP_ADAPTER.md`).
 - No remote transport (TCP, HTTP, WebSocket) — Unix Domain Socket only.
 - No authentication beyond filesystem permissions on the socket file
   itself, which is the standard Unix model for same-host IPC.
