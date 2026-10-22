@@ -123,7 +123,9 @@ numbers on your own machine; they're real but machine-specific.
 | 10 | `CANCEL` | C→S | Implemented |
 | 11 | `BATCH` | C→S | Implemented |
 | 12 | `BATCH_RESULT` | S→C | Implemented |
-| 13–15 | `STREAM_START`/`STREAM_CHUNK`/`STREAM_END` | — | **Reserved, not implemented** |
+| 13 | `STREAM_START` | S→C | Implemented |
+| 14 | `STREAM_CHUNK` | S→C | Implemented |
+| 15 | `STREAM_END` | S→C | Implemented |
 
 ### Batch execution
 
@@ -162,15 +164,50 @@ answered by a single `BATCH_RESULT`. Semantics, chosen conservatively:
   in-flight slot (`--max-in-flight-per-connection`), regardless of how
   many calls it contains.
 
-### Deferred: streaming
+### Chunked streaming
 
-No demonstrated need yet in this crate's own tools (`system.info`,
-`filesystem.read` — neither produces incremental or unbounded output).
-Implementing it now would be speculative. The byte values above are
-reserved so a future version can add them without reassigning a type
-code already in use. If/when a real tool needs incremental output (a
-genuinely large or streaming result), that's the trigger to specify and
-implement this — not before.
+`STREAM_START`/`STREAM_CHUNK`/`STREAM_END` let a client ask for a
+result as a bounded sequence of chunks instead of one `RESULT` frame.
+Be precise about what this is: **chunked delivery of a result the
+server has already fully computed**, not incremental execution-time
+production. No tool in this crate (`system.info`, `filesystem.read`)
+produces output incrementally — `filesystem.read` still reads the
+whole file and returns one value before any chunk is sent — so this
+doesn't claim to be "true" streaming in the sense of a tool emitting
+partial output as it works. What it *does* provide, which was the
+actual deferred need: bounded per-chunk frame size and real
+backpressure for a large result, via the same mechanism every other
+response already uses (the connection's bounded outgoing-frame
+channel — `tx.send(...).await` naturally blocks when a slow reader
+can't keep up), rather than one `RESULT` frame sized to the whole
+result.
+
+- **Opt-in per call**: `Invoke.stream: true` requests it; absent or
+  `false` (the default, and what every client in this crate other than
+  the explicit `--stream` flag uses) gets the normal `RESULT`. Any
+  tool's result can be streamed — this is a delivery-mode choice, not a
+  tool capability, so no "is this tool streamable" flag exists or is
+  needed.
+- **Failure before streaming starts**: if the invoked tool itself
+  fails, the server still has the complete outcome (an error) before
+  anything is sent, so it reports a normal `ERROR` — `STREAM_START` is
+  never sent for a call that didn't succeed. A client doesn't need a
+  special code path for "this failed partway through a stream" because
+  that case cannot occur.
+- **Ordering**: `STREAM_CHUNK.sequence` is 0-indexed and strictly
+  increasing with no gaps or reordering; concatenating every chunk's
+  `data` in that order reconstructs exactly the MessagePack-encoded
+  bytes a non-streamed `RESULT.value` would have carried.
+- **Chunk size**: `ast-server --stream-chunk-bytes` (default 64 KiB)
+  targets a per-chunk size; the last chunk is typically smaller.
+  Clamped down automatically at connection start if it wouldn't fit
+  under `--max-frame-bytes`, so misconfiguring the two relative to each
+  other can't produce an oversized frame.
+
+If a tool that genuinely needs incremental, execution-time output ever
+exists, that would be the trigger to extend this (or add a distinct
+mechanism) — not a reason to have withheld chunked delivery of large,
+already-computed results until then.
 
 ## Payloads per type
 
@@ -184,7 +221,7 @@ names and optionality are exactly as declared there via `serde`).
 | `HELLO_ACK` | `HelloAck` | `protocol_version: u32`, `server_name: String`, `ok: bool`, `error: Option<String>` |
 | `DISCOVER` | `Discover` | *(empty)* |
 | `DISCOVER_RESULT` | `DiscoverResult` | `tools: Vec<ToolDescriptorWire>` — each with `name`, `description`, `input_schema` (JSON Schema, draft-07 subset), `version`, `required_permissions: Vec<String>`, `max_input_bytes: Option<u64>`, `max_output_bytes: Option<u64>` |
-| `INVOKE` | `Invoke` | `tool: String`, `args: <tool-specific JSON value>`, `deadline_ms: Option<u64>` (absent means "use the server's configured default," never "no deadline") |
+| `INVOKE` | `Invoke` | `tool: String`, `args: <tool-specific JSON value>`, `deadline_ms: Option<u64>` (absent means "use the server's configured default," never "no deadline"), `stream: Option<bool>` (absent/`false` is a normal `RESULT`; `true` requests `STREAM_START`/`STREAM_CHUNK*`/`STREAM_END` instead) |
 | `RESULT` | `InvokeResult` | `value: <tool-specific JSON value>` |
 | `ERROR` | `ErrorPayload` | `code: ErrorCode`, `message: String` |
 | `PING` | `Ping` | *(empty)* |
@@ -192,6 +229,9 @@ names and optionality are exactly as declared there via `serde`).
 | `CANCEL` | `Cancel` | `target_correlation_id: u64` |
 | `BATCH` | `Batch` | `calls: Vec<BatchInvoke>` — each `{id: u64, tool: String, args: <JSON>, deadline_ms: Option<u64>}` |
 | `BATCH_RESULT` | `BatchResult` | `results: Vec<BatchResultEntry>` — each `{id: u64, status: "ok" \| "error", value / code+message}` |
+| `STREAM_START` | `StreamStart` | `total_chunks: u32`, `total_bytes: u64` (informational — see "Chunked streaming") |
+| `STREAM_CHUNK` | `StreamChunk` | `sequence: u32`, `data: bytes` (a MessagePack `bin`, not an array — see `src/ast/message.rs`'s `serde_bytes` usage) |
+| `STREAM_END` | `StreamEnd` | *(empty)* |
 
 Tool `args`/`value` are themselves arbitrary JSON values, re-encoded as
 MessagePack at the envelope level — a client library in any language can

@@ -45,6 +45,13 @@ pub struct ConnectionConfig {
     /// value — this bounds how much sequential work one slot can demand,
     /// not how many slots a batch consumes.
     pub max_batch_size: usize,
+    /// Target size, in bytes, of one `STREAM_CHUNK`'s `data` when a
+    /// client requests streamed delivery (`Invoke.stream: true`). The
+    /// last chunk of a stream is typically smaller. Clamped down at
+    /// connection start if it wouldn't fit inside `frame_limits` (see
+    /// `run_connection`), so misconfiguring this relative to
+    /// `max_frame_bytes` can't produce an oversized frame.
+    pub stream_chunk_bytes: usize,
 }
 
 impl Default for ConnectionConfig {
@@ -57,6 +64,7 @@ impl Default for ConnectionConfig {
             peer_policy: PeerPolicy::SameUid,
             server_name: "agent-socket-tools/ast".to_string(),
             max_batch_size: 100,
+            stream_chunk_bytes: 64 * 1024,
         }
     }
 }
@@ -360,6 +368,7 @@ async fn serve_reads(
                     Arc::clone(&cancellations),
                     tx.clone(),
                     max_frame_len,
+                    effective_stream_chunk_bytes(config.stream_chunk_bytes, max_frame_len),
                 );
             }
             Some(MessageType::Batch) => {
@@ -490,7 +499,10 @@ async fn serve_reads(
                 | MessageType::Result
                 | MessageType::Error
                 | MessageType::Pong
-                | MessageType::BatchResult,
+                | MessageType::BatchResult
+                | MessageType::StreamStart
+                | MessageType::StreamChunk
+                | MessageType::StreamEnd,
             ) => {
                 // These are server->client-only message types; receiving
                 // one from a client is a protocol violation, not a crash.
@@ -518,6 +530,18 @@ async fn serve_reads(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Clamps a requested `STREAM_CHUNK` payload size so it always fits
+/// inside one frame under `max_frame_len`, no matter how
+/// `stream_chunk_bytes` is configured — leaves generous headroom (128
+/// bytes) for the frame header and `StreamChunk`'s own `sequence` field
+/// and MessagePack map/bin overhead, rather than computing the exact
+/// minimum that would fit.
+fn effective_stream_chunk_bytes(configured: usize, max_frame_len: u32) -> usize {
+    let ceiling = (max_frame_len as usize).saturating_sub(wire::HEADER_LEN + 128);
+    configured.min(ceiling).max(1)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn spawn_invoke(
     correlation_id: u64,
     invoke: Invoke,
@@ -529,6 +553,7 @@ fn spawn_invoke(
     cancellations: Cancellations,
     tx: mpsc::Sender<Frame>,
     max_frame_len: u32,
+    stream_chunk_bytes: usize,
 ) {
     tokio::spawn(async move {
         let _permit = permit; // held for this task's whole lifetime
@@ -536,6 +561,7 @@ fn spawn_invoke(
             .deadline_ms
             .map(Duration::from_millis)
             .unwrap_or(default_deadline);
+        let wants_stream = invoke.stream.unwrap_or(false);
 
         let response = run_invoke(invoke, registry, deadline, cancel_notify).await;
 
@@ -549,6 +575,9 @@ fn spawn_invoke(
             .remove(&correlation_id);
 
         match response {
+            Ok(value) if wants_stream => {
+                send_streamed_result(&tx, correlation_id, value, stream_chunk_bytes).await;
+            }
             Ok(value) => {
                 let _ = send(
                     &tx,
@@ -564,6 +593,67 @@ fn spawn_invoke(
             }
         }
     });
+}
+
+/// Sends an already-computed, successful result as
+/// `STREAM_START`/`STREAM_CHUNK*`/`STREAM_END` instead of one `RESULT`.
+/// Each `tx.send(...).await` below blocks when the connection's bounded
+/// outgoing-frame channel is full — the same backpressure every other
+/// response already relies on — so a slow reader on the other end
+/// throttles how fast this loop produces further chunks, rather than
+/// buffering the whole result in memory on the server's behalf beyond
+/// what's already needed to have computed `value` in the first place.
+async fn send_streamed_result(
+    tx: &mpsc::Sender<Frame>,
+    correlation_id: u64,
+    value: serde_json::Value,
+    chunk_bytes: usize,
+) {
+    let encoded = match codec::encode(&value) {
+        Ok(bytes) => bytes,
+        Err(_) => return, // can't even report this as an ERROR without re-encoding the same failure
+    };
+    let total_chunks = encoded.chunks(chunk_bytes.max(1)).count().max(1) as u32;
+
+    // STREAM_START/STREAM_CHUNK/STREAM_END are never themselves subject
+    // to RESULT_TOO_LARGE substitution the way a plain RESULT is — each
+    // chunk's size is already bounded by `chunk_bytes`
+    // (`effective_stream_chunk_bytes` clamps it below `max_frame_len`),
+    // so `send_raw` (not `send`) is correct here: there's no "too large"
+    // case left to detect.
+    if send_raw(
+        tx,
+        MessageType::StreamStart,
+        correlation_id,
+        &StreamStart {
+            total_chunks,
+            total_bytes: encoded.len() as u64,
+        },
+    )
+    .await
+    .is_err()
+    {
+        return;
+    }
+
+    for (sequence, chunk) in encoded.chunks(chunk_bytes.max(1)).enumerate() {
+        if send_raw(
+            tx,
+            MessageType::StreamChunk,
+            correlation_id,
+            &StreamChunk {
+                sequence: sequence as u32,
+                data: chunk.to_vec(),
+            },
+        )
+        .await
+        .is_err()
+        {
+            return;
+        }
+    }
+
+    let _ = send_raw(tx, MessageType::StreamEnd, correlation_id, &StreamEnd {}).await;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -596,6 +686,11 @@ fn spawn_batch(
                 tool: call.tool,
                 args: call.args,
                 deadline_ms: call.deadline_ms,
+                // Streamed delivery is an INVOKE-level choice; BATCH
+                // always collects each call's full result in one
+                // BatchResultEntry; there's no such thing as "stream one
+                // entry within a batch."
+                stream: None,
             };
             let deadline = invoke
                 .deadline_ms
@@ -958,6 +1053,7 @@ mod tests {
             tool: "test.slow".to_string(),
             args: serde_json::json!({}),
             deadline_ms: Some(5000),
+            stream: None,
         };
         let payload = codec::encode(&invoke).unwrap();
         send_raw(
@@ -1010,6 +1106,7 @@ mod tests {
             tool: "test.slow".to_string(),
             args: serde_json::json!({}),
             deadline_ms: Some(50),
+            stream: None,
         };
         send_raw(
             &mut client,
@@ -1045,6 +1142,7 @@ mod tests {
             tool: "test.slow".to_string(),
             args: serde_json::json!({}),
             deadline_ms: Some(10_000),
+            stream: None,
         };
         send_raw(
             &mut client,
@@ -1132,6 +1230,7 @@ mod tests {
             tool: "test.slow".to_string(),
             args: serde_json::json!({}),
             deadline_ms: Some(5000),
+            stream: None,
         };
         let payload = codec::encode(&invoke).unwrap();
         send_raw(
@@ -1180,6 +1279,7 @@ mod tests {
             tool: "test.big_result".to_string(),
             args: serde_json::json!({}),
             deadline_ms: Some(5000),
+            stream: None,
         };
         send_raw(
             &mut client,
@@ -1222,6 +1322,7 @@ mod tests {
             tool: "test.big_result".to_string(),
             args: serde_json::json!({}),
             deadline_ms: Some(5000),
+            stream: None,
         };
         send_raw(
             &mut client,
@@ -1521,5 +1622,163 @@ mod tests {
         );
         let err: ErrorPayload = codec::decode(&resp.payload).unwrap();
         assert_eq!(err.code, ErrorCode::InvalidMessage);
+    }
+
+    #[tokio::test]
+    async fn streamed_invoke_of_a_small_result_reassembles_to_the_same_value() {
+        let registry = registry_with(vec![Box::new(SystemInfoTool)]);
+        let (mut client, _dir) =
+            connected_pair_with_registry(registry, ConnectionConfig::default()).await;
+        do_hello(&mut client).await;
+
+        let invoke = Invoke {
+            tool: "system.info".to_string(),
+            args: serde_json::json!({}),
+            deadline_ms: None,
+            stream: Some(true),
+        };
+        send_raw(
+            &mut client,
+            Frame {
+                msg_type: MessageType::Invoke as u8,
+                correlation_id: 1,
+                payload: codec::encode(&invoke).unwrap(),
+            },
+        )
+        .await;
+
+        let start_frame = recv_raw(&mut client).await;
+        assert_eq!(
+            MessageType::from_u8(start_frame.msg_type),
+            Some(MessageType::StreamStart)
+        );
+        let start: StreamStart = codec::decode(&start_frame.payload).unwrap();
+        assert_eq!(start.total_chunks, 1); // system.info's result is tiny
+
+        let mut encoded = Vec::new();
+        for _ in 0..start.total_chunks {
+            let frame = recv_raw(&mut client).await;
+            assert_eq!(
+                MessageType::from_u8(frame.msg_type),
+                Some(MessageType::StreamChunk)
+            );
+            let chunk: StreamChunk = codec::decode(&frame.payload).unwrap();
+            encoded.extend_from_slice(&chunk.data);
+        }
+        assert_eq!(encoded.len(), start.total_bytes as usize);
+
+        let end_frame = recv_raw(&mut client).await;
+        assert_eq!(
+            MessageType::from_u8(end_frame.msg_type),
+            Some(MessageType::StreamEnd)
+        );
+
+        let value: JsonValue = codec::decode(&encoded).unwrap();
+        assert_eq!(value["os"], std::env::consts::OS);
+    }
+
+    #[tokio::test]
+    async fn streamed_invoke_of_a_large_result_splits_into_several_chunks_in_order() {
+        let registry = registry_with(vec![Box::new(BigResultTool { result_bytes: 1000 })]);
+        let config = ConnectionConfig {
+            stream_chunk_bytes: 64, // forces many chunks for a 1000+-byte result
+            ..Default::default()
+        };
+        let (mut client, _dir) = connected_pair_with_registry(registry, config).await;
+        do_hello(&mut client).await;
+
+        let invoke = Invoke {
+            tool: "test.big_result".to_string(),
+            args: serde_json::json!({}),
+            deadline_ms: None,
+            stream: Some(true),
+        };
+        send_raw(
+            &mut client,
+            Frame {
+                msg_type: MessageType::Invoke as u8,
+                correlation_id: 1,
+                payload: codec::encode(&invoke).unwrap(),
+            },
+        )
+        .await;
+
+        let start_frame = recv_raw(&mut client).await;
+        let start: StreamStart = codec::decode(&start_frame.payload).unwrap();
+        assert!(
+            start.total_chunks > 1,
+            "a result this much bigger than the 64-byte chunk size should need several chunks"
+        );
+
+        let mut encoded = Vec::new();
+        for expected_sequence in 0..start.total_chunks {
+            let frame = recv_raw(&mut client).await;
+            assert_eq!(
+                MessageType::from_u8(frame.msg_type),
+                Some(MessageType::StreamChunk)
+            );
+            let chunk: StreamChunk = codec::decode(&frame.payload).unwrap();
+            assert_eq!(chunk.sequence, expected_sequence);
+            encoded.extend_from_slice(&chunk.data);
+        }
+        let end_frame = recv_raw(&mut client).await;
+        assert_eq!(
+            MessageType::from_u8(end_frame.msg_type),
+            Some(MessageType::StreamEnd)
+        );
+
+        let value: JsonValue = codec::decode(&encoded).unwrap();
+        assert_eq!(value["data"], "x".repeat(1000));
+    }
+
+    #[tokio::test]
+    async fn non_streamed_invoke_is_unaffected_by_a_small_stream_chunk_bytes_config() {
+        // Proves `stream: None`/`Some(false)` still gets one plain
+        // RESULT even when the connection's configured chunk size is
+        // tiny — streaming is opt-in per INVOKE, never automatic.
+        let registry = registry_with(vec![Box::new(BigResultTool { result_bytes: 1000 })]);
+        let config = ConnectionConfig {
+            stream_chunk_bytes: 64,
+            ..Default::default()
+        };
+        let (mut client, _dir) = connected_pair_with_registry(registry, config).await;
+        do_hello(&mut client).await;
+
+        let invoke = Invoke {
+            tool: "test.big_result".to_string(),
+            args: serde_json::json!({}),
+            deadline_ms: None,
+            stream: None,
+        };
+        send_raw(
+            &mut client,
+            Frame {
+                msg_type: MessageType::Invoke as u8,
+                correlation_id: 1,
+                payload: codec::encode(&invoke).unwrap(),
+            },
+        )
+        .await;
+
+        let frame = recv_raw(&mut client).await;
+        assert_eq!(
+            MessageType::from_u8(frame.msg_type),
+            Some(MessageType::Result)
+        );
+        let result: InvokeResult = codec::decode(&frame.payload).unwrap();
+        assert_eq!(result.value["data"], "x".repeat(1000));
+    }
+
+    #[test]
+    fn effective_stream_chunk_bytes_never_exceeds_the_frame_limit() {
+        // A generously large configured chunk size is clamped down to
+        // fit comfortably under a small max_frame_len...
+        assert!(effective_stream_chunk_bytes(1_000_000, 256) < 256);
+        // ...while a small configured chunk size under a large
+        // max_frame_len is left alone.
+        assert_eq!(
+            effective_stream_chunk_bytes(1024, wire::DEFAULT_MAX_FRAME_LEN),
+            1024
+        );
     }
 }

@@ -312,3 +312,53 @@ async fn batch_exceeding_configured_max_size_is_rejected() {
     let (success, _stdout) = run_client(&server.socket_path, &["batch", "--calls", calls]);
     assert!(!success);
 }
+
+#[tokio::test]
+async fn invoke_stream_returns_the_same_result_as_a_plain_invoke() {
+    let server = start_server().await;
+
+    let (success, plain_stdout) = run_client(
+        &server.socket_path,
+        &["invoke", "--tool", "system.info", "--args", "{}"],
+    );
+    assert!(success);
+
+    let (success, streamed_stdout) = run_client(
+        &server.socket_path,
+        &[
+            "invoke",
+            "--tool",
+            "system.info",
+            "--args",
+            "{}",
+            "--stream",
+        ],
+    );
+    assert!(success);
+
+    let plain: serde_json::Value = serde_json::from_str(&plain_stdout).unwrap();
+    let streamed: serde_json::Value = serde_json::from_str(&streamed_stdout).unwrap();
+    assert_eq!(plain, streamed);
+}
+
+#[tokio::test]
+async fn invoke_stream_of_a_large_file_reassembles_correctly() {
+    let server = start_server().await;
+    let large_contents = "y".repeat(200_000);
+    std::fs::write(server._read_dir.path().join("large.txt"), &large_contents).unwrap();
+
+    let (success, stdout) = run_client(
+        &server.socket_path,
+        &[
+            "invoke",
+            "--tool",
+            "filesystem.read",
+            "--args",
+            r#"{"path":"large.txt"}"#,
+            "--stream",
+        ],
+    );
+    assert!(success);
+    let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(value["contents"], large_contents);
+}

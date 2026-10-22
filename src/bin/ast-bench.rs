@@ -732,6 +732,7 @@ fn print_encoded_sizes() {
             tool: "filesystem.read".to_string(),
             args: serde_json::json!({"path": "medium.txt"}),
             deadline_ms: None,
+            stream: None,
         })
         .unwrap()
         .len();

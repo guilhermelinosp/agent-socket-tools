@@ -66,6 +66,7 @@ async fn invoke_vector() {
         tool: "system.info".to_string(),
         args: serde_json::json!({}),
         deadline_ms: Some(5000),
+        stream: None,
     };
     let frame = Frame {
         msg_type: MessageType::Invoke as u8,

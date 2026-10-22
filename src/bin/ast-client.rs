@@ -42,6 +42,12 @@ enum Command {
         /// Overrides the server's default deadline for this one call.
         #[arg(long)]
         deadline_ms: Option<u64>,
+        /// Requests chunked (`STREAM_START`/`STREAM_CHUNK*`/
+        /// `STREAM_END`) delivery instead of a single `RESULT`. The
+        /// printed output is identical either way — this only changes
+        /// how it travels on the wire.
+        #[arg(long, default_value_t = false)]
+        stream: bool,
     },
     /// Runs several tool calls as one BATCH. The server executes them
     /// sequentially, in order — see `docs/AST_PROTOCOL.md`'s "Batch
@@ -100,6 +106,7 @@ async fn main() -> std::process::ExitCode {
             tool,
             args,
             deadline_ms,
+            stream,
         } => {
             let args: serde_json::Value = match serde_json::from_str(&args) {
                 Ok(v) => v,
@@ -108,10 +115,13 @@ async fn main() -> std::process::ExitCode {
                     return std::process::ExitCode::FAILURE;
                 }
             };
-            match client
-                .invoke(&tool, args, deadline_ms.map(Duration::from_millis))
-                .await
-            {
+            let deadline = deadline_ms.map(Duration::from_millis);
+            let result = if stream {
+                client.invoke_stream(&tool, args, deadline).await
+            } else {
+                client.invoke(&tool, args, deadline).await
+            };
+            match result {
                 Ok(value) => {
                     println!(
                         "{}",

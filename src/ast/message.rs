@@ -2,10 +2,11 @@
 //!
 //! Every payload struct here is encoded as a MessagePack named-field map
 //! (see [`crate::ast::codec`]). `HELLO`/`HELLO_ACK`, `DISCOVER`, `INVOKE`,
-//! `RESULT`, `ERROR`, `PING`/`PONG`, `CANCEL`, and `BATCH`/`BATCH_RESULT`
-//! are implemented. `STREAM_*` are reserved type codes — see
-//! `docs/AST_PROTOCOL.md` for why that one's deferred rather than
-//! implemented in v1.
+//! `RESULT`, `ERROR`, `PING`/`PONG`, `CANCEL`, `BATCH`/`BATCH_RESULT`, and
+//! `STREAM_START`/`STREAM_CHUNK`/`STREAM_END` are all implemented. See
+//! `docs/AST_PROTOCOL.md`'s "Chunked streaming" section for exactly what
+//! the stream types do and don't provide (chunked delivery of an
+//! already-computed result, not incremental execution-time production).
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -27,10 +28,9 @@ pub enum MessageType {
     Cancel = 10,
     Batch = 11,
     BatchResult = 12,
-    // Reserved, not implemented in v1 — see docs/AST_PROTOCOL.md §"Deferred".
-    // StreamStart = 13,
-    // StreamChunk = 14,
-    // StreamEnd = 15,
+    StreamStart = 13,
+    StreamChunk = 14,
+    StreamEnd = 15,
 }
 
 impl MessageType {
@@ -48,6 +48,9 @@ impl MessageType {
             10 => Some(Self::Cancel),
             11 => Some(Self::Batch),
             12 => Some(Self::BatchResult),
+            13 => Some(Self::StreamStart),
+            14 => Some(Self::StreamChunk),
+            15 => Some(Self::StreamEnd),
             _ => None,
         }
     }
@@ -106,12 +109,59 @@ pub struct Invoke {
     /// this protocol has no unbounded-wait mode, by design.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deadline_ms: Option<u64>,
+    /// `true` asks the server to deliver the result as
+    /// `STREAM_START`/`STREAM_CHUNK*`/`STREAM_END` instead of a single
+    /// `RESULT`, regardless of the result's size. Absent or `false`
+    /// means the normal, unchunked `RESULT` — the default, and what
+    /// every other client in this crate uses. See
+    /// `docs/AST_PROTOCOL.md`'s "Chunked streaming" section for why this
+    /// is a delivery-mode choice, not a tool capability: any tool's
+    /// result can be streamed, because streaming chunks the server's
+    /// already-fully-computed result rather than requiring the tool
+    /// itself to produce output incrementally.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InvokeResult {
     pub value: Value,
 }
+
+/// First message of a streamed response. `total_bytes` is the size, in
+/// bytes, of the MessagePack-encoded result value *before* chunking —
+/// informational (e.g. for a progress bar), not load-bearing: a
+/// conforming client reassembles the result from exactly the chunks it
+/// receives, in `sequence` order, regardless of whether their total
+/// matches this number.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamStart {
+    pub total_chunks: u32,
+    pub total_bytes: u64,
+}
+
+/// One chunk of a streamed response's encoded result value. `sequence`
+/// is 0-indexed and strictly increasing with no gaps — a conforming
+/// server never reorders or drops a chunk. `data` is a raw slice of the
+/// MessagePack-encoded result value (`rmp_serde::to_vec_named`'s output,
+/// cut at arbitrary byte boundaries, not aligned to MessagePack element
+/// boundaries) — concatenating every chunk's `data` in `sequence` order
+/// reconstructs exactly the bytes a non-streamed `RESULT.value` would
+/// have carried, decodable as that same value.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamChunk {
+    pub sequence: u32,
+    #[serde(with = "serde_bytes")]
+    pub data: Vec<u8>,
+}
+
+/// Terminates a stream that completed successfully. (A tool failure is
+/// never reported this way — see `docs/AST_PROTOCOL.md`'s "Chunked
+/// streaming" section: a failing call never starts a stream in the
+/// first place, since the server already has the complete result,
+/// success or `ErrorPayload`, before any `STREAM_START` is sent.)
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct StreamEnd {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]

@@ -54,6 +54,12 @@ struct Cli {
     #[arg(long, default_value_t = 100)]
     max_batch_size: usize,
 
+    /// Target size, in bytes, of one `STREAM_CHUNK` when a client
+    /// requests streamed delivery (`INVOKE`'s `stream: true`). Clamped
+    /// down automatically if it wouldn't fit under `--max-frame-bytes`.
+    #[arg(long, default_value_t = 64 * 1024)]
+    stream_chunk_bytes: usize,
+
     /// Timeout, in seconds, to receive a valid `HELLO` after a connection
     /// is accepted. A peer that doesn't send one in time is disconnected.
     #[arg(long, default_value_t = 5)]
@@ -114,6 +120,7 @@ async fn main() -> std::process::ExitCode {
         },
         server_name: "agent-socket-tools/ast".to_string(),
         max_batch_size: cli.max_batch_size,
+        stream_chunk_bytes: cli.stream_chunk_bytes,
     };
 
     tracing::info!(

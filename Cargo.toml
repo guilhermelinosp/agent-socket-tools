@@ -50,6 +50,11 @@ rmp-serde = "1"
 # Used by both the test suite and `ast-bench` (a real [[bin]], not just
 # tests) for disposable, auto-cleaned-up directories.
 tempfile = "3"
+# So STREAM_CHUNK's payload bytes are encoded as a single MessagePack
+# `bin` value, not a sequence of per-byte fixints — without it, serde's
+# default `Vec<u8>` handling makes every streamed chunk several times
+# larger on the wire than it needs to be.
+serde_bytes = "0.11"
 
 [dev-dependencies]
 criterion = "0.7"

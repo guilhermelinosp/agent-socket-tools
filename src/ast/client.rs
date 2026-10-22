@@ -46,10 +46,19 @@ pub enum AstClientError {
 }
 
 type Waiters = Arc<Mutex<HashMap<u64, oneshot::Sender<Frame>>>>;
+/// Registered only for a correlation_id started via
+/// [`AstClient::invoke_stream`] — an mpsc channel the reader task
+/// forwards every frame bearing that id into (an `Error` if the call
+/// failed before streaming began, or `StreamStart`/`StreamChunk*`/
+/// `StreamEnd` if it didn't), instead of the one-shot `waiters` every
+/// other request uses. Removed once a terminal frame (`Error` or
+/// `StreamEnd`) for that id has been forwarded.
+type StreamWaiters = Arc<Mutex<HashMap<u64, mpsc::Sender<Frame>>>>;
 
 pub struct AstClient {
     tx: mpsc::Sender<Frame>,
     waiters: Waiters,
+    stream_waiters: StreamWaiters,
     next_id: AtomicU64,
     default_timeout: Duration,
     writer_task: JoinHandle<()>,
@@ -78,6 +87,7 @@ impl AstClient {
         let (mut read_half, write_half) = stream.into_split();
         let (tx, mut rx) = mpsc::channel::<Frame>(64);
         let waiters: Waiters = Arc::new(Mutex::new(HashMap::new()));
+        let stream_waiters: StreamWaiters = Arc::new(Mutex::new(HashMap::new()));
 
         let writer_task = tokio::spawn(async move {
             let mut write_half = write_half;
@@ -89,11 +99,33 @@ impl AstClient {
         });
 
         let reader_waiters = Arc::clone(&waiters);
+        let reader_stream_waiters = Arc::clone(&stream_waiters);
         let frame_limits = config.frame_limits;
         let reader_task = tokio::spawn(async move {
             loop {
                 match wire::read_frame(&mut read_half, frame_limits).await {
                     Ok(Some(frame)) => {
+                        let is_terminal_for_stream = matches!(
+                            MessageType::from_u8(frame.msg_type),
+                            Some(MessageType::Error) | Some(MessageType::StreamEnd)
+                        );
+                        let stream_sender = if is_terminal_for_stream {
+                            reader_stream_waiters
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .remove(&frame.correlation_id)
+                        } else {
+                            reader_stream_waiters
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .get(&frame.correlation_id)
+                                .cloned()
+                        };
+                        if let Some(sender) = stream_sender {
+                            let _ = sender.send(frame).await;
+                            continue;
+                        }
+
                         let waiter = reader_waiters
                             .lock()
                             .unwrap_or_else(|p| p.into_inner())
@@ -113,6 +145,7 @@ impl AstClient {
         let client = Self {
             tx,
             waiters,
+            stream_waiters,
             next_id: AtomicU64::new(1),
             default_timeout: config.request_timeout,
             writer_task,
@@ -255,6 +288,7 @@ impl AstClient {
             tool: tool.to_string(),
             args,
             deadline_ms: deadline.map(|d| d.as_millis() as u64),
+            stream: None,
         };
         // Give the client-side wait a little longer than the deadline we
         // told the server to enforce, so a `DEADLINE_EXCEEDED` error (sent
@@ -271,6 +305,87 @@ impl AstClient {
             }
             Some(MessageType::Error) => Err(self.decode_server_error(&frame.payload)?),
             _ => Err(AstClientError::UnexpectedResponseType(frame.msg_type)),
+        }
+    }
+
+    /// Like [`Self::invoke`], but asks the server to deliver the result
+    /// as `STREAM_START`/`STREAM_CHUNK*`/`STREAM_END` and reassembles it
+    /// here — the caller gets back exactly the same `Value` either way.
+    /// See `docs/AST_PROTOCOL.md`'s "Chunked streaming" section for why
+    /// this exists: bounding the server's and this client's own peak
+    /// memory for a large result to roughly one chunk at a time, instead
+    /// of one whole encoded result, with real backpressure (both sides'
+    /// bounded channels) rather than an unbounded buffer on either end.
+    pub async fn invoke_stream(
+        &self,
+        tool: &str,
+        args: Value,
+        deadline: Option<Duration>,
+    ) -> Result<Value, AstClientError> {
+        let invoke = Invoke {
+            tool: tool.to_string(),
+            args,
+            deadline_ms: deadline.map(|d| d.as_millis() as u64),
+            stream: Some(true),
+        };
+
+        let id = self.next_correlation_id();
+        let (stx, mut srx) = mpsc::channel::<Frame>(8);
+        self.stream_waiters
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(id, stx);
+
+        let bytes = codec::encode(&invoke)?;
+        let frame = Frame {
+            msg_type: MessageType::Invoke as u8,
+            correlation_id: id,
+            payload: bytes,
+        };
+        if self.tx.send(frame).await.is_err() {
+            self.stream_waiters
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&id);
+            return Err(AstClientError::Closed);
+        }
+
+        let wait = deadline.unwrap_or(self.default_timeout) + Duration::from_secs(1);
+        let result = tokio::time::timeout(wait, self.collect_stream(&mut srx)).await;
+        self.stream_waiters
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&id);
+        match result {
+            Ok(outcome) => outcome,
+            Err(_elapsed) => Err(AstClientError::Timeout),
+        }
+    }
+
+    async fn collect_stream(
+        &self,
+        srx: &mut mpsc::Receiver<Frame>,
+    ) -> Result<Value, AstClientError> {
+        let first = srx.recv().await.ok_or(AstClientError::Closed)?;
+        match MessageType::from_u8(first.msg_type) {
+            Some(MessageType::Error) => Err(self.decode_server_error(&first.payload)?),
+            Some(MessageType::StreamStart) => {
+                let start: StreamStart = codec::decode(&first.payload)?;
+                let mut encoded = Vec::with_capacity(start.total_bytes as usize);
+                loop {
+                    let frame = srx.recv().await.ok_or(AstClientError::Closed)?;
+                    match MessageType::from_u8(frame.msg_type) {
+                        Some(MessageType::StreamChunk) => {
+                            let chunk: StreamChunk = codec::decode(&frame.payload)?;
+                            encoded.extend_from_slice(&chunk.data);
+                        }
+                        Some(MessageType::StreamEnd) => break,
+                        _ => return Err(AstClientError::UnexpectedResponseType(frame.msg_type)),
+                    }
+                }
+                Ok(codec::decode(&encoded)?)
+            }
+            _ => Err(AstClientError::UnexpectedResponseType(first.msg_type)),
         }
     }
 
@@ -437,5 +552,47 @@ mod tests {
             let value = handle.await.unwrap().unwrap();
             assert_eq!(value["os"], std::env::consts::OS);
         }
+    }
+
+    #[tokio::test]
+    async fn invoke_stream_reassembles_to_the_same_value_invoke_would_return() {
+        let (_dir, path) = start_test_server().await;
+        let client = AstClient::connect(&path, AstClientConfig::default())
+            .await
+            .unwrap();
+
+        let plain = client
+            .invoke("system.info", serde_json::json!({}), None)
+            .await
+            .unwrap();
+        let streamed = client
+            .invoke_stream("system.info", serde_json::json!({}), None)
+            .await
+            .unwrap();
+        assert_eq!(plain, streamed);
+
+        client.close().await;
+    }
+
+    #[tokio::test]
+    async fn invoke_stream_of_an_unknown_tool_reports_the_same_error_invoke_would() {
+        let (_dir, path) = start_test_server().await;
+        let client = AstClient::connect(&path, AstClientConfig::default())
+            .await
+            .unwrap();
+
+        let err = client
+            .invoke_stream("does.not.exist", serde_json::json!({}), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AstClientError::Server {
+                code: ErrorCode::ToolNotFound,
+                ..
+            }
+        ));
+
+        client.close().await;
     }
 }
