@@ -72,6 +72,14 @@ struct Cli {
     #[arg(long, default_value_t = 5)]
     handshake_timeout_secs: u64,
 
+    /// Maximum time, in seconds, to wait for the *next* frame on an
+    /// already-handshaken connection before closing it. Resets on every
+    /// frame received — bounds how long a connected-but-silent peer can
+    /// hold a connection slot, independent of any one request's own
+    /// `deadline_ms`.
+    #[arg(long, default_value_t = 300)]
+    idle_timeout_secs: u64,
+
     /// Only accept connections from processes running as the same user as
     /// this server, checked via `SO_PEERCRED` (Linux) / `LOCAL_PEERCRED`
     /// (macOS) — independent of, and in addition to, the socket file's
@@ -120,6 +128,7 @@ async fn main() -> std::process::ExitCode {
         max_in_flight: cli.max_in_flight_per_connection,
         default_deadline: Duration::from_millis(cli.default_deadline_ms),
         handshake_timeout: Duration::from_secs(cli.handshake_timeout_secs),
+        idle_timeout: Duration::from_secs(cli.idle_timeout_secs),
         peer_policy: if cli.require_same_uid {
             PeerPolicy::SameUid
         } else {

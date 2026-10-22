@@ -38,6 +38,25 @@ pub struct ConnectionConfig {
     pub max_in_flight: usize,
     pub default_deadline: Duration,
     pub handshake_timeout: Duration,
+    /// Maximum time to wait for the *next* frame on an already-
+    /// handshaken connection before closing it. Resets on every frame
+    /// received — it bounds how long a connected-but-silent peer can
+    /// hold this connection's resources (its slot in
+    /// `--max-connections`, any held `in_flight` permits from requests
+    /// still running), not any one request's own deadline (that's
+    /// `INVOKE.deadline_ms`, entirely independent). Without this, a
+    /// peer that completes `HELLO` and then never sends — or sends
+    /// unbearably slowly — anything else holds a connection open
+    /// forever, a resource-exhaustion vector no amount of per-request
+    /// bounding fixes, since the connection itself is never making a
+    /// request to bound.
+    /// Applied only while this connection has zero in-flight requests —
+    /// a client legitimately waiting out a long `deadline_ms` for a
+    /// response it already asked for isn't idle just because it has no
+    /// reason to send another frame meanwhile, so this never fires
+    /// while anything is still being worked on. It re-arms as soon as
+    /// every outstanding request has been answered.
+    pub idle_timeout: Duration,
     pub peer_policy: PeerPolicy,
     pub server_name: String,
     /// Maximum number of calls in one `BATCH`. A whole `BATCH` counts as
@@ -73,6 +92,7 @@ impl Default for ConnectionConfig {
             max_in_flight: 64,
             default_deadline: Duration::from_secs(10),
             handshake_timeout: Duration::from_secs(5),
+            idle_timeout: Duration::from_secs(300),
             peer_policy: PeerPolicy::SameUid,
             server_name: "agent-socket-tools/ast".to_string(),
             max_batch_size: 100,
@@ -234,7 +254,34 @@ async fn serve_reads(
     let in_flight_limit = Arc::new(Semaphore::new(config.max_in_flight));
 
     loop {
-        let frame = match wire::read_frame(&mut read_half, config.frame_limits).await {
+        let nothing_in_flight = in_flight
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_empty();
+        let read_result = if nothing_in_flight {
+            match tokio::time::timeout(
+                config.idle_timeout,
+                wire::read_frame(&mut read_half, config.frame_limits),
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(_elapsed) => {
+                    tracing::debug!(
+                        idle_timeout = ?config.idle_timeout,
+                        "closing connection: no frame received within the idle timeout"
+                    );
+                    return;
+                }
+            }
+        } else {
+            // At least one request is still being worked on — don't
+            // treat "the client hasn't sent anything new" as idle while
+            // it's legitimately waiting on a response already requested.
+            wire::read_frame(&mut read_half, config.frame_limits).await
+        };
+
+        let frame = match read_result {
             Ok(Some(f)) => f,
             Ok(None) => return, // clean disconnect
             Err(FrameError::TooLarge { .. }) => {
@@ -1829,6 +1876,79 @@ mod tests {
         assert_eq!(
             effective_stream_chunk_bytes(1024, wire::DEFAULT_MAX_FRAME_LEN),
             1024
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_connection_is_closed_after_the_configured_timeout() {
+        // A connected-but-silent peer (past HELLO, never sends another
+        // frame) must not hold its connection slot forever — proves
+        // `idle_timeout` actually closes the connection, not just that
+        // the config field exists.
+        let registry = registry_with(vec![Box::new(SystemInfoTool)]);
+        let config = ConnectionConfig {
+            idle_timeout: Duration::from_millis(50),
+            ..Default::default()
+        };
+        let (mut client, _dir) = connected_pair_with_registry(registry, config).await;
+        do_hello(&mut client).await;
+
+        // Send nothing further; the server should close the connection
+        // on its own well within this test's own generous timeout.
+        let closed = tokio::time::timeout(Duration::from_secs(2), async {
+            wire::read_frame(&mut client, FrameLimits::default()).await
+        })
+        .await
+        .expect("server should have closed the idle connection, not hung");
+
+        assert!(
+            matches!(closed, Ok(None)),
+            "expected a clean disconnect from the idle timeout, got {closed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_does_not_fire_while_a_request_is_still_in_flight() {
+        // A client that sent a long-running INVOKE and is legitimately
+        // waiting out its own deadline isn't idle, even though it has
+        // no reason to send another frame meanwhile — the idle timeout
+        // must not disconnect it before the slow tool actually answers.
+        let registry = registry_with(vec![Box::new(SlowTool {
+            sleep: Duration::from_millis(300),
+        })]);
+        let config = ConnectionConfig {
+            idle_timeout: Duration::from_millis(50), // much shorter than the tool's own sleep
+            ..Default::default()
+        };
+        let (mut client, _dir) = connected_pair_with_registry(registry, config).await;
+        do_hello(&mut client).await;
+
+        let invoke = Invoke {
+            tool: "test.slow".to_string(),
+            args: serde_json::json!({}),
+            deadline_ms: Some(5_000),
+            stream: None,
+        };
+        send_raw(
+            &mut client,
+            Frame {
+                msg_type: MessageType::Invoke as u8,
+                correlation_id: 1,
+                payload: codec::encode(&invoke).unwrap(),
+            },
+        )
+        .await;
+
+        // The tool sleeps 300ms, well past the 50ms idle_timeout — if
+        // idle_timeout wrongly applied while a request is in flight,
+        // the connection would already be closed by the time this
+        // response is due.
+        let resp = tokio::time::timeout(Duration::from_secs(2), recv_raw(&mut client))
+            .await
+            .expect("connection was closed by idle_timeout despite an in-flight request");
+        assert_eq!(
+            MessageType::from_u8(resp.msg_type),
+            Some(MessageType::Result)
         );
     }
 
