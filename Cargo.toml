@@ -29,6 +29,10 @@ path = "src/bin/ast-bench.rs"
 name = "mcp-like-server"
 path = "src/bin/mcp-like-server.rs"
 
+[[bin]]
+name = "mcp-server"
+path = "src/bin/mcp-server.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time", "sync", "signal", "process"] }
 serde = { version = "1", features = ["derive"] }
@@ -65,3 +69,10 @@ ciborium = "0.2"
 [[bench]]
 name = "serialization"
 harness = false
+
+[dependencies.rmcp]
+# Official modelcontextprotocol/rust-sdk — used ONLY by the `mcp-server`
+# binary, a real MCP baseline for ast-bench (not by AST's own hot path).
+# Pinned to an exact, documented version per the fair-baseline mandate.
+version = "=3.6.0"
+features = ["server", "transport-io"]
