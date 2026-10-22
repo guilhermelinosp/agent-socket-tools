@@ -19,6 +19,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::io::BufReader;
 use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -132,10 +133,15 @@ impl Default for AstClientConfig {
     }
 }
 
+/// Capacity of the buffered read half: one `read(2)` can pull several small
+/// frames instead of issuing separate 1-, 3- and N-byte reads per frame.
+const READ_BUF_CAPACITY: usize = 8 * 1024;
+
 impl AstClient {
     pub async fn connect(path: &Path, config: AstClientConfig) -> Result<Self, AstClientError> {
         let stream = UnixStream::connect(path).await?;
-        let (mut read_half, write_half) = stream.into_split();
+        let (read_half, write_half) = stream.into_split();
+        let mut read_half = BufReader::with_capacity(READ_BUF_CAPACITY, read_half);
         let (tx, mut rx) = mpsc::channel::<Frame>(64);
         let waiters: Waiters = Arc::new(Mutex::new(HashMap::new()));
         let stream_waiters: StreamWaiters = Arc::new(Mutex::new(HashMap::new()));

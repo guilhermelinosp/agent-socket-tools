@@ -44,6 +44,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub const HEADER_LEN: usize = 4 + 1 + 8;
 pub const MIN_FRAME_LEN: u32 = 9; // type (1) + correlation_id (8), empty payload
 pub const DEFAULT_MAX_FRAME_LEN: u32 = 4 * 1024 * 1024; // 4 MiB
+/// Payloads up to this size are written header+payload in one `write_all`.
+const COALESCE_MAX_PAYLOAD: usize = 16 * 1024;
 
 #[derive(Debug, Clone, Copy)]
 pub struct FrameLimits {
@@ -118,19 +120,30 @@ pub async fn read_frame<R: AsyncRead + Unpin>(
         });
     }
 
-    let mut rest = vec![0u8; len as usize];
+    // `len >= MIN_FRAME_LEN` was checked above, so the fixed 9-byte part
+    // (type + correlation_id) always fits inside the declared length.
+    let mut head = [0u8; 9];
     reader
-        .read_exact(&mut rest)
+        .read_exact(&mut head)
         .await
         .map_err(|e| match e.kind() {
             io::ErrorKind::UnexpectedEof => FrameError::Incomplete,
             _ => FrameError::Io(e),
         })?;
+    let msg_type = head[0];
+    let correlation_id = u64::from_be_bytes(head[1..9].try_into().expect("fixed 8-byte slice"));
 
-    let msg_type = rest[0];
-    let correlation_id =
-        u64::from_be_bytes(rest[1..9].try_into().expect("checked by MIN_FRAME_LEN"));
-    let payload = rest[9..].to_vec();
+    // The payload is read straight into its final buffer; no intermediate
+    // copy of the whole frame body.
+    let payload_len = (len - MIN_FRAME_LEN) as usize;
+    let mut payload = vec![0u8; payload_len];
+    reader
+        .read_exact(&mut payload)
+        .await
+        .map_err(|e| match e.kind() {
+            io::ErrorKind::UnexpectedEof => FrameError::Incomplete,
+            _ => FrameError::Io(e),
+        })?;
 
     Ok(Some(Frame {
         msg_type,
@@ -155,13 +168,23 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
         max: u32::MAX - 1,
     })?;
 
-    let mut header = Vec::with_capacity(HEADER_LEN);
-    header.extend_from_slice(&len.to_be_bytes());
-    header.push(frame.msg_type);
-    header.extend_from_slice(&frame.correlation_id.to_be_bytes());
+    let mut header = [0u8; HEADER_LEN];
+    header[0..4].copy_from_slice(&len.to_be_bytes());
+    header[4] = frame.msg_type;
+    header[5..HEADER_LEN].copy_from_slice(&frame.correlation_id.to_be_bytes());
 
-    writer.write_all(&header).await?;
-    writer.write_all(&frame.payload).await?;
+    if frame.payload.len() <= COALESCE_MAX_PAYLOAD {
+        // Small frames go out as one contiguous buffer, so they cost a
+        // single write(2) instead of header + payload.
+        let mut wire = Vec::with_capacity(HEADER_LEN + frame.payload.len());
+        wire.extend_from_slice(&header);
+        wire.extend_from_slice(&frame.payload);
+        writer.write_all(&wire).await?;
+    } else {
+        // Large payloads are not copied; they are written as-is.
+        writer.write_all(&header).await?;
+        writer.write_all(&frame.payload).await?;
+    }
     writer.flush().await?;
     Ok(())
 }
@@ -360,5 +383,104 @@ mod tests {
         writer.await.unwrap();
         assert_eq!(decoded.correlation_id, 99);
         assert_eq!(decoded.payload, frame.payload);
+    }
+
+    /// Records every `poll_write` call separately, so a test can tell one
+    /// coalesced write apart from a header write followed by a payload write.
+    #[derive(Default)]
+    struct RecordingWriter {
+        calls: Vec<Vec<u8>>,
+    }
+
+    impl AsyncWrite for RecordingWriter {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            self.calls.push(buf.to_vec());
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn write_frame_small_payload_is_a_single_write() {
+        let payload: Vec<u8> = (0..100u8).collect();
+        let frame = Frame {
+            msg_type: 0x05,
+            correlation_id: 0x0102_0304_0506_0708,
+            payload: payload.clone(),
+        };
+        let mut writer = RecordingWriter::default();
+        write_frame(&mut writer, &frame).await.unwrap();
+
+        // Expected bytes assembled by hand from the documented layout:
+        // length (u32 BE) = 1 (type) + 8 (correlation_id) + 100 = 109.
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&109u32.to_be_bytes());
+        expected.push(0x05);
+        expected.extend_from_slice(&0x0102_0304_0506_0708u64.to_be_bytes());
+        expected.extend_from_slice(&payload);
+
+        assert_eq!(writer.calls.len(), 1, "small frame must be one poll_write");
+        assert_eq!(writer.calls[0], expected);
+    }
+
+    #[tokio::test]
+    async fn write_frame_large_payload_keeps_header_and_payload_separate() {
+        let payload = vec![0xEEu8; COALESCE_MAX_PAYLOAD + 1];
+        let frame = Frame {
+            msg_type: 0x02,
+            correlation_id: 7,
+            payload: payload.clone(),
+        };
+        let mut writer = RecordingWriter::default();
+        write_frame(&mut writer, &frame).await.unwrap();
+
+        let len = (1 + 8 + payload.len()) as u32;
+        let mut header = Vec::new();
+        header.extend_from_slice(&len.to_be_bytes());
+        header.push(0x02);
+        header.extend_from_slice(&7u64.to_be_bytes());
+
+        assert_eq!(writer.calls.len(), 2);
+        assert_eq!(writer.calls[0], header);
+        assert_eq!(writer.calls[1], payload);
+    }
+
+    #[tokio::test]
+    async fn read_frame_roundtrips_across_the_coalesce_threshold() {
+        for size in [0usize, 1, 16 * 1024, 16 * 1024 + 1, 100_000] {
+            let frame = Frame {
+                msg_type: 0x09,
+                correlation_id: u64::MAX - size as u64,
+                payload: (0..size).map(|i| (i % 251) as u8).collect(),
+            };
+            let mut buf = Vec::new();
+            write_frame(&mut buf, &frame).await.unwrap();
+
+            let mut cursor = Cursor::new(buf);
+            let decoded = read_frame(&mut cursor, limits(DEFAULT_MAX_FRAME_LEN))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(decoded.msg_type, frame.msg_type, "size {size}");
+            assert_eq!(decoded.correlation_id, frame.correlation_id, "size {size}");
+            assert_eq!(decoded.payload, frame.payload, "size {size}");
+        }
     }
 }

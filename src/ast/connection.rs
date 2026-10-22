@@ -17,6 +17,7 @@ use crate::tools::{ToolError, ToolRegistry};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::io::BufReader;
 use tokio::net::UnixStream;
 use tokio::sync::{mpsc, Notify, Semaphore};
 
@@ -150,6 +151,9 @@ pub async fn run_connection(
     }
 
     let (read_half, write_half) = stream.into_split();
+    // One buffered read half per connection, shared by the handshake and the
+    // steady-state loop, so bytes buffered after HELLO are never lost.
+    let read_half = BufReader::with_capacity(READ_BUF_CAPACITY, read_half);
     let (tx, mut rx) = mpsc::channel::<Frame>(64);
     let write_timeout = config.write_timeout;
 
@@ -240,8 +244,11 @@ async fn wait_until_continuously_idle(
     }
 }
 
+/// Capacity of the buffered read half of each accepted connection.
+const READ_BUF_CAPACITY: usize = 8 * 1024;
+
 async fn serve_reads(
-    mut read_half: tokio::net::unix::OwnedReadHalf,
+    mut read_half: BufReader<tokio::net::unix::OwnedReadHalf>,
     tx: mpsc::Sender<Frame>,
     registry: Arc<ToolRegistry>,
     config: ConnectionConfig,
