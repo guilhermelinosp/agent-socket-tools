@@ -4,6 +4,25 @@ A minimal, MCP-free way for local AI agents to discover and invoke a small
 set of authorized tools over a Unix Domain Socket — no HTTP, no TCP, no
 dependency on the Model Context Protocol.
 
+**Two protocols live here, side by side, neither deprecated:**
+
+- **AST (Agent Socket Transport)** — `ast-server`/`ast-client`. Length-
+  prefixed framing, MessagePack payloads, persistent connections,
+  concurrent in-flight requests, deadlines, best-effort cancellation,
+  and peer-credential checking. The actively developed one. Full spec,
+  test vectors, security model, and a real AST-vs-legacy benchmark:
+  **[`docs/AST_PROTOCOL.md`](docs/AST_PROTOCOL.md)**.
+- **The original JSON-Lines protocol** — `agent-tools-server`/
+  `agent-tools-client`. Simpler: one request per connection, plain text
+  lines, no framing math. Still fully supported, not a legacy
+  afterthought. Spec: **[`docs/PROTOCOL.md`](docs/PROTOCOL.md)**.
+
+Both share the same `Tool` trait, registry, and tool implementations
+(`src/tools/`) and the same socket-directory hardening
+(`src/transport.rs`) — only the wire protocol and connection model
+differ. The rest of this README covers the original protocol in detail;
+see `docs/AST_PROTOCOL.md` for AST's equivalent.
+
 ## Why
 
 MCP is a general-purpose protocol for agent/tool integration, with its own

@@ -29,6 +29,13 @@ pub fn default_socket_path() -> PathBuf {
     default_socket_dir().join("agent-tools.sock")
 }
 
+/// Same private directory as [`default_socket_path`], different file:
+/// AST and the legacy JSON-Lines protocol are two different servers that
+/// can run at the same time without colliding, each with its own socket.
+pub fn default_ast_socket_path() -> PathBuf {
+    default_socket_dir().join("ast.sock")
+}
+
 fn default_socket_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
         let dir = PathBuf::from(dir);

@@ -13,6 +13,18 @@ path = "src/bin/agent-tools-server.rs"
 name = "agent-tools-client"
 path = "src/bin/agent-tools-client.rs"
 
+[[bin]]
+name = "ast-server"
+path = "src/bin/ast-server.rs"
+
+[[bin]]
+name = "ast-client"
+path = "src/bin/ast-client.rs"
+
+[[bin]]
+name = "ast-bench"
+path = "src/bin/ast-bench.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time", "sync", "signal"] }
 serde = { version = "1", features = ["derive"] }
@@ -23,9 +35,24 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 # Used only for a handful of justified, documented `unsafe` FFI calls:
 # getuid()/umask() for the private-socket-directory hardening in
-# transport.rs, and O_NOFOLLOW for filesystem_read.rs's symlink-swap
-# mitigation. Not used anywhere else.
+# transport.rs, O_NOFOLLOW for filesystem_read.rs's symlink-swap
+# mitigation, and SO_PEERCRED/LOCAL_PEERCRED for AST's peer-credential
+# check. Not used anywhere else.
 libc = "0.2"
+# AST's wire serialization. Chosen over CBOR and JSON by measurement, not
+# assumption — see benches/serialization.rs and docs/AST_PROTOCOL.md's
+# "Serialization" section for the actual numbers on this machine.
+rmp-serde = "1"
+# Used by both the test suite and `ast-bench` (a real [[bin]], not just
+# tests) for disposable, auto-cleaned-up directories.
+tempfile = "3"
 
 [dev-dependencies]
-tempfile = "3"
+criterion = "0.7"
+# Dev-only: benches/serialization.rs's losing contender, kept only to make
+# that comparison reproducible. Never used by shipped code.
+ciborium = "0.2"
+
+[[bench]]
+name = "serialization"
+harness = false
