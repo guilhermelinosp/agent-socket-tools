@@ -3888,7 +3888,9 @@ mod tests {
             cancel: &CancelToken,
         ) -> Result<JsonValue, RegistryToolError> {
             let _ = self.started.send(());
-            let safety = std::time::Instant::now() + Duration::from_secs(5);
+            // Long on purpose: tests that check cancellation must pass only
+            // because the token propagated, never because this timed out.
+            let safety = std::time::Instant::now() + Duration::from_secs(30);
             let outcome = loop {
                 if cancel.is_cancelled() {
                     break Err(RegistryToolError::Failed(
@@ -3963,15 +3965,23 @@ mod tests {
         next_signal(&mut started_rx).await;
         send_cancel(&mut client, 2, 1).await;
 
+        // The tool's safety is 30s, so only the token can stop it in time.
+        wait_until_within(
+            "the cooperative tool to stop after CANCEL",
+            Duration::from_secs(2),
+            || finished.load(Ordering::SeqCst),
+        )
+        .await;
+        wait_until_within(
+            "the slot to be returned after CANCEL",
+            Duration::from_secs(2),
+            || slots.available_permits() == 1,
+        )
+        .await;
         assert_eq!(
             recv_error_frame(&mut client).await,
             (1, ErrorCode::Cancelled)
         );
-        wait_until("the cooperative tool to stop", || {
-            finished.load(Ordering::SeqCst)
-        })
-        .await;
-        wait_until("the slot to be returned", || slots.available_permits() == 1).await;
 
         send_invoke(&mut client, 3, "system.noop", Some(5_000)).await;
         let frame = recv_within(&mut client).await;
@@ -4167,11 +4177,18 @@ mod tests {
         client.write_all(&partial).await.unwrap();
         drop(client);
 
-        wait_until("the cooperative tool to stop", || {
-            finished.load(Ordering::SeqCst)
-        })
+        wait_until_within(
+            "the cooperative tool to stop after the disconnect",
+            Duration::from_secs(2),
+            || finished.load(Ordering::SeqCst),
+        )
         .await;
-        wait_until("the slot to be returned", || slots.available_permits() == 1).await;
+        wait_until_within(
+            "the slot to be returned after the disconnect",
+            Duration::from_secs(2),
+            || slots.available_permits() == 1,
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -4210,6 +4227,69 @@ mod tests {
             Some(MessageType::Result)
         );
         wait_until("the slot to be returned", || slots.available_permits() == 1).await;
+    }
+
+    /// A tool that panics inside its blocking closure.
+    struct PanicTool;
+    impl Tool for PanicTool {
+        fn name(&self) -> &str {
+            "test.panic"
+        }
+        fn description(&self) -> &str {
+            "always panics, for tests"
+        }
+        fn input_schema(&self) -> JsonValue {
+            serde_json::json!({})
+        }
+        fn invoke(&self, _args: JsonValue) -> Result<JsonValue, RegistryToolError> {
+            panic!("deliberate test panic")
+        }
+    }
+
+    /// A panic in a tool must not leak its blocking slot or wedge the
+    /// connection: the client gets INTERNAL_ERROR, the slot comes back, and
+    /// later requests still run.
+    #[tokio::test]
+    async fn a_panicking_tool_releases_its_permits_and_reports_an_internal_error() {
+        let registry = registry_with(vec![Box::new(PanicTool), Box::new(NoopTool)]);
+        let config = ConnectionConfig::default().with_max_blocking_tasks(1);
+        let slots = Arc::clone(&config.blocking_slots);
+        let (mut client, _dir) = connected_pair_with_registry(registry, config).await;
+        do_hello(&mut client).await;
+
+        send_invoke(&mut client, 1, "test.panic", Some(5_000)).await;
+        assert_eq!(
+            recv_error_frame(&mut client).await,
+            (1, ErrorCode::InternalError)
+        );
+        wait_until_within(
+            "the panicked tool's slot to be returned",
+            Duration::from_secs(2),
+            || slots.available_permits() == 1,
+        )
+        .await;
+
+        send_raw(
+            &mut client,
+            Frame {
+                msg_type: MessageType::Ping as u8,
+                correlation_id: 2,
+                payload: codec::encode(&Ping {}).unwrap(),
+            },
+        )
+        .await;
+        let pong = recv_within(&mut client).await;
+        assert_eq!(MessageType::from_u8(pong.msg_type), Some(MessageType::Pong));
+        assert_eq!(pong.correlation_id, 2);
+
+        // The single slot is usable again, so a normal call still succeeds.
+        send_invoke(&mut client, 3, "system.noop", Some(5_000)).await;
+        let frame = recv_within(&mut client).await;
+        assert_eq!(frame.correlation_id, 3);
+        assert_eq!(
+            MessageType::from_u8(frame.msg_type),
+            Some(MessageType::Result)
+        );
     }
 
     /// Polls `cond` until it holds, failing after `max`. Unlike `wait_until`,
@@ -4345,6 +4425,13 @@ mod tests {
         next_signal(&mut started_rx).await;
 
         shutdown_tx.send(true).unwrap();
+        // The tool's safety is 30s, so only the shutdown's cancellation can stop it in time.
+        wait_until_within(
+            "the cooperative tool to stop after shutdown",
+            Duration::from_secs(2),
+            || finished.load(Ordering::SeqCst),
+        )
+        .await;
         assert_eq!(
             recv_error_frame(&mut client).await,
             (1, ErrorCode::Cancelled)
@@ -4359,9 +4446,5 @@ mod tests {
         .expect("connection did not close after shutdown")
         .expect("read after shutdown failed");
         assert!(after.is_none(), "expected EOF after the terminal frame");
-        wait_until("the cooperative tool to stop", || {
-            finished.load(Ordering::SeqCst)
-        })
-        .await;
     }
 }
