@@ -897,7 +897,15 @@ fn spawn_invoke(
         let _permit = permit; // held for this task's whole lifetime
         let deadline = effective_deadline(invoke.deadline_ms, default_deadline, max_deadline);
 
-        let response = run_invoke(invoke, registry, deadline, cancel_notify, blocking_slots).await;
+        let response = run_invoke(
+            invoke,
+            registry,
+            deadline,
+            cancel_notify,
+            blocking_slots,
+            None,
+        )
+        .await;
 
         in_flight
             .lock()
@@ -1271,6 +1279,13 @@ fn spawn_batch(
         // This bounds peak memory to "whatever's already in `results`
         // plus one more call's result," not "every result the batch ever
         // produces."
+        //
+        // One execution lane per batch. `run_invoke` answers a call at its
+        // deadline without stopping its closure, so a call can still be
+        // running after the batch has moved on. The lane keeps the next
+        // call from starting until that closure has really returned: a batch
+        // never has more than one live blocking execution.
+        let lane = Arc::new(Semaphore::new(1));
         let mut results = Vec::with_capacity(batch.calls.len());
         let mut encoded_bytes_so_far: usize = 0;
         for call in batch.calls {
@@ -1287,14 +1302,31 @@ fn spawn_batch(
             };
             let deadline = effective_deadline(invoke.deadline_ms, default_deadline, max_deadline);
 
-            let outcome = run_invoke(
-                invoke,
-                Arc::clone(&registry),
-                deadline,
-                Arc::clone(&cancel_notify),
-                Arc::clone(&blocking_slots),
-            )
-            .await;
+            // Wait for the lane, bounded by this call's own deadline. A call
+            // that cannot get it in time is answered DEADLINE_EXCEEDED and its
+            // tool is never started.
+            let lane_permit =
+                match tokio::time::timeout(deadline, Arc::clone(&lane).acquire_owned()).await {
+                    Ok(Ok(permit)) => Some(permit),
+                    _ => None,
+                };
+            let outcome = match lane_permit {
+                Some(permit) => {
+                    run_invoke(
+                        invoke,
+                        Arc::clone(&registry),
+                        deadline,
+                        Arc::clone(&cancel_notify),
+                        Arc::clone(&blocking_slots),
+                        Some(permit),
+                    )
+                    .await
+                }
+                None => Err((
+                    ErrorCode::DeadlineExceeded,
+                    "the call's deadline expired while waiting for the batch's previous call to finish".to_string(),
+                )),
+            };
             let was_cancelled = matches!(outcome, Err((ErrorCode::Cancelled, _)));
 
             let mut entry = BatchResultEntry {
@@ -1371,12 +1403,17 @@ fn spawn_batch(
 /// the slot stays taken until the tool really returns. A tool that ignores
 /// its deadline therefore keeps occupying one slot; once all slots are
 /// taken, new executions are refused with `RESOURCE_EXHAUSTED`.
+///
+/// `extra_permit` (a batch's execution lane, see `spawn_batch`) moves into
+/// the closure with the blocking permit, so it is also released only when
+/// the tool really returns. It is dropped at once if no closure is started.
 async fn run_invoke(
     invoke: Invoke,
     registry: Arc<ToolRegistry>,
     deadline: Duration,
     cancel_notify: Arc<Notify>,
     blocking_slots: Arc<Semaphore>,
+    extra_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> Result<serde_json::Value, (ErrorCode, String)> {
     let Some(_tool) = registry.get(&invoke.tool) else {
         return Err((
@@ -1400,6 +1437,7 @@ async fn run_invoke(
     let closure_token = token.clone();
     let task = tokio::task::spawn_blocking(move || {
         let _blocking_permit = blocking_permit; // released only when the tool returns
+        let _lane_permit = extra_permit; // likewise, for a batch's lane
         let tool = registry
             .get(&tool_name)
             .expect("presence already checked before spawning");
@@ -3672,6 +3710,79 @@ mod tests {
         );
 
         gate.open(); // let the blocked tool return so the test runtime can shut down
+    }
+
+    /// Calls that ignore their deadline must not stack up blocking slots in
+    /// one batch: only the first call's tool starts, and every later call is
+    /// answered DEADLINE_EXCEEDED while waiting for the batch's lane.
+    #[tokio::test]
+    async fn batch_with_abandoned_calls_holds_at_most_one_blocking_slot() {
+        use std::sync::atomic::AtomicBool;
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let gate = Gate::default(); // not opened until the batch has answered
+        let finished = Arc::new(AtomicBool::new(false));
+        let registry = registry_with(vec![gate_tool("test.gate", &gate, &finished, &started_tx)]);
+        let config = ConnectionConfig::default();
+        let slots = Arc::clone(&config.blocking_slots);
+        let (mut client, _dir) = connected_pair_with_registry(registry, config).await;
+        do_hello(&mut client).await;
+
+        let batch = Batch {
+            calls: (10..15)
+                .map(|id| BatchInvoke {
+                    id,
+                    tool: "test.gate".to_string(),
+                    args: serde_json::json!({}),
+                    deadline_ms: Some(50),
+                })
+                .collect(),
+        };
+        send_raw(
+            &mut client,
+            Frame {
+                msg_type: MessageType::Batch as u8,
+                correlation_id: 1,
+                payload: codec::encode(&batch).unwrap(),
+            },
+        )
+        .await;
+        let frame = recv_within(&mut client).await;
+        assert_eq!(
+            MessageType::from_u8(frame.msg_type),
+            Some(MessageType::BatchResult)
+        );
+        let result: BatchResult = codec::decode(&frame.payload).unwrap();
+        let ids: Vec<u64> = result.results.iter().map(|e| e.id).collect();
+        assert_eq!(ids, vec![10, 11, 12, 13, 14]);
+        for entry in &result.results {
+            assert!(
+                matches!(
+                    entry.outcome,
+                    BatchOutcome::Error {
+                        code: ErrorCode::DeadlineExceeded,
+                        ..
+                    }
+                ),
+                "call {} should have been answered DEADLINE_EXCEEDED",
+                entry.id
+            );
+        }
+        next_signal(&mut started_rx).await;
+        assert!(
+            started_rx.try_recv().is_err(),
+            "only the first call's tool may start"
+        );
+
+        // Sampled after the BATCH_RESULT, and again while the tool is still held.
+        assert!(slots.available_permits() >= 63);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(slots.available_permits() >= 63);
+
+        gate.open();
+        wait_until("the batch's slot to be returned", || {
+            slots.available_permits() == 64
+        })
+        .await;
     }
 
     #[tokio::test]
