@@ -1,27 +1,27 @@
-//! Reproducible benchmark: AST vs this crate's own legacy JSON-Lines
-//! protocol, both over Unix Domain Sockets, both serving the exact same
-//! `system.info`/`filesystem.read` tools from the exact same process on
-//! the exact same machine in the same run.
-//!
-//! **MCP is not benchmarked here.** No persistent, stdio-based MCP server
-//! exists in this repository or environment to compare against, and
-//! building a second, separate implementation (even a minimal one) was
-//! out of scope for this pass — see `docs/AST_PROTOCOL.md`'s "MCP
-//! comparison" section. This binary's `Baseline` trait is written so a
-//! stdio-JSON-RPC MCP baseline could be added later without changing the
-//! measurement code, but until one actually exists and actually runs
-//! here, any MCP number in this report would be invented. There is none.
+//! Reproducible benchmark: AST vs (1) this crate's own legacy JSON-Lines
+//! protocol, both over Unix Domain Sockets, and (2) `mcp-like-server`
+//! (`src/bin/mcp-like-server.rs`), a minimal, shape-faithful JSON-RPC
+//! 2.0-over-stdio baseline implementing MCP's `initialize`/`tools/list`/
+//! `tools/call` methods against the *exact same* `system.info`/
+//! `filesystem.read` tools. **`mcp-like-server` is not the official MCP
+//! reference implementation** — see its own doc comment and
+//! `docs/AST_PROTOCOL.md`'s "MCP comparison" section for exactly what
+//! comparing against it does and doesn't establish. All three baselines
+//! do identical work in the same run on the same machine; only transport
+//! and wire format differ.
 //!
 //! Run with: `cargo run --release --bin ast-bench`
 
 use agent_socket_tools::ast::client::{AstClient, AstClientConfig};
 use agent_socket_tools::protocol::{Operation, Request, Response, PROTOCOL_VERSION};
 use agent_socket_tools::transport::MessageReader;
+use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
+use tokio::process::{ChildStdin, Command as TokioCommand};
 
 const ITERATIONS: usize = 500;
 const CONCURRENCY: usize = 20;
@@ -208,10 +208,82 @@ async fn wait_for_socket(path: &Path) {
     panic!("server never came up at {path:?}");
 }
 
+// ---- mcp-like-server (JSON-RPC 2.0 over stdio) client ----
+
+struct McpLikeProc {
+    // Held only to keep the child alive and `kill_on_drop`-ed; never read
+    // after spawn (stdin/stdout were taken out of it below).
+    _child: tokio::process::Child,
+    stdin: ChildStdin,
+    stdout: BufReader<tokio::process::ChildStdout>,
+    next_id: u64,
+}
+
+impl McpLikeProc {
+    async fn call(&mut self, method: &str, params: Value) -> Value {
+        let id = self.next_id;
+        self.next_id += 1;
+        let request = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+        let mut line = serde_json::to_string(&request).unwrap();
+        line.push('\n');
+        self.stdin.write_all(line.as_bytes()).await.unwrap();
+        self.stdin.flush().await.unwrap();
+
+        let mut response_line = String::new();
+        self.stdout.read_line(&mut response_line).await.unwrap();
+        serde_json::from_str(&response_line).unwrap()
+    }
+
+    async fn tools_call(&mut self, name: &str, args: Value) -> Value {
+        self.call("tools/call", json!({ "name": name, "arguments": args }))
+            .await
+    }
+
+    fn pid(&self) -> u32 {
+        self._child.id().expect("child has not been reaped")
+    }
+}
+
+async fn start_mcp_like(read_dir: &Path) -> (McpLikeProc, Duration) {
+    let started = Instant::now();
+    let mut child = TokioCommand::new(sibling_bin("mcp-like-server"))
+        .arg(read_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let stdin = child.stdin.take().unwrap();
+    let stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut proc = McpLikeProc {
+        _child: child,
+        stdin,
+        stdout,
+        next_id: 1,
+    };
+    // The "initialize" handshake real MCP clients perform before any
+    // other call; `mcp-like-server` requires nothing from its result, but
+    // sending it keeps this baseline's startup cost honest (a real
+    // startup-time comparison needs to include it).
+    let _ = proc
+        .call(
+            "initialize",
+            json!({
+                "protocolVersion": "2026-06-18",
+                "capabilities": {},
+                "clientInfo": { "name": "ast-bench", "version": "0.1.0" }
+            }),
+        )
+        .await;
+    let startup = started.elapsed();
+    (proc, startup)
+}
+
 #[tokio::main]
 async fn main() {
-    println!("# AST vs legacy JSON-Lines — benchmark report\n");
-    println!("**MCP: not run.** No stdio MCP server exists in this environment to compare against; see the note at the top of `src/bin/ast-bench.rs`.\n");
+    println!("# AST vs legacy JSON-Lines vs mcp-like-server — benchmark report\n");
+    println!("**`mcp-like-server` is a minimal, shape-faithful JSON-RPC 2.0-over-stdio baseline, not the official MCP reference implementation.** See `src/bin/mcp-like-server.rs`'s doc comment and `docs/AST_PROTOCOL.md`'s \"MCP comparison\" section for exactly what it does and doesn't establish.\n");
     print_environment();
 
     let fixture_dir = tempfile::tempdir().unwrap();
@@ -222,31 +294,38 @@ async fn main() {
     let socket_dir = tempfile::tempdir().unwrap();
     let (legacy, legacy_startup) = start_legacy(fixture_dir.path(), socket_dir.path()).await;
     let (ast, ast_startup) = start_ast(fixture_dir.path(), socket_dir.path()).await;
+    let (mut mcp, mcp_startup) = start_mcp_like(fixture_dir.path()).await;
 
     println!("## Startup time\n");
-    println!("| Server | Time to usable socket |");
+    println!("| Server | Time to usable connection |");
     println!("|---|---|");
     println!(
         "| agent-tools-server (legacy) | {:.2}ms |",
         legacy_startup.as_secs_f64() * 1000.0
     );
     println!(
-        "| ast-server | {:.2}ms |\n",
+        "| ast-server | {:.2}ms |",
         ast_startup.as_secs_f64() * 1000.0
+    );
+    println!(
+        "| mcp-like-server (incl. `initialize`) | {:.2}ms |\n",
+        mcp_startup.as_secs_f64() * 1000.0
     );
 
     let legacy_sampler = ResourceSampler::start(legacy.child.id());
     let ast_sampler = ResourceSampler::start(ast.child.id());
+    let mcp_sampler = ResourceSampler::start(mcp.pid());
 
-    bench_sequential_health(&legacy, &ast).await;
+    bench_sequential_health(&legacy, &ast, &mut mcp).await;
     bench_persistent_vs_reconnect(&legacy, &ast).await;
-    bench_payload_sizes(&legacy, &ast, fixture_dir.path()).await;
-    bench_concurrency(&legacy, &ast).await;
-    bench_discover(&legacy, &ast).await;
+    bench_payload_sizes(&legacy, &ast, &mut mcp).await;
+    bench_concurrency(&legacy, &ast, fixture_dir.path()).await;
+    bench_discover(&legacy, &ast, &mut mcp).await;
     print_encoded_sizes();
 
     let (legacy_peak_rss_kb, legacy_avg_cpu) = legacy_sampler.stop();
     let (ast_peak_rss_kb, ast_avg_cpu) = ast_sampler.stop();
+    let (mcp_peak_rss_kb, mcp_avg_cpu) = mcp_sampler.stop();
     println!(
         "\n## Resident memory and CPU (sampled every ~40ms via `ps` across the whole run above)\n"
     );
@@ -261,6 +340,11 @@ async fn main() {
         "| ast-server | {:.1} MiB | {:.1}% |",
         ast_peak_rss_kb as f64 / 1024.0,
         ast_avg_cpu
+    );
+    println!(
+        "| mcp-like-server | {:.1} MiB | {:.1}% |",
+        mcp_peak_rss_kb as f64 / 1024.0,
+        mcp_avg_cpu
     );
 
     println!("\n---\n");
@@ -298,8 +382,9 @@ fn print_environment() {
     );
 }
 
-async fn bench_sequential_health(legacy: &ServerProc, ast: &ServerProc) {
+async fn bench_sequential_health(legacy: &ServerProc, ast: &ServerProc, mcp: &mut McpLikeProc) {
     println!("## No-op / health, sequential, persistent connection\n");
+    println!("MCP has no dedicated no-op/health method in this baseline's implemented surface, so `tools/call system.info` (the cheapest real call available) stands in for it — this makes its number directly comparable to \"a round trip that does real work,\" not a true no-op, which the other two rows arguably understate relative to it for that reason.\n");
     println!("| Protocol | p50 | p95 | p99 | throughput |");
     println!("|---|---|---|---|---|");
 
@@ -334,13 +419,30 @@ async fn bench_sequential_health(legacy: &ServerProc, ast: &ServerProc) {
     let elapsed = started.elapsed();
     let p = percentiles(samples);
     println!(
-        "| AST (MessagePack) | {} | {} | {} | {:.0} req/s |\n",
+        "| AST (MessagePack) | {} | {} | {} | {:.0} req/s |",
         fmt_us(p.p50),
         fmt_us(p.p95),
         fmt_us(p.p99),
         ITERATIONS as f64 / elapsed.as_secs_f64()
     );
     client.close().await;
+
+    let mut samples = Vec::with_capacity(ITERATIONS);
+    let started = Instant::now();
+    for _ in 0..ITERATIONS {
+        let t0 = Instant::now();
+        let _ = mcp.tools_call("system.info", json!({})).await;
+        samples.push(t0.elapsed());
+    }
+    let elapsed = started.elapsed();
+    let p = percentiles(samples);
+    println!(
+        "| mcp-like (JSON-RPC/stdio) | {} | {} | {} | {:.0} req/s |\n",
+        fmt_us(p.p50),
+        fmt_us(p.p95),
+        fmt_us(p.p99),
+        ITERATIONS as f64 / elapsed.as_secs_f64()
+    );
 }
 
 async fn bench_persistent_vs_reconnect(legacy: &ServerProc, ast: &ServerProc) {
@@ -405,7 +507,7 @@ async fn bench_persistent_vs_reconnect(legacy: &ServerProc, ast: &ServerProc) {
     );
 }
 
-async fn bench_payload_sizes(legacy: &ServerProc, ast: &ServerProc, fixture_dir: &Path) {
+async fn bench_payload_sizes(legacy: &ServerProc, ast: &ServerProc, mcp: &mut McpLikeProc) {
     println!("## Payload sizes (filesystem.read, persistent connection, sequential)\n");
     println!("| Protocol | File | p50 | p95 |");
     println!("|---|---|---|---|");
@@ -444,14 +546,28 @@ async fn bench_payload_sizes(legacy: &ServerProc, ast: &ServerProc, fixture_dir:
         let p = percentiles(samples);
         println!("| AST | {label} | {} | {} |", fmt_us(p.p50), fmt_us(p.p95));
         client.close().await;
+
+        let mut samples = Vec::with_capacity(ITERATIONS);
+        for _ in 0..ITERATIONS {
+            let t0 = Instant::now();
+            let _ = mcp
+                .tools_call("filesystem.read", json!({ "path": file }))
+                .await;
+            samples.push(t0.elapsed());
+        }
+        let p = percentiles(samples);
+        println!(
+            "| mcp-like | {label} | {} | {} |",
+            fmt_us(p.p50),
+            fmt_us(p.p95)
+        );
     }
-    let _ = fixture_dir;
     println!();
 }
 
-async fn bench_concurrency(legacy: &ServerProc, ast: &ServerProc) {
+async fn bench_concurrency(legacy: &ServerProc, ast: &ServerProc, read_dir: &Path) {
     println!("## Concurrent requests\n");
-    println!("Legacy serves one request at a time *per connection*, so its only concurrency model is N separate connections. AST multiplexes N concurrent in-flight requests over a *single* connection; both are measured.\n");
+    println!("Legacy serves one request at a time *per connection*, so its only concurrency model is N separate connections. AST multiplexes N concurrent in-flight requests over a *single* connection; both are measured. `mcp-like-server`'s stdio transport is a single bidirectional pipe per process with no multi-client notion at all — its only way to serve N callers at once is N separate server *processes*, which is what's measured for it (process-spawn cost included, unlike the other two rows' connection-only cost).\n");
     println!("| Protocol | Concurrency model | Total time for {CONCURRENCY} calls | Throughput |");
     println!("|---|---|---|---|");
 
@@ -514,13 +630,32 @@ async fn bench_concurrency(legacy: &ServerProc, ast: &ServerProc) {
     }
     let elapsed = started.elapsed();
     println!(
-        "| AST | {CONCURRENCY} multiplexed on 1 connection | {:.2}ms | {:.0} req/s |\n",
+        "| AST | {CONCURRENCY} multiplexed on 1 connection | {:.2}ms | {:.0} req/s |",
+        elapsed.as_secs_f64() * 1000.0,
+        CONCURRENCY as f64 / elapsed.as_secs_f64()
+    );
+
+    let started = Instant::now();
+    let mut handles = Vec::new();
+    for _ in 0..CONCURRENCY {
+        let dir = read_dir.to_path_buf();
+        handles.push(tokio::spawn(async move {
+            let (mut proc, _startup) = start_mcp_like(&dir).await;
+            let _ = proc.tools_call("system.info", json!({})).await;
+        }));
+    }
+    for h in handles {
+        h.await.unwrap();
+    }
+    let elapsed = started.elapsed();
+    println!(
+        "| mcp-like | {CONCURRENCY} separate processes (incl. spawn + initialize) | {:.2}ms | {:.0} req/s |\n",
         elapsed.as_secs_f64() * 1000.0,
         CONCURRENCY as f64 / elapsed.as_secs_f64()
     );
 }
 
-async fn bench_discover(legacy: &ServerProc, ast: &ServerProc) {
+async fn bench_discover(legacy: &ServerProc, ast: &ServerProc, mcp: &mut McpLikeProc) {
     println!("## Discovery\n");
     println!("| Protocol | p50 | p95 |");
     println!("|---|---|---|");
@@ -545,8 +680,17 @@ async fn bench_discover(legacy: &ServerProc, ast: &ServerProc) {
         samples.push(t0.elapsed());
     }
     let p = percentiles(samples);
-    println!("| AST | {} | {} |\n", fmt_us(p.p50), fmt_us(p.p95));
+    println!("| AST | {} | {} |", fmt_us(p.p50), fmt_us(p.p95));
     client.close().await;
+
+    let mut samples = Vec::with_capacity(ITERATIONS);
+    for _ in 0..ITERATIONS {
+        let t0 = Instant::now();
+        let _ = mcp.call("tools/list", json!({})).await;
+        samples.push(t0.elapsed());
+    }
+    let p = percentiles(samples);
+    println!("| mcp-like | {} | {} |\n", fmt_us(p.p50), fmt_us(p.p95));
 }
 
 fn print_encoded_sizes() {
@@ -554,8 +698,10 @@ fn print_encoded_sizes() {
     use agent_socket_tools::ast::wire::HEADER_LEN;
 
     println!("## Encoded bytes per request (computed directly, not sniffed off the wire)\n");
-    println!("| Message | Legacy (JSON line incl. \\n) | AST (frame incl. header) |");
-    println!("|---|---|---|");
+    println!(
+        "| Message | Legacy (JSON line incl. \\n) | AST (frame incl. header) | mcp-like (JSON-RPC line incl. \\n) |"
+    );
+    println!("|---|---|---|---|");
 
     let legacy_health = {
         let mut s = serde_json::to_string(&health_request("1")).unwrap();
@@ -566,7 +712,15 @@ fn print_encoded_sizes() {
         + agent_socket_tools::ast::codec::encode(&agent_socket_tools::ast::message::Ping {})
             .unwrap()
             .len();
-    println!("| health / ping | {legacy_health} bytes | {ast_ping} bytes |");
+    let mcp_system_info = {
+        let req = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"system.info","arguments":{}}});
+        let mut s = serde_json::to_string(&req).unwrap();
+        s.push('\n');
+        s.len()
+    };
+    println!(
+        "| health / ping / cheapest call | {legacy_health} bytes | {ast_ping} bytes | {mcp_system_info} bytes |"
+    );
 
     let legacy_invoke = {
         let mut s = serde_json::to_string(&read_request("1", "medium.txt")).unwrap();
@@ -581,8 +735,17 @@ fn print_encoded_sizes() {
         })
         .unwrap()
         .len();
+    let mcp_invoke = {
+        let req = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"filesystem.read","arguments":{"path":"medium.txt"}}});
+        let mut s = serde_json::to_string(&req).unwrap();
+        s.push('\n');
+        s.len()
+    };
     println!(
-        "| invoke filesystem.read (request only) | {legacy_invoke} bytes | {ast_invoke} bytes |"
+        "| invoke filesystem.read (request only) | {legacy_invoke} bytes | {ast_invoke} bytes | {mcp_invoke} bytes |"
+    );
+    println!(
+        "\nNote: `mcp-like-server` wraps every tool *result* as `{{\"content\":[{{\"type\":\"text\",\"text\":\"<JSON-stringified result>\"}}]}}` — matching real MCP's text-content convention for structured tool output — which means its response-side payload is JSON encoded, then that whole JSON string is itself embedded as one string field in a second, outer JSON object. This roughly doubles the response size relative to legacy's single-layer JSON, independent of anything this benchmark controls; it's an honest property of the convention being compared against, not an artifact of this baseline's implementation."
     );
     let _ = MessageType::Invoke;
 }

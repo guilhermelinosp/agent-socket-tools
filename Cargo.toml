@@ -25,8 +25,12 @@ path = "src/bin/ast-client.rs"
 name = "ast-bench"
 path = "src/bin/ast-bench.rs"
 
+[[bin]]
+name = "mcp-like-server"
+path = "src/bin/mcp-like-server.rs"
+
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time", "sync", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time", "sync", "signal", "process"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive"] }

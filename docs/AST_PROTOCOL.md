@@ -358,39 +358,72 @@ neither CLI is an SDK or an agent-framework adapter.
 ## MCP comparison
 
 A reproducible benchmark (`cargo run --release --bin ast-bench`) compares
-AST against **this crate's own legacy JSON-Lines protocol**, both over
-Unix Domain Sockets, both serving identical tools, in the same run on the
-same machine. Representative results (`rustc 1.99.1`, Apple Silicon
-arm64, release build, 500 iterations per scenario, 20-way concurrency):
+three things doing identical work in the same run on the same machine:
+AST, **this crate's own legacy JSON-Lines protocol** (both over Unix
+Domain Sockets), and **`mcp-like-server`**
+(`src/bin/mcp-like-server.rs`) — a minimal JSON-RPC 2.0-over-stdio server
+implementing MCP's `initialize`/`tools/list`/`tools/call` methods and
+content-block result shape, serving the exact same
+`system.info`/`filesystem.read` tools.
 
-| Scenario | Legacy (JSON) | AST (MessagePack) |
-|---|---|---|
-| Health/ping, sequential, persistent connection (p50) | 23.8µs | 41.2µs |
-| Reconnect-per-call, 100 calls (total) | 5.71ms | 11.33ms (includes `HELLO`) |
-| `filesystem.read`, 512 KiB payload (p50) | 10424.2µs | **650.8µs (16x faster)** |
-| 20 concurrent requests, 1 connection where possible | 83290 req/s (20 connections; legacy has no multiplexing) | **181679 req/s (multiplexed on 1 connection)** |
-| Encoded bytes, ping/health | 37 B | 14 B |
-| Avg CPU across the whole benchmark run | 8.0% | 2.5% |
+**`mcp-like-server` is not the official MCP reference implementation —
+it is a shape-faithful stand-in, built for this benchmark.** It gets
+stdio framing, the three methods a tool-invocation benchmark needs, and
+the `{"content":[{"type":"text","text":...}], "isError": bool}`
+tool-result convention right, and nothing else from the full MCP
+specification (no resources, prompts, sampling, roots, or capability
+negotiation beyond the one call `ast-bench` makes). Treat every number
+below as "a faithfully-shaped MCP-like server, implemented by this
+project," not "MCP itself" or any particular official SDK's actual
+performance.
 
-**Read honestly, not as a one-sided win:** AST is *slower* for small
-messages on a single connection used sequentially (handshake and
-dispatch overhead that a simpler line-based protocol doesn't pay), and
-reconnecting per call is markedly more expensive for AST specifically
-*because* it has a stateful handshake the legacy protocol doesn't. AST's
-real advantages — large payloads and concurrent multiplexing — are
-exactly the properties it was designed for, and they're large (16x,
-2.2x), not marginal. This is this project's own two protocols compared
-to each other, not evidence about AST versus any specific competing
-implementation elsewhere.
+Representative results (`rustc 1.99.1`, Apple Silicon arm64, release
+build, 500 iterations per scenario, 20-way concurrency):
 
-**MCP itself was not benchmarked.** No persistent, stdio-based MCP server
-exists in this repository or in the environment this was built in, and
-building one — even a minimal baseline — was out of scope for this pass.
-`ast-bench`'s `start_legacy`/`start_ast` functions show exactly the shape
-a third `start_mcp_stdio` baseline would need (spawn a child process,
-wait for it to be ready, run the same timed scenarios against it); adding
-one is mechanical once such a server exists to point at. Until then, any
-MCP number in this document would be invented, so there isn't one.
+| Scenario | Legacy (JSON) | AST (MessagePack) | mcp-like (JSON-RPC/stdio) |
+|---|---|---|---|
+| Startup time | 214.7ms | 217.3ms | **6.3ms (34x faster)** |
+| Cheapest round trip, sequential, persistent (p50) | 24.3µs | 32.4µs | **13.7µs (fastest)** |
+| Reconnect-per-call, 100 calls (total) | 3.79ms | 9.07ms (incl. `HELLO`) | n/a — see note below |
+| `filesystem.read`, 512 KiB payload (p50) | 10449.3µs | **663.6µs (16x faster than legacy)** | 584.7µs |
+| 20 concurrent calls | 74326 req/s (20 connections) | **165006 req/s (multiplexed, 1 connection)** | 3630 req/s (20 separate *processes*, spawn cost included) |
+| Encoded bytes, cheapest call | 37 B | **14 B (smallest)** | 94 B |
+| Avg CPU across the whole run | 7.8% | 3.6% | **2.1% (lowest)** |
+
+**Read honestly — this is not a one-sided result for anyone:**
+
+- **`mcp-like` wins startup and small-sequential-call latency by a wide
+  margin.** It pays no `connect()`/socket-setup cost at all — stdio pipes
+  are already open the moment the process exists — and no handshake
+  message the other two protocols require. For a short-lived,
+  spawn-once-use-once invocation (exactly how `mcp-like-server` is used
+  here, and arguably how MCP's stdio transport is used in practice), this
+  is a real, meaningful advantage.
+- **`mcp-like` collapses under concurrency**, because its stdio transport
+  fundamentally has no multi-caller model: serving N concurrent callers
+  means N separate processes, each paying the full spawn + `initialize`
+  cost again. 3630 req/s here is *that* cost dominating, not a
+  per-request protocol inefficiency — compare it to AST's 165006 req/s
+  multiplexing N requests over one already-open connection, which is
+  exactly the gap AST's design targets.
+- **Reconnect-per-call has no `mcp-like` row**, not because it's
+  unmeasured but because it's not a meaningful distinct scenario for a
+  process-per-session transport: every `mcp-like` call in the startup and
+  concurrency rows above *already* includes process-spawn cost, so
+  there's no separate "persistent vs reconnect" axis to measure the way
+  there is for a long-lived socket server.
+- **`mcp-like`'s response payloads are larger** than the request-size
+  table above suggests, because of the content-block double-encoding
+  described in `docs/AST_PROTOCOL.md`'s own "Encoded bytes" output
+  (`ast-bench`'s report prints the exact note) — a property of the
+  convention being compared against, not of this baseline's
+  implementation.
+- AST's two real advantages over the legacy protocol — large payloads
+  (16x) and concurrent multiplexing (2.2x, and a qualitatively different
+  story against `mcp-like`'s 45x) — are exactly the properties it was
+  designed for, and they're large, not marginal. AST is not universally
+  faster than either alternative; it's faster at the two things it
+  specifically trades handshake/dispatch overhead to be faster at.
 
 ## Cross-language interoperability
 
