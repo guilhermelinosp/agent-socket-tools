@@ -6,6 +6,7 @@ use clap::Parser;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Semaphore;
 
 /// Starts an AST (Agent Socket Transport) server.
 ///
@@ -23,6 +24,17 @@ struct Cli {
     /// Base directory `filesystem.read` is authorized to read from.
     #[arg(long)]
     read_dir: PathBuf,
+
+    /// Comma-separated allowlist of tools to register. Default: all of
+    /// them. Unknown names are a usage error (exit code 2). Only the listed
+    /// tools are registered, so `DISCOVER` and `INVOKE` see nothing else.
+    #[arg(
+        long,
+        value_delimiter = ',',
+        default_value = "system.info,system.noop,filesystem.read",
+        value_parser = parse_tool_name
+    )]
+    tools: Vec<String>,
 
     /// Maximum frame size, in bytes, for one AST message (request or
     /// response). See `docs/AST_PROTOCOL.md`'s framing section — this is
@@ -47,6 +59,19 @@ struct Cli {
     /// Maximum concurrent connections, server-wide.
     #[arg(long, default_value_t = 256)]
     max_connections: usize,
+
+    /// Maximum number of tool executions running at once on blocking
+    /// threads, server-wide. A tool keeps its slot until it actually
+    /// returns, even after its request was answered with a deadline or
+    /// cancellation; requests that find no free slot get RESOURCE_EXHAUSTED.
+    /// The blocking thread pool is sized to this value plus a small margin.
+    #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(u64).range(1..))]
+    max_blocking_tasks: u64,
+
+    /// Upper bound, in milliseconds, on any request's deadline. A larger
+    /// `deadline_ms` (or a larger `--default-deadline-ms`) is clamped to it.
+    #[arg(long, default_value_t = 60_000, value_parser = clap::value_parser!(u64).range(1..))]
+    max_deadline_ms: u64,
 
     /// Maximum number of calls in one `BATCH` message. A whole batch
     /// still counts as a single in-flight slot (see
@@ -86,6 +111,13 @@ struct Cli {
     #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
     write_timeout_secs: u64,
 
+    /// On SIGINT/SIGTERM, how long, in seconds, to wait for open connections
+    /// to finish after their in-flight requests are cancelled. Connections
+    /// still open when it elapses are abandoned, and so are tool executions
+    /// still running on blocking threads.
+    #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..))]
+    shutdown_grace_secs: u64,
+
     /// Only accept connections from processes running as the same user as
     /// this server, checked via `SO_PEERCRED` (Linux) / `LOCAL_PEERCRED`
     /// (macOS) — independent of, and in addition to, the socket file's
@@ -96,8 +128,7 @@ struct Cli {
     require_same_uid: bool,
 }
 
-#[tokio::main]
-async fn main() -> std::process::ExitCode {
+fn main() -> std::process::ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -106,16 +137,71 @@ async fn main() -> std::process::ExitCode {
         .init();
 
     let cli = Cli::parse();
+    if cli.max_blocking_tasks > Semaphore::MAX_PERMITS as u64 {
+        tracing::error!(
+            max_blocking_tasks = cli.max_blocking_tasks,
+            limit = Semaphore::MAX_PERMITS,
+            "--max-blocking-tasks exceeds the semaphore's permit limit"
+        );
+        return std::process::ExitCode::FAILURE;
+    }
+
+    // Same worker-thread default as `#[tokio::main]`; only the blocking pool
+    // is sized explicitly. Tool executions are capped by `blocking_slots`
+    // (see `ConnectionConfig`), so the pool never needs more than that plus
+    // a small margin for other blocking work.
+    let blocking_threads = (cli.max_blocking_tasks as usize).saturating_add(8);
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .max_blocking_threads(blocking_threads)
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to build the async runtime");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let code = runtime.block_on(run(cli));
+    // Do not wait for tool executions still running on blocking threads:
+    // the shutdown grace period has already ended, and they are abandoned
+    // along with the process. Dropping a runtime would otherwise block on them.
+    runtime.shutdown_background();
+    code
+}
+
+/// Every tool this binary knows how to register, in `--tools` terms.
+const KNOWN_TOOLS: &[&str] = &["system.info", "system.noop", "filesystem.read"];
+
+fn parse_tool_name(name: &str) -> Result<String, String> {
+    if KNOWN_TOOLS.contains(&name) {
+        Ok(name.to_string())
+    } else {
+        Err(format!(
+            "unknown tool {name:?}; expected one of: {}",
+            KNOWN_TOOLS.join(", ")
+        ))
+    }
+}
+
+async fn run(cli: Cli) -> std::process::ExitCode {
     let socket_path = cli.socket_path.unwrap_or_else(default_ast_socket_path);
 
+    let selected = |name: &str| cli.tools.iter().any(|t| t == name);
     let mut registry = ToolRegistry::new();
-    registry.register(Box::new(SystemInfoTool));
-    registry.register(Box::new(NoopTool));
-    match FilesystemReadTool::new(&cli.read_dir) {
-        Ok(tool) => registry.register(Box::new(tool)),
-        Err(e) => {
-            tracing::error!(dir = ?cli.read_dir, error = %e, "cannot authorize read directory");
-            return std::process::ExitCode::FAILURE;
+    if selected("system.info") {
+        registry.register(Box::new(SystemInfoTool));
+    }
+    if selected("system.noop") {
+        registry.register(Box::new(NoopTool));
+    }
+    if selected("filesystem.read") {
+        match FilesystemReadTool::new(&cli.read_dir) {
+            Ok(tool) => registry.register(Box::new(tool)),
+            Err(e) => {
+                tracing::error!(dir = ?cli.read_dir, error = %e, "cannot authorize read directory");
+                return std::process::ExitCode::FAILURE;
+            }
         }
     }
     let registry = Arc::new(registry);
@@ -128,7 +214,9 @@ async fn main() -> std::process::ExitCode {
         }
     };
 
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let config = ConnectionConfig {
+        shutdown: shutdown_rx,
         frame_limits: agent_socket_tools::ast::wire::FrameLimits {
             max_frame_len: cli.max_frame_bytes,
         },
@@ -148,7 +236,10 @@ async fn main() -> std::process::ExitCode {
             .max_batch_output_bytes
             .unwrap_or(cli.max_frame_bytes as usize),
         stream_chunk_bytes: cli.stream_chunk_bytes,
-    };
+        max_deadline: Duration::from_millis(cli.max_deadline_ms),
+        ..Default::default()
+    }
+    .with_max_blocking_tasks(cli.max_blocking_tasks as usize);
 
     tracing::info!(
         path = ?listener.path(),
@@ -160,7 +251,15 @@ async fn main() -> std::process::ExitCode {
         "ast-server listening"
     );
 
-    run_until_shutdown(listener, registry, config, cli.max_connections).await;
+    run_until_shutdown(
+        listener,
+        registry,
+        config,
+        cli.max_connections,
+        shutdown_tx,
+        Duration::from_secs(cli.shutdown_grace_secs),
+    )
+    .await;
 
     tracing::info!("ast-server shut down");
     std::process::ExitCode::SUCCESS
@@ -171,13 +270,19 @@ async fn run_until_shutdown(
     registry: Arc<ToolRegistry>,
     config: ConnectionConfig,
     max_connections: usize,
+    shutdown: tokio::sync::watch::Sender<bool>,
+    grace: Duration,
 ) {
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .expect("failed to install SIGTERM handler");
     let limiter = agent_socket_tools::transport::ConnectionLimiter::new(max_connections);
+    let mut connections = tokio::task::JoinSet::new();
 
     loop {
         tokio::select! {
+            // Reaps finished connections so the set does not grow for the
+            // lifetime of the server.
+            Some(_) = connections.join_next(), if !connections.is_empty() => {}
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, _addr)) => {
@@ -185,7 +290,7 @@ async fn run_until_shutdown(
                             Some(permit) => {
                                 let registry = Arc::clone(&registry);
                                 let config = config.clone();
-                                tokio::spawn(async move {
+                                connections.spawn(async move {
                                     let _permit = permit;
                                     run_connection(stream, registry, config).await;
                                 });
@@ -218,5 +323,25 @@ async fn run_until_shutdown(
                 break;
             }
         }
+    }
+
+    // Stop accepting (dropping the listener also removes the socket file),
+    // then signal every connection to cancel its in-flight work and close.
+    drop(listener);
+    shutdown.send_replace(true);
+    tracing::info!(
+        open_connections = connections.len(),
+        ?grace,
+        "draining open connections"
+    );
+    let drained = tokio::time::timeout(grace, async {
+        while connections.join_next().await.is_some() {}
+    })
+    .await;
+    if drained.is_err() {
+        tracing::warn!(
+            remaining = connections.len(),
+            "grace period elapsed; abandoning connections still open"
+        );
     }
 }

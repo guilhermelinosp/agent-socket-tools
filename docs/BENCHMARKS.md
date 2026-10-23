@@ -23,10 +23,25 @@ cargo run --release --bin ast-bench -- --quick --json-out bench-quick.json   # s
 - Every option and its default is listed by `cargo run --bin ast-bench -- --help`.
 - A debug build prints a `DEBUG BUILD — numbers are not valid` warning at the
   top of the report. Only `--release` numbers are meaningful.
+- `--only LIST` runs only the named scenarios (comma-separated): `startup`,
+  `noop`, `info`, `payload`, `discovery`, `batch`, `concurrency`,
+  `deployment`, `cpu`, `rss`. Default: all. Unselected scenarios are neither
+  run nor reported, and the report's header lists the scenarios that ran.
+  Each run uses fresh servers and samplers, so partial runs are comparable
+  with each other but not row-for-row with a full run. The `rss` samplers
+  only run when `rss` is selected.
+- To reproduce just the concurrency table at one level:
+  `cargo run --release --bin ast-bench -- --only concurrency --concurrency-levels 64 --repeats 10`.
+- Reproducible, archived runs go through
+  [`scripts/run-benchmarks.sh`](../scripts/run-benchmarks.sh). It writes a
+  dated, non-overwriting directory under `docs/results/` with the JSON and
+  Markdown reports, the allocator probe, and an `ENV.txt` (toolchain, host,
+  CPU, git SHA, dirty-tree count).
 
 Options: `--iterations` (500), `--warmup` (100), `--repeats` (5),
 `--concurrency-levels` (1,4,16,64), `--total-ops` (2000, operations per
-concurrency cell), `--cpu-ops` (20000), `--json-out`, `--raw`, `--quick`.
+concurrency cell), `--cpu-ops` (20000), `--json-out`, `--raw`, `--quick`,
+`--only` (all scenarios).
 
 ## Fairness rules
 
@@ -193,3 +208,5 @@ The interpretation and the target-by-target verdicts are in the
 ["MCP comparison"](AST_PROTOCOL.md#mcp-comparison) section of `docs/AST_PROTOCOL.md`.
 
 Wire-path optimization run (commit `26fe02d`, same machine and toolchain): [`results/bench-2026-10-22-wire-opt.md`](results/bench-2026-10-22-wire-opt.md) and [`results/bench-2026-10-22-wire-opt.json`](results/bench-2026-10-22-wire-opt.json). Allocator calls per call are measured by `alloc-probe` (`cargo run --release --bin alloc-probe`, client and server in one process, sequential), not by `ast-bench`; raw data in [`results/alloc-baseline.json`](results/alloc-baseline.json) and [`results/alloc-after-wire.json`](results/alloc-after-wire.json).
+
+Final release run (commit `34f06ed`, zero errors in every cell): [`results/2026-10-22-34f06ed/`](results/2026-10-22-34f06ed/) (`bench.md`, `bench.json`, `alloc.md`, `alloc.json`, `ENV.txt`). The pre-fix run that retains one error is in [`results/2026-10-22-13a577d/`](results/2026-10-22-13a577d/). An index of every file in `docs/results/` and how to reproduce a run is in [`results/README.md`](results/README.md).

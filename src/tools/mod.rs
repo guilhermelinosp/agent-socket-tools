@@ -12,6 +12,8 @@ pub use system_noop::NoopTool;
 
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// A policy/authorization failure, distinct from a tool-internal error.
 #[derive(Debug, thiserror::Error)]
@@ -24,6 +26,30 @@ pub enum ToolError {
     Failed(String),
 }
 
+/// Cooperative cancellation flag for one request, handed to a tool through
+/// [`Tool::invoke_with_cancel`]. Clones share the same flag.
+///
+/// The server calls [`CancelToken::cancel`] when the request's deadline
+/// expires, when a `CANCEL` arrives for it, when its connection fails, and
+/// when the server shuts down. Setting the flag does not stop anything by
+/// itself: only a tool that checks [`CancelToken::is_cancelled`] stops.
+#[derive(Clone, Default)]
+pub struct CancelToken(Arc<AtomicBool>);
+
+impl CancelToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
 pub trait Tool: Send + Sync {
     /// Dotted tool name, e.g. `"system.info"`.
     fn name(&self) -> &str;
@@ -34,13 +60,30 @@ pub trait Tool: Send + Sync {
     /// JSON Schema (draft-07 subset) describing accepted `args`.
     fn input_schema(&self) -> Value;
 
-    /// Validates `args` and executes the tool synchronously.
-    ///
-    /// Tools in this MVP are all synchronous and non-blocking in practice
-    /// (in-memory lookups, single bounded file reads), so the registry runs
-    /// them via `spawn_blocking` rather than requiring every tool to be
-    /// written against an async trait.
+    /// Validates `args` and executes the tool. Runs on a blocking thread
+    /// (`spawn_blocking`), so it may block; it must not assume it is on an
+    /// async executor. Each execution holds one of the server's
+    /// `blocking_slots` until this returns.
     fn invoke(&self, args: Value) -> Result<Value, ToolError>;
+
+    /// Like [`Tool::invoke`], but also receives the request's
+    /// [`CancelToken`]. The `ast-server` calls this method; other front-ends
+    /// (e.g. `mcp-server`, `mcp-like-server`) call `invoke` directly and offer
+    /// no cancellation. So an override is how a tool becomes cancellable on
+    /// the `ast-server` path.
+    ///
+    /// A tool that runs long MUST check `cancel.is_cancelled()` at its
+    /// checkpoints and return early once it is set. A tool that ignores the
+    /// token keeps occupying its blocking slot until it returns, even though
+    /// its caller has already been answered `DEADLINE_EXCEEDED` or
+    /// `CANCELLED`. Rust cannot stop a running thread, and the server does
+    /// not try to.
+    ///
+    /// The default ignores the token and calls [`Tool::invoke`].
+    fn invoke_with_cancel(&self, args: Value, cancel: &CancelToken) -> Result<Value, ToolError> {
+        let _ = cancel;
+        self.invoke(args)
+    }
 
     /// Returns `Some(self)` only for a tool whose output can be *produced*
     /// incrementally (see [`StreamingTool`]). Most tools don't override

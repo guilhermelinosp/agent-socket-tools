@@ -362,3 +362,50 @@ async fn invoke_stream_of_a_large_file_reassembles_correctly() {
     let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(value["contents"], large_contents);
 }
+
+#[tokio::test]
+async fn tools_allowlist_registers_only_the_selected_tools() {
+    let server = start_server_with_args(&["--tools", "system.noop"]).await;
+
+    let (success, stdout) = run_client(&server.socket_path, &["discover"]);
+    assert!(success);
+    let tools: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let names: Vec<&str> = tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["system.noop"]);
+
+    // A tool that exists in the default set but was not selected must be
+    // unknown to the server, not merely hidden from DISCOVER.
+    let output = Command::new(env!("CARGO_BIN_EXE_ast-client"))
+        .arg("--socket-path")
+        .arg(&server.socket_path)
+        .args(["invoke", "--tool", "system.info", "--args", "{}"])
+        .output()
+        .expect("failed to spawn ast-client");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // The client prints the error variant name, not the wire code string.
+    assert!(stderr.contains("ToolNotFound"), "stderr was: {stderr}");
+}
+
+#[test]
+fn unknown_tool_name_in_tools_is_a_startup_usage_error() {
+    let read_dir = tempfile::tempdir().unwrap();
+    let socket_dir = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_ast-server"))
+        .arg("--socket-path")
+        .arg(socket_dir.path().join("never.sock"))
+        .arg("--read-dir")
+        .arg(read_dir.path())
+        .args(["--tools", "system.info,does.not.exist"])
+        .output()
+        .expect("failed to spawn ast-server");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("does.not.exist"), "stderr was: {stderr}");
+    assert!(!socket_dir.path().join("never.sock").exists());
+}

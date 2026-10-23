@@ -147,6 +147,8 @@ impl Config {
             "quick": self.quick,
             "debug_build": self.debug_build,
             "json_out": self.json_out.as_ref().map(|p| p.display().to_string()),
+            "only": self.only,
+            "scenarios_run": self.selected(),
             "batch_group_size": 20,
             "payload_sizes_bytes": { "tiny": 2, "medium": 16 * 1024, "large": 512 * 1024 },
             "request_timeout_s": 10,
@@ -174,23 +176,45 @@ pub fn markdown(env: &Environment, cfg: &Config, entries: &[Entry]) -> String {
     md.push_str("## Methodology\n\n");
     let _ = writeln!(md, "{METHODOLOGY}\n");
 
-    section_startup(&mut md, entries);
-    section_sequential(&mut md, entries, "noop_sequential", "## No-op (`system.noop`), sequential, persistent connection",
-        "The same call on every protocol. The AST ping row is the protocol floor and is not comparable to tool calls.");
-    section_sequential(
-        &mut md,
-        entries,
-        "info_sequential",
-        "## Info (`system.info`), sequential, persistent connection",
-        "",
-    );
-    section_payloads(&mut md, entries);
-    section_discovery(&mut md, entries);
-    section_batch(&mut md, entries);
-    section_concurrency(&mut md, entries);
-    section_deployment(&mut md, entries);
-    section_cpu(&mut md, entries, cfg);
-    section_rss(&mut md, entries);
+    let _ = writeln!(md, "**Scenarios run:** {}\n", cfg.selected().join(", "));
+
+    if cfg.wants("startup") {
+        section_startup(&mut md, entries);
+    }
+    if cfg.wants("noop") {
+        section_sequential(&mut md, entries, "noop_sequential", "## No-op (`system.noop`), sequential, persistent connection",
+            "The same call on every protocol. The AST ping row is the protocol floor and is not comparable to tool calls.");
+    }
+    if cfg.wants("info") {
+        section_sequential(
+            &mut md,
+            entries,
+            "info_sequential",
+            "## Info (`system.info`), sequential, persistent connection",
+            "",
+        );
+    }
+    if cfg.wants("payload") {
+        section_payloads(&mut md, entries);
+    }
+    if cfg.wants("discovery") {
+        section_discovery(&mut md, entries);
+    }
+    if cfg.wants("batch") {
+        section_batch(&mut md, entries);
+    }
+    if cfg.wants("concurrency") {
+        section_concurrency(&mut md, entries);
+    }
+    if cfg.wants("deployment") {
+        section_deployment(&mut md, entries);
+    }
+    if cfg.wants("cpu") {
+        section_cpu(&mut md, entries, cfg);
+    }
+    if cfg.wants("rss") {
+        section_rss(&mut md, entries);
+    }
 
     md.push_str("## Not measured\n\n");
     for item in NOT_MEASURED {
@@ -201,7 +225,17 @@ pub fn markdown(env: &Environment, cfg: &Config, entries: &[Entry]) -> String {
         let _ = writeln!(md, "- {item}");
     }
     md.push_str("\n---\n\n");
-    md.push_str("Reproduce with: `cargo build --release && cargo run --release --bin ast-bench`\n");
+    if cfg.only.is_empty() {
+        md.push_str(
+            "Reproduce with: `cargo build --release && cargo run --release --bin ast-bench`\n",
+        );
+    } else {
+        let _ = writeln!(
+            md,
+            "Reproduce with: `cargo build --release && cargo run --release --bin ast-bench -- --only {}`\n",
+            cfg.only.join(",")
+        );
+    }
     md
 }
 
@@ -309,6 +343,30 @@ fn headers_ref(v: &[String]) -> Vec<&str> {
     v.iter().map(String::as_str).collect()
 }
 
+/// After a table: one line per cell that has errors, naming the cell and
+/// listing its first distinct error messages (at most five).
+fn error_notes<'a>(
+    md: &mut String,
+    entries: impl IntoIterator<Item = &'a Entry>,
+    name: impl Fn(&Entry) -> String,
+) {
+    for e in entries {
+        if e.errors_total() == 0 {
+            continue;
+        }
+        let samples = if e.error_samples.is_empty() {
+            "none recorded".to_string()
+        } else {
+            e.error_samples
+                .iter()
+                .map(|m| format!("`{}`", m.replace(['\n', '`'], " ")))
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        let _ = writeln!(md, "Error samples ({}): {samples}\n", name(e));
+    }
+}
+
 fn select<'a>(entries: &'a [Entry], scenario: &str) -> Vec<&'a Entry> {
     entries.iter().filter(|e| e.scenario == scenario).collect()
 }
@@ -337,6 +395,9 @@ fn section_startup(md: &mut String, entries: &[Entry]) {
         &["Server", "startup median (min–max)", "errors"],
         &rows,
     ));
+    error_notes(md, select(entries, "startup"), |e| {
+        label(&e.protocol).to_string()
+    });
 }
 
 fn section_sequential(md: &mut String, entries: &[Entry], scenario: &str, title: &str, note: &str) {
@@ -356,6 +417,9 @@ fn section_sequential(md: &mut String, entries: &[Entry], scenario: &str, title:
         &headers_ref(&latency_headers("Protocol", "throughput median (ops/s)")),
         &table_rows,
     ));
+    error_notes(md, select(entries, scenario), |e| {
+        label(&e.protocol).to_string()
+    });
 }
 
 fn section_payloads(md: &mut String, entries: &[Entry]) {
@@ -374,6 +438,13 @@ fn section_payloads(md: &mut String, entries: &[Entry]) {
             &headers_ref(&latency_headers("Protocol", "throughput median (ops/s)")),
             &rows,
         ));
+        error_notes(
+            md,
+            select(entries, "payload_sequential")
+                .into_iter()
+                .filter(|e| e.params["size"] == size),
+            |e| format!("{size}, {}", label(&e.protocol)),
+        );
     }
 }
 
@@ -391,6 +462,9 @@ fn section_discovery(md: &mut String, entries: &[Entry]) {
         &headers_ref(&latency_headers("Protocol", "throughput median (ops/s)")),
         &table_rows,
     ));
+    error_notes(md, select(entries, "discovery"), |e| {
+        label(&e.protocol).to_string()
+    });
 }
 
 fn section_batch(md: &mut String, entries: &[Entry]) {
@@ -408,6 +482,9 @@ fn section_batch(md: &mut String, entries: &[Entry]) {
         &headers_ref(&latency_headers("Mode", "groups/s median")),
         &table_rows,
     ));
+    error_notes(md, select(entries, "batch"), |e| {
+        e.params["mode"].as_str().unwrap_or("").to_string()
+    });
 }
 
 fn section_concurrency(md: &mut String, entries: &[Entry]) {
@@ -433,6 +510,14 @@ fn section_concurrency(md: &mut String, entries: &[Entry]) {
         )),
         &table_rows,
     ));
+    error_notes(md, select(entries, "concurrency"), |e| {
+        format!(
+            "{} · C={} · connections={}",
+            e.params["model"].as_str().unwrap_or(""),
+            e.params["concurrency"].as_u64().unwrap_or(0),
+            e.params["connections"].as_u64().unwrap_or(0)
+        )
+    });
 }
 
 fn section_deployment(md: &mut String, entries: &[Entry]) {
@@ -468,6 +553,9 @@ fn section_deployment(md: &mut String, entries: &[Entry]) {
         ],
         &table_rows,
     ));
+    error_notes(md, select(entries, "deployment_per_process"), |e| {
+        format!("{} processes", e.params["processes"])
+    });
 }
 
 fn section_cpu(md: &mut String, entries: &[Entry], cfg: &Config) {
@@ -510,6 +598,9 @@ fn section_cpu(md: &mut String, entries: &[Entry], cfg: &Config) {
         ],
         &table_rows,
     ));
+    error_notes(md, select(entries, "server_cpu"), |e| {
+        label(&e.protocol).to_string()
+    });
 }
 
 fn section_rss(md: &mut String, entries: &[Entry]) {
@@ -553,6 +644,7 @@ mod tests {
             quick: false,
             debug_build: false,
             json_out: None,
+            only: Vec::new(),
         };
         let env = Environment::collect();
         let doc = json_document(&env, &cfg, &[]);

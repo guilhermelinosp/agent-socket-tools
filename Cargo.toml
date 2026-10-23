@@ -51,8 +51,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 # Used only for a handful of justified, documented `unsafe` FFI calls:
 # getuid()/umask() for the private-socket-directory hardening in
-# transport.rs, O_NOFOLLOW for filesystem_read.rs's symlink-swap
-# mitigation, and SO_PEERCRED/LOCAL_PEERCRED for AST's peer-credential
+# transport.rs, openat/O_NOFOLLOW for filesystem_read.rs's fd-relative
+# traversal, and SO_PEERCRED/LOCAL_PEERCRED for AST's peer-credential
 # check. Not used anywhere else.
 libc = "0.2"
 # AST's wire serialization. Chosen over CBOR and JSON by measurement, not

@@ -13,13 +13,13 @@ use crate::ast::codec;
 use crate::ast::message::*;
 use crate::ast::peercred::{self, PeerCredentials};
 use crate::ast::wire::{self, Frame, FrameError, FrameLimits};
-use crate::tools::{ToolError, ToolRegistry};
+use crate::tools::{CancelToken, ToolError, ToolRegistry};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::BufReader;
 use tokio::net::UnixStream;
-use tokio::sync::{mpsc, Notify, Semaphore};
+use tokio::sync::{mpsc, watch, Notify, OwnedSemaphorePermit, Semaphore};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerPolicy {
@@ -89,6 +89,36 @@ pub struct ConnectionConfig {
     /// its connection closed rather than holding the writer task and its
     /// fd indefinitely.
     pub write_timeout: Duration,
+    /// Upper bound on any request's effective deadline. A requested
+    /// `deadline_ms` (or `default_deadline`) larger than this is clamped
+    /// down to it, for `INVOKE`, every call of a `BATCH`, and streams.
+    pub max_deadline: Duration,
+    /// Server-wide pool of slots for tool executions on blocking threads.
+    /// Every `spawn_blocking` that runs a tool first takes one slot and
+    /// holds it until the blocking closure actually returns — even after
+    /// the caller has already been answered with `DEADLINE_EXCEEDED` or
+    /// `CANCELLED`. Requests that find no free slot get `RESOURCE_EXHAUSTED`
+    /// instead of starting. Shared by every connection cloned from this
+    /// config; see [`ConnectionConfig::with_max_blocking_tasks`].
+    pub blocking_slots: Arc<Semaphore>,
+    /// Server shutdown signal. Once the value becomes `true`, every
+    /// connection stops reading, cancels its in-flight requests, and closes
+    /// after their terminal frames are written. A config whose sender was
+    /// dropped without signalling (the `Default` one) never shuts down.
+    pub shutdown: watch::Receiver<bool>,
+}
+
+/// Default number of tool executions allowed to run at once, server-wide.
+pub const DEFAULT_MAX_BLOCKING_TASKS: usize = 64;
+
+impl ConnectionConfig {
+    /// Replaces the blocking-execution slot pool with one of `n` slots.
+    /// Build the config fully before cloning it into connections: a clone
+    /// made earlier keeps the pool it was cloned with.
+    pub fn with_max_blocking_tasks(mut self, n: usize) -> Self {
+        self.blocking_slots = Arc::new(Semaphore::new(n));
+        self
+    }
 }
 
 impl Default for ConnectionConfig {
@@ -105,21 +135,69 @@ impl Default for ConnectionConfig {
             max_batch_output_bytes: FrameLimits::default().max_frame_len as usize,
             stream_chunk_bytes: 64 * 1024,
             write_timeout: Duration::from_secs(30),
+            max_deadline: Duration::from_secs(60),
+            blocking_slots: Arc::new(Semaphore::new(DEFAULT_MAX_BLOCKING_TASKS)),
+            // The sender is dropped here on purpose: `wait_for_shutdown`
+            // treats a closed channel as "never shuts down".
+            shutdown: watch::channel(false).1,
         }
     }
 }
 
+/// Resolves once `rx` carries `true`. If the sender is dropped without ever
+/// signalling, this never resolves: that is not a shutdown request.
+async fn wait_for_shutdown(rx: &mut watch::Receiver<bool>) {
+    loop {
+        if *rx.borrow_and_update() {
+            return;
+        }
+        if rx.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// The deadline a request runs under: its own `deadline_ms` (or the
+/// server default when it has none), clamped to `max_deadline`. A zero
+/// result means the request must be answered `DEADLINE_EXCEEDED` without
+/// starting the tool.
+fn effective_deadline(
+    deadline_ms: Option<u64>,
+    default_deadline: Duration,
+    max_deadline: Duration,
+) -> Duration {
+    deadline_ms
+        .map(Duration::from_millis)
+        .unwrap_or(default_deadline)
+        .min(max_deadline)
+}
+
+/// In-flight requests of one connection, keyed by correlation id, each with
+/// the `Notify` its task races against. The per-request `CancelToken` lives
+/// inside `run_invoke`: it is cancelled there, on the same arm that observes
+/// the notification, so signalling the `Notify` is enough.
 type Cancellations = Arc<Mutex<HashMap<u64, Arc<Notify>>>>;
+
+/// Signals every in-flight request of a connection as cancelled. `notify_one`
+/// stores a permit, so a request that reaches its `.notified()` arm after
+/// this runs is cancelled too.
+fn cancel_all(cancellations: &Cancellations) {
+    let map = cancellations.lock().unwrap_or_else(|p| p.into_inner());
+    for notify in map.values() {
+        notify.notify_one();
+    }
+}
 
 /// Signals every in-flight request of a connection as cancelled when the
 /// connection's `serve_reads` ends, for any reason (including the select
-/// in `run_connection` dropping it). `notify_one` stores a permit, so a
-/// task that reaches `.notified()` after this runs is cancelled too.
+/// in `run_connection` dropping it).
 ///
 /// The one exception is a clean EOF from the peer (a half-close): the
 /// caller `disarm`s the guard, so responses already in flight are still
 /// delivered. `run_connection` then drops its sender and waits for the
-/// writer, which drains them.
+/// writer, which drains them. In that state the writer also cancels
+/// everything on its first failed write, and `run_connection` cancels
+/// everything on server shutdown.
 struct CancelAllOnDrop {
     cancellations: Cancellations,
     armed: bool,
@@ -141,12 +219,8 @@ impl CancelAllOnDrop {
 
 impl Drop for CancelAllOnDrop {
     fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        let map = self.cancellations.lock().unwrap_or_else(|p| p.into_inner());
-        for notify in map.values() {
-            notify.notify_one();
+        if self.armed {
+            cancel_all(&self.cancellations);
         }
     }
 }
@@ -179,18 +253,31 @@ pub async fn run_connection(
     // One buffered read half per connection, shared by the handshake and the
     // steady-state loop, so bytes buffered after HELLO are never lost.
     let read_half = BufReader::with_capacity(READ_BUF_CAPACITY, read_half);
-    let (tx, mut rx) = mpsc::channel::<Frame>(64);
+    let (tx, mut rx) = mpsc::channel::<Outgoing>(64);
     let write_timeout = config.write_timeout;
+    // Owned here, not by `serve_reads`, so the writer can cancel in-flight
+    // work after a failed write even once `serve_reads` has returned (a
+    // clean EOF disarms its guard, see `CancelAllOnDrop`).
+    let cancellations: Cancellations = Arc::new(Mutex::new(HashMap::new()));
+    let writer_cancellations = Arc::clone(&cancellations);
+    let mut shutdown = config.shutdown.clone();
 
     let mut writer_task = tokio::spawn(async move {
         let mut write_half = write_half;
-        while let Some(frame) = rx.recv().await {
+        while let Some(Outgoing { frame, permit }) = rx.recv().await {
+            // The request's in-flight slot is returned here, just before its
+            // terminal frame starts going out, so a client that reads the
+            // terminal and immediately sends its next request always finds the
+            // slot free. Bounded: a permit stays held while its frame waits in
+            // the channel, so a slow reader still caps queued requests.
+            drop(permit);
             match tokio::time::timeout(write_timeout, wire::write_frame(&mut write_half, &frame))
                 .await
             {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
                     tracing::debug!(error = %e, "closing connection: frame write failed");
+                    cancel_all(&writer_cancellations);
                     return;
                 }
                 Err(_elapsed) => {
@@ -198,6 +285,7 @@ pub async fn run_connection(
                         ?write_timeout,
                         "closing connection: frame write timed out (peer not reading)"
                     );
+                    cancel_all(&writer_cancellations);
                     return;
                 }
             }
@@ -211,13 +299,24 @@ pub async fn run_connection(
     // non-cancel-safe `read_frame` is never resumed.
     let mut writer_finished = false;
     tokio::select! {
-        _ = serve_reads(read_half, tx.clone(), registry, config) => {}
+        _ = serve_reads(read_half, tx.clone(), registry, config, Arc::clone(&cancellations)) => {}
         _ = &mut writer_task => { writer_finished = true; }
     }
 
     drop(tx); // lets the writer task's `rx.recv()` loop end
     if !writer_finished {
-        let _ = writer_task.await;
+        // Reached after a clean EOF (half-close, guard disarmed) or any
+        // other `serve_reads` exit. Waiting only for the writer would leave
+        // half-closed connections uncancelled on shutdown, so shutdown
+        // cancels the remaining work and the writer drains the terminals.
+        tokio::select! {
+            _ = &mut writer_task => {}
+            _ = wait_for_shutdown(&mut shutdown) => {
+                tracing::debug!("cancelling in-flight work of a half-closed connection: server is shutting down");
+                cancel_all(&cancellations);
+                let _ = (&mut writer_task).await;
+            }
+        }
     }
 }
 
@@ -272,11 +371,20 @@ async fn wait_until_continuously_idle(
 /// Capacity of the buffered read half of each accepted connection.
 const READ_BUF_CAPACITY: usize = 8 * 1024;
 
+/// A frame queued for the connection's writer, plus the in-flight permit of
+/// the request it terminates (`None` for everything else). The writer drops
+/// the permit as it dequeues the frame, before writing it.
+struct Outgoing {
+    frame: Frame,
+    permit: Option<OwnedSemaphorePermit>,
+}
+
 async fn serve_reads(
     mut read_half: BufReader<tokio::net::unix::OwnedReadHalf>,
-    tx: mpsc::Sender<Frame>,
+    tx: mpsc::Sender<Outgoing>,
     registry: Arc<ToolRegistry>,
     config: ConnectionConfig,
+    cancellations: Cancellations,
 ) {
     let max_frame_len = config.frame_limits.max_frame_len;
 
@@ -369,10 +477,10 @@ async fn serve_reads(
     // --- Steady state. ---
     let in_flight: Arc<Mutex<std::collections::HashSet<u64>>> =
         Arc::new(Mutex::new(Default::default()));
-    let cancellations: Cancellations = Arc::new(Mutex::new(HashMap::new()));
     // Cancels all in-flight work of this connection when `serve_reads` ends.
     let mut cancel_on_drop = CancelAllOnDrop::new(Arc::clone(&cancellations));
     let in_flight_limit = Arc::new(Semaphore::new(config.max_in_flight));
+    let mut shutdown = config.shutdown.clone();
 
     loop {
         let read_result = tokio::select! {
@@ -382,6 +490,13 @@ async fn serve_reads(
                     idle_timeout = ?config.idle_timeout,
                     "closing connection: no frame received within the idle timeout"
                 );
+                return;
+            }
+            _ = wait_for_shutdown(&mut shutdown) => {
+                // Returning like a connection error: the armed guard cancels
+                // every in-flight request, each sends its terminal frame, and
+                // the writer drains them before the connection closes.
+                tracing::debug!("closing connection: server is shutting down");
                 return;
             }
         };
@@ -532,6 +647,8 @@ async fn serve_reads(
                     invoke,
                     Arc::clone(&registry),
                     config.default_deadline,
+                    config.max_deadline,
+                    Arc::clone(&config.blocking_slots),
                     notify,
                     permit,
                     Arc::clone(&in_flight),
@@ -630,6 +747,8 @@ async fn serve_reads(
                     batch,
                     Arc::clone(&registry),
                     config.default_deadline,
+                    config.max_deadline,
+                    Arc::clone(&config.blocking_slots),
                     notify,
                     permit,
                     Arc::clone(&in_flight),
@@ -718,11 +837,13 @@ fn spawn_invoke(
     invoke: Invoke,
     registry: Arc<ToolRegistry>,
     default_deadline: Duration,
+    max_deadline: Duration,
+    blocking_slots: Arc<Semaphore>,
     cancel_notify: Arc<Notify>,
     permit: tokio::sync::OwnedSemaphorePermit,
     in_flight: Arc<Mutex<std::collections::HashSet<u64>>>,
     cancellations: Cancellations,
-    tx: mpsc::Sender<Frame>,
+    tx: mpsc::Sender<Outgoing>,
     max_frame_len: u32,
     stream_chunk_bytes: usize,
 ) {
@@ -741,19 +862,17 @@ fn spawn_invoke(
         // in-progress disk-to-wire transfer, which can meaningfully take
         // a while for a large stream.
         tokio::spawn(async move {
-            let _permit = permit;
-            let deadline = invoke
-                .deadline_ms
-                .map(Duration::from_millis)
-                .unwrap_or(default_deadline);
+            let mut permit = Some(permit);
+            let deadline = effective_deadline(invoke.deadline_ms, default_deadline, max_deadline);
             let started = Instant::now();
 
             let opened = run_invoke_streaming(
                 invoke,
-                registry,
+                Arc::clone(&registry),
                 deadline,
                 started,
                 Arc::clone(&cancel_notify),
+                Arc::clone(&blocking_slots),
             )
             .await;
             match opened {
@@ -766,12 +885,22 @@ fn spawn_invoke(
                         deadline,
                         started,
                         cancel_notify,
+                        &blocking_slots,
                         max_frame_len,
+                        &mut permit,
                     )
                     .await;
                 }
                 Err((code, message)) => {
-                    let _ = send_error(&tx, correlation_id, code, &message, max_frame_len).await;
+                    let _ = send_error_with(
+                        &tx,
+                        correlation_id,
+                        code,
+                        &message,
+                        max_frame_len,
+                        permit.take(),
+                    )
+                    .await;
                 }
             }
 
@@ -788,13 +917,19 @@ fn spawn_invoke(
     }
 
     tokio::spawn(async move {
-        let _permit = permit; // held for this task's whole lifetime
-        let deadline = invoke
-            .deadline_ms
-            .map(Duration::from_millis)
-            .unwrap_or(default_deadline);
+        // Held until the terminal frame is queued; the writer releases it.
+        let mut permit = Some(permit);
+        let deadline = effective_deadline(invoke.deadline_ms, default_deadline, max_deadline);
 
-        let response = run_invoke(invoke, registry, deadline, cancel_notify).await;
+        let response = run_invoke(
+            invoke,
+            registry,
+            deadline,
+            cancel_notify,
+            blocking_slots,
+            None,
+        )
+        .await;
 
         in_flight
             .lock()
@@ -807,15 +942,17 @@ fn spawn_invoke(
 
         match response {
             Ok(value) if wants_stream => {
-                send_streamed_result(&tx, correlation_id, value, stream_chunk_bytes).await;
+                send_streamed_result(&tx, correlation_id, value, stream_chunk_bytes, &mut permit)
+                    .await;
             }
             Ok(value) => {
-                if send(
+                if send_with(
                     &tx,
                     MessageType::Result,
                     correlation_id,
                     &InvokeResult { value },
                     max_frame_len,
+                    permit.take(),
                 )
                 .await
                 .is_err()
@@ -824,9 +961,16 @@ fn spawn_invoke(
                 }
             }
             Err((code, message)) => {
-                if send_error(&tx, correlation_id, code, &message, max_frame_len)
-                    .await
-                    .is_err()
+                if send_error_with(
+                    &tx,
+                    correlation_id,
+                    code,
+                    &message,
+                    max_frame_len,
+                    permit.take(),
+                )
+                .await
+                .is_err()
                 {
                     tracing::debug!(correlation_id, "response could not be delivered: the connection's outgoing channel is closed or the response failed to encode");
                 }
@@ -845,6 +989,7 @@ async fn run_invoke_streaming(
     deadline: Duration,
     started: Instant,
     cancel_notify: Arc<Notify>,
+    blocking_slots: Arc<Semaphore>,
 ) -> Result<crate::tools::StreamingToolOpen, (ErrorCode, String)> {
     let Some(_tool) = registry.get(&invoke.tool) else {
         return Err((
@@ -852,10 +997,17 @@ async fn run_invoke_streaming(
             format!("no such tool: {}", invoke.tool),
         ));
     };
+    if deadline.is_zero() {
+        return Err(zero_deadline_error());
+    }
+    let Ok(blocking_permit) = Arc::clone(&blocking_slots).try_acquire_owned() else {
+        return Err(blocking_slots_exhausted_error());
+    };
 
     let tool_name = invoke.tool.clone();
     let args = invoke.args;
     let task = tokio::task::spawn_blocking(move || {
+        let _blocking_permit = blocking_permit; // released only when the open returns
         let tool = registry
             .get(&tool_name)
             .expect("presence already checked before spawning");
@@ -901,24 +1053,27 @@ async fn run_invoke_streaming(
 /// rather than each getting a fresh one.
 #[allow(clippy::too_many_arguments)]
 async fn send_raw_streamed_result(
-    tx: &mpsc::Sender<Frame>,
+    tx: &mpsc::Sender<Outgoing>,
     correlation_id: u64,
     opened: crate::tools::StreamingToolOpen,
     chunk_bytes: usize,
     deadline: Duration,
     started: Instant,
     cancel_notify: Arc<Notify>,
+    blocking_slots: &Arc<Semaphore>,
     max_frame_len: u32,
+    permit: &mut Option<OwnedSemaphorePermit>,
 ) {
     // Clients enforce `total_bytes` exactly, so a stream whose size is
     // unknown cannot be sent: refuse it before STREAM_START goes out.
     let Some(total_bytes) = opened.reader.total_bytes_hint() else {
-        let _ = send_error(
+        let _ = send_error_with(
             tx,
             correlation_id,
             ErrorCode::InternalError,
             "streaming tool did not report a size",
             max_frame_len,
+            permit.take(),
         )
         .await;
         return;
@@ -953,18 +1108,36 @@ async fn send_raw_streamed_result(
     loop {
         let remaining = deadline.saturating_sub(started.elapsed());
         if remaining.is_zero() {
-            let _ = send_error(
+            let _ = send_error_with(
                 tx,
                 correlation_id,
                 ErrorCode::DeadlineExceeded,
                 "the tool did not complete within the configured deadline",
                 max_frame_len,
+                permit.take(),
             )
             .await;
             return;
         }
 
+        // Each chunk read is a blocking tool execution too, so it takes its
+        // own slot. Exhaustion here is a terminal error for this stream:
+        // STREAM_START has already gone out, so it can only be reported as
+        // an ERROR, not retracted.
+        let Ok(blocking_permit) = Arc::clone(blocking_slots).try_acquire_owned() else {
+            let _ = send_error_with(
+                tx,
+                correlation_id,
+                ErrorCode::ResourceExhausted,
+                blocking_slots_exhausted_message(),
+                max_frame_len,
+                permit.take(),
+            )
+            .await;
+            return;
+        };
         let read_task = tokio::task::spawn_blocking(move || {
+            let _blocking_permit = blocking_permit; // released only when the read returns
             let chunk = reader.next_chunk(chunk_bytes.max(1));
             (reader, chunk)
         });
@@ -973,36 +1146,36 @@ async fn send_raw_streamed_result(
             result = read_task => match result {
                 Ok(pair) => pair,
                 Err(join_err) => {
-                    let _ = send_error(
+                    let _ = send_error_with(
                         tx,
                         correlation_id,
                         ErrorCode::InternalError,
                         &format!("the streaming reader task panicked: {join_err}"),
                         max_frame_len,
-                    )
+                     permit.take(),)
                     .await;
                     return;
                 }
             },
             _ = tokio::time::sleep(remaining) => {
-                let _ = send_error(
+                let _ = send_error_with(
                     tx,
                     correlation_id,
                     ErrorCode::DeadlineExceeded,
                     "the tool did not complete within the configured deadline",
                     max_frame_len,
-                )
+                 permit.take(),)
                 .await;
                 return;
             }
             _ = cancel_notify.notified() => {
-                let _ = send_error(
+                let _ = send_error_with(
                     tx,
                     correlation_id,
                     ErrorCode::Cancelled,
                     "the request was cancelled",
                     max_frame_len,
-                )
+                 permit.take(),)
                 .await;
                 return;
             }
@@ -1027,13 +1200,28 @@ async fn send_raw_streamed_result(
             Ok(None) => break, // exhausted
             Err(tool_err) => {
                 let (code, message) = tool_error_to_code(tool_err);
-                let _ = send_error(tx, correlation_id, code, &message, max_frame_len).await;
+                let _ = send_error_with(
+                    tx,
+                    correlation_id,
+                    code,
+                    &message,
+                    max_frame_len,
+                    permit.take(),
+                )
+                .await;
                 return;
             }
         }
     }
 
-    let _ = send_raw(tx, MessageType::StreamEnd, correlation_id, &StreamEnd {}).await;
+    let _ = send_raw_with(
+        tx,
+        MessageType::StreamEnd,
+        correlation_id,
+        &StreamEnd {},
+        permit.take(),
+    )
+    .await;
 }
 
 /// Sends an already-computed, successful result as
@@ -1045,10 +1233,11 @@ async fn send_raw_streamed_result(
 /// buffering the whole result in memory on the server's behalf beyond
 /// what's already needed to have computed `value` in the first place.
 async fn send_streamed_result(
-    tx: &mpsc::Sender<Frame>,
+    tx: &mpsc::Sender<Outgoing>,
     correlation_id: u64,
     value: serde_json::Value,
     chunk_bytes: usize,
+    permit: &mut Option<OwnedSemaphorePermit>,
 ) {
     let encoded = match codec::encode(&value) {
         Ok(bytes) => bytes,
@@ -1095,7 +1284,14 @@ async fn send_streamed_result(
         }
     }
 
-    let _ = send_raw(tx, MessageType::StreamEnd, correlation_id, &StreamEnd {}).await;
+    let _ = send_raw_with(
+        tx,
+        MessageType::StreamEnd,
+        correlation_id,
+        &StreamEnd {},
+        permit.take(),
+    )
+    .await;
 }
 
 /// Reserved margin, in bytes, subtracted from `max_batch_output_bytes`
@@ -1114,16 +1310,19 @@ fn spawn_batch(
     batch: Batch,
     registry: Arc<ToolRegistry>,
     default_deadline: Duration,
+    max_deadline: Duration,
+    blocking_slots: Arc<Semaphore>,
     cancel_notify: Arc<Notify>,
     permit: tokio::sync::OwnedSemaphorePermit,
     in_flight: Arc<Mutex<std::collections::HashSet<u64>>>,
     cancellations: Cancellations,
-    tx: mpsc::Sender<Frame>,
+    tx: mpsc::Sender<Outgoing>,
     max_frame_len: u32,
     max_batch_output_bytes: usize,
 ) {
     tokio::spawn(async move {
-        let _permit = permit; // held for the whole batch's lifetime
+        // The whole batch's slot, returned by the writer with its BATCH_RESULT.
+        let mut permit = Some(permit);
 
         // Sequential, in array order, never concurrently with each other
         // — see `Batch`'s doc comment for why. Each call still goes
@@ -1141,6 +1340,13 @@ fn spawn_batch(
         // This bounds peak memory to "whatever's already in `results`
         // plus one more call's result," not "every result the batch ever
         // produces."
+        //
+        // One execution lane per batch. `run_invoke` answers a call at its
+        // deadline without stopping its closure, so a call can still be
+        // running after the batch has moved on. The lane keeps the next
+        // call from starting until that closure has really returned: a batch
+        // never has more than one live blocking execution.
+        let lane = Arc::new(Semaphore::new(1));
         let mut results = Vec::with_capacity(batch.calls.len());
         let mut encoded_bytes_so_far: usize = 0;
         for call in batch.calls {
@@ -1155,18 +1361,33 @@ fn spawn_batch(
                 // entry within a batch."
                 stream: None,
             };
-            let deadline = invoke
-                .deadline_ms
-                .map(Duration::from_millis)
-                .unwrap_or(default_deadline);
+            let deadline = effective_deadline(invoke.deadline_ms, default_deadline, max_deadline);
 
-            let outcome = run_invoke(
-                invoke,
-                Arc::clone(&registry),
-                deadline,
-                Arc::clone(&cancel_notify),
-            )
-            .await;
+            // Wait for the lane, bounded by this call's own deadline. A call
+            // that cannot get it in time is answered DEADLINE_EXCEEDED and its
+            // tool is never started.
+            let lane_permit =
+                match tokio::time::timeout(deadline, Arc::clone(&lane).acquire_owned()).await {
+                    Ok(Ok(permit)) => Some(permit),
+                    _ => None,
+                };
+            let outcome = match lane_permit {
+                Some(permit) => {
+                    run_invoke(
+                        invoke,
+                        Arc::clone(&registry),
+                        deadline,
+                        Arc::clone(&cancel_notify),
+                        Arc::clone(&blocking_slots),
+                        Some(permit),
+                    )
+                    .await
+                }
+                None => Err((
+                    ErrorCode::DeadlineExceeded,
+                    "the call's deadline expired while waiting for the batch's previous call to finish".to_string(),
+                )),
+            };
             let was_cancelled = matches!(outcome, Err((ErrorCode::Cancelled, _)));
 
             let mut entry = BatchResultEntry {
@@ -1219,12 +1440,13 @@ fn spawn_batch(
             .unwrap_or_else(|p| p.into_inner())
             .remove(&correlation_id);
 
-        if send(
+        if send_with(
             &tx,
             MessageType::BatchResult,
             correlation_id,
             &BatchResult { results },
             max_frame_len,
+            permit.take(),
         )
         .await
         .is_err()
@@ -1234,11 +1456,26 @@ fn spawn_batch(
     });
 }
 
+/// Runs one tool invocation on a blocking thread, racing its deadline and
+/// cancellation. Used by `INVOKE` and by every call of a `BATCH`.
+///
+/// The caller is answered as soon as the deadline or a cancellation wins
+/// the race, but the blocking closure is not interrupted: Rust cannot stop
+/// a running thread. Its `blocking_slots` permit moves into the closure, so
+/// the slot stays taken until the tool really returns. A tool that ignores
+/// its deadline therefore keeps occupying one slot; once all slots are
+/// taken, new executions are refused with `RESOURCE_EXHAUSTED`.
+///
+/// `extra_permit` (a batch's execution lane, see `spawn_batch`) moves into
+/// the closure with the blocking permit, so it is also released only when
+/// the tool really returns. It is dropped at once if no closure is started.
 async fn run_invoke(
     invoke: Invoke,
     registry: Arc<ToolRegistry>,
     deadline: Duration,
     cancel_notify: Arc<Notify>,
+    blocking_slots: Arc<Semaphore>,
+    extra_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> Result<serde_json::Value, (ErrorCode, String)> {
     let Some(_tool) = registry.get(&invoke.tool) else {
         return Err((
@@ -1246,17 +1483,27 @@ async fn run_invoke(
             format!("no such tool: {}", invoke.tool),
         ));
     };
+    if deadline.is_zero() {
+        return Err(zero_deadline_error());
+    }
+    let Ok(blocking_permit) = Arc::clone(&blocking_slots).try_acquire_owned() else {
+        return Err(blocking_slots_exhausted_error());
+    };
 
     // Looked up again inside the blocking closure (an `Arc` bump, not a
     // deep copy) rather than borrowed across the `spawn_blocking` boundary
     // — see the equivalent comment in `src/transport.rs` for why.
     let tool_name = invoke.tool.clone();
     let args = invoke.args;
+    let token = CancelToken::new();
+    let closure_token = token.clone();
     let task = tokio::task::spawn_blocking(move || {
+        let _blocking_permit = blocking_permit; // released only when the tool returns
+        let _lane_permit = extra_permit; // likewise, for a batch's lane
         let tool = registry
             .get(&tool_name)
             .expect("presence already checked before spawning");
-        tool.invoke(args)
+        tool.invoke_with_cancel(args, &closure_token)
     });
 
     // Races the deadline, explicit cancellation, and the tool actually
@@ -1265,7 +1512,9 @@ async fn run_invoke(
     // nor "cancelled" can forcibly stop a `spawn_blocking` task that's
     // already running. Both guarantee the *caller* gets an answer and the
     // in-flight slot is freed; neither guarantees the tool's own work
-    // actually stopped.
+    // actually stopped. The token is what lets a cooperative tool stop:
+    // it is set on every path where the caller is answered without the
+    // closure's own result.
     tokio::select! {
         result = task => match result {
             Ok(Ok(value)) => Ok(value),
@@ -1273,12 +1522,32 @@ async fn run_invoke(
             Err(join_err) => Err((ErrorCode::InternalError, format!("tool task panicked: {join_err}"))),
         },
         _ = tokio::time::sleep(deadline) => {
+            token.cancel();
             Err((ErrorCode::DeadlineExceeded, "the tool did not complete within the configured deadline".to_string()))
         }
         _ = cancel_notify.notified() => {
+            token.cancel();
             Err((ErrorCode::Cancelled, "the request was cancelled".to_string()))
         }
     }
+}
+
+fn zero_deadline_error() -> (ErrorCode, String) {
+    (
+        ErrorCode::DeadlineExceeded,
+        "the request's effective deadline is zero, so the tool was not started".to_string(),
+    )
+}
+
+fn blocking_slots_exhausted_message() -> &'static str {
+    "too many tool executions in progress"
+}
+
+fn blocking_slots_exhausted_error() -> (ErrorCode, String) {
+    (
+        ErrorCode::ResourceExhausted,
+        blocking_slots_exhausted_message().to_string(),
+    )
 }
 
 fn tool_error_to_code(err: ToolError) -> (ErrorCode, String) {
@@ -1295,10 +1564,22 @@ fn tool_error_to_code(err: ToolError) -> (ErrorCode, String) {
 /// oversized one (a short, fixed string that can never itself trigger
 /// the check it's replacing).
 async fn send_raw<T: serde::Serialize>(
-    tx: &mpsc::Sender<Frame>,
+    tx: &mpsc::Sender<Outgoing>,
     msg_type: MessageType,
     correlation_id: u64,
     payload: &T,
+) -> Result<(), ()> {
+    send_raw_with(tx, msg_type, correlation_id, payload, None).await
+}
+
+/// Like [`send_raw`], but the queued frame carries `permit`, the in-flight
+/// slot of the request it terminates. Only terminal frames pass one.
+async fn send_raw_with<T: serde::Serialize>(
+    tx: &mpsc::Sender<Outgoing>,
+    msg_type: MessageType,
+    correlation_id: u64,
+    payload: &T,
+    permit: Option<OwnedSemaphorePermit>,
 ) -> Result<(), ()> {
     let bytes = codec::encode(payload).map_err(|_| ())?;
     let frame = Frame {
@@ -1306,7 +1587,7 @@ async fn send_raw<T: serde::Serialize>(
         correlation_id,
         payload: bytes,
     };
-    tx.send(frame).await.map_err(|_| ())
+    tx.send(Outgoing { frame, permit }).await.map_err(|_| ())
 }
 
 /// Encodes `payload` and enqueues it — unless the resulting frame would
@@ -1317,11 +1598,24 @@ async fn send_raw<T: serde::Serialize>(
 /// `RESULT`/`ERROR` (a tool's own result or error, e.g.
 /// `filesystem.read`'s file contents) all go through it.
 async fn send<T: serde::Serialize>(
-    tx: &mpsc::Sender<Frame>,
+    tx: &mpsc::Sender<Outgoing>,
     msg_type: MessageType,
     correlation_id: u64,
     payload: &T,
     max_frame_len: u32,
+) -> Result<(), ()> {
+    send_with(tx, msg_type, correlation_id, payload, max_frame_len, None).await
+}
+
+/// Like [`send`], with the terminal-frame `permit` described on
+/// [`send_raw_with`]. The `RESULT_TOO_LARGE` substitute carries it too.
+async fn send_with<T: serde::Serialize>(
+    tx: &mpsc::Sender<Outgoing>,
+    msg_type: MessageType,
+    correlation_id: u64,
+    payload: &T,
+    max_frame_len: u32,
+    permit: Option<OwnedSemaphorePermit>,
 ) -> Result<(), ()> {
     let bytes = codec::encode(payload).map_err(|_| ())?;
     if (wire::HEADER_LEN as u64 + bytes.len() as u64) > max_frame_len as u64 {
@@ -1329,18 +1623,18 @@ async fn send<T: serde::Serialize>(
             code: ErrorCode::ResultTooLarge,
             message: "the response exceeded the configured maximum frame size".to_string(),
         };
-        return send_raw(tx, MessageType::Error, correlation_id, &substitute).await;
+        return send_raw_with(tx, MessageType::Error, correlation_id, &substitute, permit).await;
     }
     let frame = Frame {
         msg_type: msg_type as u8,
         correlation_id,
         payload: bytes,
     };
-    tx.send(frame).await.map_err(|_| ())
+    tx.send(Outgoing { frame, permit }).await.map_err(|_| ())
 }
 
 async fn send_error(
-    tx: &mpsc::Sender<Frame>,
+    tx: &mpsc::Sender<Outgoing>,
     correlation_id: u64,
     code: ErrorCode,
     message: &str,
@@ -1359,13 +1653,36 @@ async fn send_error(
     .await
 }
 
+/// Terminal ERROR that carries the request's in-flight `permit`.
+async fn send_error_with(
+    tx: &mpsc::Sender<Outgoing>,
+    correlation_id: u64,
+    code: ErrorCode,
+    message: &str,
+    max_frame_len: u32,
+    permit: Option<OwnedSemaphorePermit>,
+) -> Result<(), ()> {
+    send_with(
+        tx,
+        MessageType::Error,
+        correlation_id,
+        &ErrorPayload {
+            code,
+            message: message.to_string(),
+        },
+        max_frame_len,
+        permit,
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ast::wire::read_frame;
     use crate::tools::{
-        FilesystemReadTool, IncrementalBytes, StreamingTool, StreamingToolOpen, SystemInfoTool,
-        Tool, ToolError as RegistryToolError,
+        FilesystemReadTool, IncrementalBytes, NoopTool, StreamingTool, StreamingToolOpen,
+        SystemInfoTool, Tool, ToolError as RegistryToolError,
     };
     use serde_json::Value as JsonValue;
     use tokio::net::UnixListener;
@@ -1962,6 +2279,141 @@ mod tests {
         );
         let err: ErrorPayload = codec::decode(&resp.payload).unwrap();
         assert_eq!(err.code, ErrorCode::ResourceExhausted);
+    }
+
+    /// Sends `requests` sequential `system.noop` INVOKEs, each one only after
+    /// the previous terminal frame arrived, so the client never has more than
+    /// one request outstanding. Every one must be answered with RESULT.
+    async fn assert_sequential_requests_are_never_rejected(
+        config: ConnectionConfig,
+        requests: u64,
+    ) {
+        let registry = registry_with(vec![Box::new(NoopTool)]);
+        let (mut client, _dir) = connected_pair_with_registry(registry, config).await;
+        do_hello(&mut client).await;
+        for id in 1..=requests {
+            send_invoke(&mut client, id, "system.noop", Some(5_000)).await;
+            let frame = recv_within(&mut client).await;
+            assert_eq!(
+                frame.correlation_id, id,
+                "terminal frame for the wrong request"
+            );
+            match MessageType::from_u8(frame.msg_type) {
+                Some(MessageType::Result) => {}
+                Some(MessageType::Error) => {
+                    let err: ErrorPayload = codec::decode(&frame.payload).unwrap();
+                    panic!(
+                        "request {id} was refused with {:?}: {}",
+                        err.code, err.message
+                    );
+                }
+                other => panic!("request {id}: unexpected message type {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn client_at_the_advertised_limit_is_never_rejected() {
+        // Sanity regression for the in-flight permit, not a reproduction: the
+        // race it guards against (permit released only after the terminal
+        // frame is already on its way) shows up only under load. Before the
+        // permit moved onto the terminal frame, the 4 x 40-repeat concurrency
+        // stress (`ast-bench --only concurrency --concurrency-levels 64
+        // --repeats 40`) refused one request in 320k with RESOURCE_EXHAUSTED
+        // from the in-flight limit, while this sequential loop never did.
+        // max_in_flight = 1 is the limit the client is told about; blocking
+        // slots are left at their default so only the in-flight permit matters.
+        let config = ConnectionConfig {
+            max_in_flight: 1,
+            ..Default::default()
+        };
+        assert_sequential_requests_are_never_rejected(config, 5_000).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn client_at_the_blocking_limit_is_never_rejected() {
+        // Sanity regression for the blocking-slot permit. The blocking permit
+        // is released inside the blocking closure, before any terminal frame
+        // is queued, so this path has no in-flight race; the load-only race
+        // that does exist is described on the in-flight test above.
+        // Isolates the blocking-slot permit: one blocking slot, in-flight
+        // limit left at its default.
+        let config = ConnectionConfig::default().with_max_blocking_tasks(1);
+        assert_sequential_requests_are_never_rejected(config, 5_000).await;
+    }
+
+    #[tokio::test]
+    async fn slow_reader_cannot_make_the_server_accept_unbounded_requests() {
+        // Large results fill the socket buffer as soon as the client stops
+        // reading, so the server's writer stalls and the output queue fills.
+        // Bound: a frame keeps its in-flight permit while it waits in the
+        // output channel, so a stalled writer caps accepted requests at about
+        // max_in_flight plus the frames the writer already dequeued. Measured
+        // `accepted` on this test: 16 before the permit moved onto the
+        // terminal frame, 8 after.
+        let registry = registry_with(vec![Box::new(BigResultTool {
+            result_bytes: 256 * 1024,
+        })]);
+        let config = ConnectionConfig {
+            max_in_flight: 4,
+            ..Default::default()
+        };
+        const REQUESTS: u64 = 200;
+        let (mut client, _dir) = connected_pair_with_registry(registry, config).await;
+        do_hello(&mut client).await;
+        let (mut read_half, mut write_half) = client.into_split();
+
+        let sender = tokio::spawn(async move {
+            for id in 1..=REQUESTS {
+                let invoke = Invoke {
+                    tool: "test.big_result".to_string(),
+                    args: serde_json::json!({}),
+                    deadline_ms: Some(10_000),
+                    stream: None,
+                };
+                let frame = Frame {
+                    msg_type: MessageType::Invoke as u8,
+                    correlation_id: id,
+                    payload: codec::encode(&invoke).unwrap(),
+                };
+                wire::write_frame(&mut write_half, &frame).await.unwrap();
+            }
+            write_half
+        });
+
+        // Do not read yet: let the server take in as many requests as it will.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let mut accepted = 0u64;
+        let mut refused = 0u64;
+        tokio::time::timeout(Duration::from_secs(20), async {
+            for _ in 0..REQUESTS {
+                let frame = read_frame(&mut read_half, FrameLimits::default())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                match MessageType::from_u8(frame.msg_type) {
+                    Some(MessageType::Result) => accepted += 1,
+                    Some(MessageType::Error) => {
+                        let err: ErrorPayload = codec::decode(&frame.payload).unwrap();
+                        assert_eq!(err.code, ErrorCode::ResourceExhausted);
+                        refused += 1;
+                    }
+                    other => panic!("unexpected message type {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("every request must receive exactly one terminal frame");
+        sender.abort();
+        eprintln!("SLOW_READER accepted={accepted} refused={refused}");
+
+        assert_eq!(accepted + refused, REQUESTS);
+        assert!(refused > 0, "a slow reader must eventually hit the limit");
+        assert!(
+            accepted <= 4 + 64 + 8,
+            "server accepted {accepted} requests from a client that was not reading"
+        );
     }
 
     #[tokio::test]
@@ -3273,5 +3725,971 @@ mod tests {
         let pong = recv_raw(&mut client).await;
         assert_eq!(MessageType::from_u8(pong.msg_type), Some(MessageType::Pong));
         assert_eq!(pong.correlation_id, 2);
+    }
+
+    /// A one-shot latch a test opens to release a blocked tool. Waiting
+    /// uses a condvar with a safety timeout, so a broken test fails
+    /// instead of hanging.
+    #[derive(Clone, Default)]
+    struct Gate(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+
+    impl Gate {
+        fn open(&self) {
+            let (lock, cvar) = &*self.0;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
+        }
+
+        /// Blocks for at most `max`; returns whether the gate was opened.
+        fn wait(&self, max: Duration) -> bool {
+            let (lock, cvar) = &*self.0;
+            let open = lock.lock().unwrap();
+            let (open, _) = cvar.wait_timeout_while(open, max, |o| !*o).unwrap();
+            *open
+        }
+    }
+
+    /// Test tool that announces it started, then holds its blocking slot
+    /// until its gate opens. It never checks the cancellation token, so it
+    /// models a tool that ignores cancellation.
+    struct GateTool {
+        name: &'static str,
+        started: mpsc::UnboundedSender<()>,
+        gate: Gate,
+        finished: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl Tool for GateTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            "test tool that holds its blocking slot until released"
+        }
+        fn input_schema(&self) -> JsonValue {
+            serde_json::json!({})
+        }
+        fn invoke(&self, _args: JsonValue) -> Result<JsonValue, RegistryToolError> {
+            let _ = self.started.send(());
+            let opened = self.gate.wait(Duration::from_secs(5));
+            self.finished
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            if opened {
+                Ok(serde_json::json!({"gate": "opened"}))
+            } else {
+                Err(RegistryToolError::Failed("gate safety timeout".to_string()))
+            }
+        }
+    }
+
+    /// Polls `cond` until it holds; fails the test after a safety timeout.
+    async fn wait_until(what: &str, cond: impl Fn() -> bool) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !cond() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for: {what}"));
+    }
+
+    async fn recv_within(stream: &mut UnixStream) -> Frame {
+        tokio::time::timeout(Duration::from_secs(5), recv_raw(stream))
+            .await
+            .expect("no frame within the safety timeout")
+    }
+
+    async fn send_invoke(stream: &mut UnixStream, id: u64, tool: &str, deadline_ms: Option<u64>) {
+        let invoke = Invoke {
+            tool: tool.to_string(),
+            args: serde_json::json!({}),
+            deadline_ms,
+            stream: None,
+        };
+        send_raw(
+            stream,
+            Frame {
+                msg_type: MessageType::Invoke as u8,
+                correlation_id: id,
+                payload: codec::encode(&invoke).unwrap(),
+            },
+        )
+        .await;
+    }
+
+    /// Reads one frame that must be an ERROR and returns its id and code.
+    async fn recv_error_frame(stream: &mut UnixStream) -> (u64, ErrorCode) {
+        let frame = recv_within(stream).await;
+        assert_eq!(
+            MessageType::from_u8(frame.msg_type),
+            Some(MessageType::Error),
+            "expected an ERROR frame"
+        );
+        let err: ErrorPayload = codec::decode(&frame.payload).unwrap();
+        (frame.correlation_id, err.code)
+    }
+
+    fn gate_tool(
+        name: &'static str,
+        gate: &Gate,
+        finished: &Arc<std::sync::atomic::AtomicBool>,
+        started: &mpsc::UnboundedSender<()>,
+    ) -> Box<dyn Tool> {
+        Box::new(GateTool {
+            name,
+            started: started.clone(),
+            gate: gate.clone(),
+            finished: Arc::clone(finished),
+        })
+    }
+
+    #[tokio::test]
+    async fn deadline_expiry_keeps_the_blocking_slot_until_the_tool_finishes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let gate = Gate::default();
+        let finished = Arc::new(AtomicBool::new(false));
+        let registry = registry_with(vec![
+            gate_tool("test.gate", &gate, &finished, &started_tx),
+            Box::new(NoopTool),
+        ]);
+        let config = ConnectionConfig::default().with_max_blocking_tasks(1);
+        let slots = Arc::clone(&config.blocking_slots);
+        let (mut client, _dir) = connected_pair_with_registry(registry, config).await;
+        do_hello(&mut client).await;
+
+        // 1. The gate tool takes the only slot, then its deadline expires.
+        send_invoke(&mut client, 1, "test.gate", Some(200)).await;
+        assert_eq!(
+            recv_error_frame(&mut client).await,
+            (1, ErrorCode::DeadlineExceeded)
+        );
+        assert_eq!(
+            slots.available_permits(),
+            0,
+            "the slot must stay taken while the tool still runs"
+        );
+
+        // 2. With the slot still held, a new execution is refused.
+        send_invoke(&mut client, 2, "system.noop", Some(5_000)).await;
+        assert_eq!(
+            recv_error_frame(&mut client).await,
+            (2, ErrorCode::ResourceExhausted)
+        );
+
+        // 3. Releasing the tool frees the slot once it actually returns.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), started_rx.recv())
+                .await
+                .expect("tool never started")
+                .is_some()
+        );
+        gate.open();
+        wait_until("the gate tool to finish", || {
+            finished.load(Ordering::SeqCst)
+        })
+        .await;
+        wait_until("the slot to be returned", || slots.available_permits() == 1).await;
+
+        // 4. Recovered: a new execution runs and succeeds.
+        send_invoke(&mut client, 3, "system.noop", Some(5_000)).await;
+        let frame = recv_within(&mut client).await;
+        assert_eq!(frame.correlation_id, 3);
+        assert_eq!(
+            MessageType::from_u8(frame.msg_type),
+            Some(MessageType::Result)
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_deadline_never_starts_the_tool() {
+        use std::sync::atomic::AtomicBool;
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let gate = Gate::default(); // never opened: a started tool would block
+        let finished = Arc::new(AtomicBool::new(false));
+        let registry = registry_with(vec![gate_tool("test.gate", &gate, &finished, &started_tx)]);
+        let config = ConnectionConfig::default().with_max_blocking_tasks(1);
+        let slots = Arc::clone(&config.blocking_slots);
+        let (mut client, _dir) = connected_pair_with_registry(registry, config).await;
+        do_hello(&mut client).await;
+
+        send_invoke(&mut client, 1, "test.gate", Some(0)).await;
+        assert_eq!(
+            recv_error_frame(&mut client).await,
+            (1, ErrorCode::DeadlineExceeded)
+        );
+        assert!(
+            started_rx.try_recv().is_err(),
+            "a zero-deadline request must never start the tool"
+        );
+        assert_eq!(
+            slots.available_permits(),
+            1,
+            "a zero-deadline request must not take a blocking slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn deadline_is_clamped_to_max_deadline() {
+        use std::sync::atomic::AtomicBool;
+        let (started_tx, _started_rx) = mpsc::unbounded_channel();
+        let gate = Gate::default();
+        let finished = Arc::new(AtomicBool::new(false));
+        let registry = registry_with(vec![gate_tool("test.gate", &gate, &finished, &started_tx)]);
+        let config = ConnectionConfig {
+            max_deadline: Duration::from_millis(100),
+            ..Default::default()
+        };
+        let (mut client, _dir) = connected_pair_with_registry(registry, config).await;
+        do_hello(&mut client).await;
+
+        let started = std::time::Instant::now();
+        send_invoke(&mut client, 1, "test.gate", Some(3_600_000)).await;
+        assert_eq!(
+            recv_error_frame(&mut client).await,
+            (1, ErrorCode::DeadlineExceeded)
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "an hour-long request deadline must be clamped to max_deadline ({:?} elapsed)",
+            started.elapsed()
+        );
+
+        gate.open(); // let the blocked tool return so the test runtime can shut down
+    }
+
+    /// Calls that ignore their deadline must not stack up blocking slots in
+    /// one batch: only the first call's tool starts, and every later call is
+    /// answered DEADLINE_EXCEEDED while waiting for the batch's lane.
+    #[tokio::test]
+    async fn batch_with_abandoned_calls_holds_at_most_one_blocking_slot() {
+        use std::sync::atomic::AtomicBool;
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let gate = Gate::default(); // not opened until the batch has answered
+        let finished = Arc::new(AtomicBool::new(false));
+        let registry = registry_with(vec![gate_tool("test.gate", &gate, &finished, &started_tx)]);
+        let config = ConnectionConfig::default();
+        let slots = Arc::clone(&config.blocking_slots);
+        let (mut client, _dir) = connected_pair_with_registry(registry, config).await;
+        do_hello(&mut client).await;
+
+        let batch = Batch {
+            calls: (10..15)
+                .map(|id| BatchInvoke {
+                    id,
+                    tool: "test.gate".to_string(),
+                    args: serde_json::json!({}),
+                    deadline_ms: Some(50),
+                })
+                .collect(),
+        };
+        send_raw(
+            &mut client,
+            Frame {
+                msg_type: MessageType::Batch as u8,
+                correlation_id: 1,
+                payload: codec::encode(&batch).unwrap(),
+            },
+        )
+        .await;
+        let frame = recv_within(&mut client).await;
+        assert_eq!(
+            MessageType::from_u8(frame.msg_type),
+            Some(MessageType::BatchResult)
+        );
+        let result: BatchResult = codec::decode(&frame.payload).unwrap();
+        let ids: Vec<u64> = result.results.iter().map(|e| e.id).collect();
+        assert_eq!(ids, vec![10, 11, 12, 13, 14]);
+        for entry in &result.results {
+            assert!(
+                matches!(
+                    entry.outcome,
+                    BatchOutcome::Error {
+                        code: ErrorCode::DeadlineExceeded,
+                        ..
+                    }
+                ),
+                "call {} should have been answered DEADLINE_EXCEEDED",
+                entry.id
+            );
+        }
+        next_signal(&mut started_rx).await;
+        assert!(
+            started_rx.try_recv().is_err(),
+            "only the first call's tool may start"
+        );
+
+        // Sampled after the BATCH_RESULT, and again while the tool is still held.
+        assert!(slots.available_permits() >= 63);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(slots.available_permits() >= 63);
+
+        gate.open();
+        wait_until("the batch's slot to be returned", || {
+            slots.available_permits() == 64
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn batch_calls_respect_blocking_slots() {
+        use std::sync::atomic::AtomicBool;
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let gate = Gate::default();
+        let finished = Arc::new(AtomicBool::new(false));
+        let registry = registry_with(vec![
+            gate_tool("test.gate", &gate, &finished, &started_tx),
+            Box::new(NoopTool),
+        ]);
+        let config = ConnectionConfig::default().with_max_blocking_tasks(1);
+        let (mut client, _dir) = connected_pair_with_registry(registry, config).await;
+        do_hello(&mut client).await;
+
+        // Occupy the only slot with a standalone INVOKE.
+        send_invoke(&mut client, 1, "test.gate", Some(5_000)).await;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), started_rx.recv())
+                .await
+                .expect("tool never started")
+                .is_some()
+        );
+
+        let batch = Batch {
+            calls: vec![
+                BatchInvoke {
+                    id: 10,
+                    tool: "system.noop".to_string(),
+                    args: serde_json::json!({}),
+                    deadline_ms: Some(5_000),
+                },
+                BatchInvoke {
+                    id: 11,
+                    tool: "system.noop".to_string(),
+                    args: serde_json::json!({}),
+                    deadline_ms: Some(5_000),
+                },
+            ],
+        };
+        send_raw(
+            &mut client,
+            Frame {
+                msg_type: MessageType::Batch as u8,
+                correlation_id: 2,
+                payload: codec::encode(&batch).unwrap(),
+            },
+        )
+        .await;
+        let frame = recv_within(&mut client).await;
+        assert_eq!(
+            MessageType::from_u8(frame.msg_type),
+            Some(MessageType::BatchResult)
+        );
+        let result: BatchResult = codec::decode(&frame.payload).unwrap();
+        assert_eq!(result.results.len(), 2);
+        for entry in &result.results {
+            match &entry.outcome {
+                BatchOutcome::Error { code, .. } => {
+                    assert_eq!(*code, ErrorCode::ResourceExhausted, "call {}", entry.id)
+                }
+                BatchOutcome::Ok { .. } => {
+                    panic!("call {} ran although the only slot was taken", entry.id)
+                }
+            }
+        }
+
+        // Release the holder so its own RESULT arrives and the slot returns.
+        gate.open();
+        let holder = recv_within(&mut client).await;
+        assert_eq!(holder.correlation_id, 1);
+        assert_eq!(
+            MessageType::from_u8(holder.msg_type),
+            Some(MessageType::Result)
+        );
+    }
+
+    /// Like `GateTool`, but cooperative: it checks the cancellation token at
+    /// every checkpoint, which here is each 5ms slice of waiting on the gate.
+    struct CoopGateTool {
+        name: &'static str,
+        started: mpsc::UnboundedSender<()>,
+        gate: Gate,
+        finished: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl Tool for CoopGateTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            "test tool that stops at its next checkpoint once cancelled"
+        }
+        fn input_schema(&self) -> JsonValue {
+            serde_json::json!({})
+        }
+        fn invoke(&self, args: JsonValue) -> Result<JsonValue, RegistryToolError> {
+            self.invoke_with_cancel(args, &CancelToken::new())
+        }
+        fn invoke_with_cancel(
+            &self,
+            _args: JsonValue,
+            cancel: &CancelToken,
+        ) -> Result<JsonValue, RegistryToolError> {
+            let _ = self.started.send(());
+            // Long on purpose: tests that check cancellation must pass only
+            // because the token propagated, never because this timed out.
+            let safety = std::time::Instant::now() + Duration::from_secs(30);
+            let outcome = loop {
+                if cancel.is_cancelled() {
+                    break Err(RegistryToolError::Failed(
+                        "stopped at a checkpoint after cancellation".to_string(),
+                    ));
+                }
+                if self.gate.wait(Duration::from_millis(5)) {
+                    break Ok(serde_json::json!({"gate": "opened"}));
+                }
+                if std::time::Instant::now() >= safety {
+                    break Err(RegistryToolError::Failed("gate safety timeout".to_string()));
+                }
+            };
+            self.finished
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            outcome
+        }
+    }
+
+    fn coop_gate_tool(
+        name: &'static str,
+        gate: &Gate,
+        finished: &Arc<std::sync::atomic::AtomicBool>,
+        started: &mpsc::UnboundedSender<()>,
+    ) -> Box<dyn Tool> {
+        Box::new(CoopGateTool {
+            name,
+            started: started.clone(),
+            gate: gate.clone(),
+            finished: Arc::clone(finished),
+        })
+    }
+
+    async fn next_signal(rx: &mut mpsc::UnboundedReceiver<()>) {
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("signal not received within the safety timeout")
+            .expect("signal sender dropped");
+    }
+
+    async fn send_cancel(stream: &mut UnixStream, correlation_id: u64, target: u64) {
+        let cancel = Cancel {
+            target_correlation_id: target,
+        };
+        send_raw(
+            stream,
+            Frame {
+                msg_type: MessageType::Cancel as u8,
+                correlation_id,
+                payload: codec::encode(&cancel).unwrap(),
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn cooperative_tool_stops_on_cancel_and_releases_its_slot() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let gate = Gate::default(); // never opened: only cancellation can end the tool
+        let finished = Arc::new(AtomicBool::new(false));
+        let registry = registry_with(vec![
+            coop_gate_tool("test.coop", &gate, &finished, &started_tx),
+            Box::new(NoopTool),
+        ]);
+        let config = ConnectionConfig::default().with_max_blocking_tasks(1);
+        let slots = Arc::clone(&config.blocking_slots);
+        let (mut client, _dir) = connected_pair_with_registry(registry, config).await;
+        do_hello(&mut client).await;
+
+        send_invoke(&mut client, 1, "test.coop", Some(10_000)).await;
+        next_signal(&mut started_rx).await;
+        send_cancel(&mut client, 2, 1).await;
+
+        // The tool's safety is 30s, so only the token can stop it in time.
+        wait_until_within(
+            "the cooperative tool to stop after CANCEL",
+            Duration::from_secs(2),
+            || finished.load(Ordering::SeqCst),
+        )
+        .await;
+        wait_until_within(
+            "the slot to be returned after CANCEL",
+            Duration::from_secs(2),
+            || slots.available_permits() == 1,
+        )
+        .await;
+        assert_eq!(
+            recv_error_frame(&mut client).await,
+            (1, ErrorCode::Cancelled)
+        );
+
+        send_invoke(&mut client, 3, "system.noop", Some(5_000)).await;
+        let frame = recv_within(&mut client).await;
+        assert_eq!(frame.correlation_id, 3);
+        assert_eq!(
+            MessageType::from_u8(frame.msg_type),
+            Some(MessageType::Result)
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_cancel_yields_one_terminal() {
+        use std::sync::atomic::AtomicBool;
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let gate = Gate::default();
+        let finished = Arc::new(AtomicBool::new(false));
+        let registry = registry_with(vec![coop_gate_tool(
+            "test.coop",
+            &gate,
+            &finished,
+            &started_tx,
+        )]);
+        let (mut client, _dir) =
+            connected_pair_with_registry(registry, ConnectionConfig::default()).await;
+        do_hello(&mut client).await;
+
+        send_invoke(&mut client, 1, "test.coop", Some(10_000)).await;
+        next_signal(&mut started_rx).await;
+        for cancel_id in [2, 3, 4] {
+            send_cancel(&mut client, cancel_id, 1).await;
+        }
+
+        assert_eq!(
+            recv_error_frame(&mut client).await,
+            (1, ErrorCode::Cancelled)
+        );
+        // A second terminal for id 1 would arrive here instead of the PONG.
+        send_raw(
+            &mut client,
+            Frame {
+                msg_type: MessageType::Ping as u8,
+                correlation_id: 5,
+                payload: codec::encode(&Ping {}).unwrap(),
+            },
+        )
+        .await;
+        let pong = recv_within(&mut client).await;
+        assert_eq!(pong.correlation_id, 5);
+        assert_eq!(MessageType::from_u8(pong.msg_type), Some(MessageType::Pong));
+    }
+
+    #[tokio::test]
+    async fn cancel_one_of_several_concurrent_requests() {
+        use std::sync::atomic::AtomicBool;
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let gate = Gate::default();
+        let finished = Arc::new(AtomicBool::new(false));
+        let registry = registry_with(vec![coop_gate_tool(
+            "test.coop",
+            &gate,
+            &finished,
+            &started_tx,
+        )]);
+        let (mut client, _dir) =
+            connected_pair_with_registry(registry, ConnectionConfig::default()).await;
+        do_hello(&mut client).await;
+
+        for id in 1..=4 {
+            send_invoke(&mut client, id, "test.coop", Some(10_000)).await;
+        }
+        for _ in 0..4 {
+            next_signal(&mut started_rx).await;
+        }
+        send_cancel(&mut client, 10, 2).await;
+        assert_eq!(
+            recv_error_frame(&mut client).await,
+            (2, ErrorCode::Cancelled)
+        );
+
+        // The other three were not cancelled: release them and expect RESULTs.
+        gate.open();
+        let mut completed = Vec::new();
+        for _ in 0..3 {
+            let frame = recv_within(&mut client).await;
+            assert_eq!(
+                MessageType::from_u8(frame.msg_type),
+                Some(MessageType::Result)
+            );
+            completed.push(frame.correlation_id);
+        }
+        completed.sort_unstable();
+        assert_eq!(completed, vec![1, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn late_completion_after_cancel_sends_nothing() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let gate = Gate::default();
+        let finished = Arc::new(AtomicBool::new(false));
+        // Non-cooperative: ignores the token and only returns when released.
+        let registry = registry_with(vec![gate_tool("test.gate", &gate, &finished, &started_tx)]);
+        let (mut client, _dir) =
+            connected_pair_with_registry(registry, ConnectionConfig::default()).await;
+        do_hello(&mut client).await;
+
+        send_invoke(&mut client, 1, "test.gate", Some(10_000)).await;
+        next_signal(&mut started_rx).await;
+        send_cancel(&mut client, 2, 1).await;
+        assert_eq!(
+            recv_error_frame(&mut client).await,
+            (1, ErrorCode::Cancelled)
+        );
+
+        // The tool finishes only now, after its caller was already answered.
+        gate.open();
+        wait_until("the non-cooperative tool to finish", || {
+            finished.load(Ordering::SeqCst)
+        })
+        .await;
+        let quiet = tokio::time::timeout(Duration::from_millis(200), recv_raw(&mut client)).await;
+        assert!(
+            quiet.is_err(),
+            "a completion after cancellation must not send any frame"
+        );
+
+        send_raw(
+            &mut client,
+            Frame {
+                msg_type: MessageType::Ping as u8,
+                correlation_id: 3,
+                payload: codec::encode(&Ping {}).unwrap(),
+            },
+        )
+        .await;
+        let pong = recv_within(&mut client).await;
+        assert_eq!(pong.correlation_id, 3);
+        assert_eq!(MessageType::from_u8(pong.msg_type), Some(MessageType::Pong));
+    }
+
+    #[tokio::test]
+    async fn id_reuse_right_after_terminal_is_accepted_and_answered_once() {
+        let registry = registry_with(vec![Box::new(NoopTool)]);
+        let (mut client, _dir) =
+            connected_pair_with_registry(registry, ConnectionConfig::default()).await;
+        do_hello(&mut client).await;
+
+        // Each round waits for the terminal before reusing the same id, the
+        // only reuse a well-behaved client may make. Any duplicate-id ERROR
+        // would fail the round.
+        for round in 0..200 {
+            send_invoke(&mut client, 7, "system.noop", Some(5_000)).await;
+            let frame = recv_within(&mut client).await;
+            assert_eq!(
+                MessageType::from_u8(frame.msg_type),
+                Some(MessageType::Result),
+                "round {round}"
+            );
+            assert_eq!(frame.correlation_id, 7, "round {round}");
+        }
+    }
+
+    #[tokio::test]
+    async fn abrupt_disconnect_cancels_cooperative_work_and_frees_the_slot() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::AsyncWriteExt;
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let gate = Gate::default(); // never opened: only cancellation can end the tool
+        let finished = Arc::new(AtomicBool::new(false));
+        let registry = registry_with(vec![coop_gate_tool(
+            "test.coop",
+            &gate,
+            &finished,
+            &started_tx,
+        )]);
+        let config = ConnectionConfig::default().with_max_blocking_tasks(1);
+        let slots = Arc::clone(&config.blocking_slots);
+        let (mut client, _dir) = connected_pair_with_registry(registry, config).await;
+        do_hello(&mut client).await;
+
+        send_invoke(&mut client, 1, "test.coop", Some(10_000)).await;
+        next_signal(&mut started_rx).await;
+
+        // Mechanism: a frame header announcing a 100-byte payload, followed by
+        // only 10 payload bytes, and then the socket is dropped. Unix sockets
+        // have no RST, so this is how the test makes the server's read fail
+        // mid-frame (`FrameError::Incomplete`) rather than see a clean EOF.
+        let mut partial = Vec::new();
+        partial.extend_from_slice(&((1 + 8 + 100) as u32).to_be_bytes());
+        partial.push(MessageType::Ping as u8);
+        partial.extend_from_slice(&9u64.to_be_bytes());
+        partial.extend_from_slice(&[0u8; 10]);
+        client.write_all(&partial).await.unwrap();
+        drop(client);
+
+        wait_until_within(
+            "the cooperative tool to stop after the disconnect",
+            Duration::from_secs(2),
+            || finished.load(Ordering::SeqCst),
+        )
+        .await;
+        wait_until_within(
+            "the slot to be returned after the disconnect",
+            Duration::from_secs(2),
+            || slots.available_permits() == 1,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn clean_fin_drains_and_holds_the_slot_until_done() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::AsyncWriteExt;
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let gate = Gate::default();
+        let finished = Arc::new(AtomicBool::new(false));
+        // Non-cooperative: only the gate can end it, never the connection's EOF.
+        let registry = registry_with(vec![gate_tool("test.gate", &gate, &finished, &started_tx)]);
+        let config = ConnectionConfig::default().with_max_blocking_tasks(1);
+        let slots = Arc::clone(&config.blocking_slots);
+        let (mut client, _dir) = connected_pair_with_registry(registry, config).await;
+        do_hello(&mut client).await;
+
+        send_invoke(&mut client, 1, "test.gate", Some(10_000)).await;
+        next_signal(&mut started_rx).await;
+
+        // Half-close: the server reads a clean EOF between frames, which must
+        // keep the in-flight request rather than cancel it.
+        client.shutdown().await.unwrap();
+        let early = tokio::time::timeout(Duration::from_millis(200), recv_raw(&mut client)).await;
+        assert!(
+            early.is_err(),
+            "nothing may be sent before the tool completes"
+        );
+        assert!(!finished.load(Ordering::SeqCst));
+        assert_eq!(slots.available_permits(), 0, "the slot is still held");
+
+        gate.open();
+        let frame = recv_within(&mut client).await;
+        assert_eq!(frame.correlation_id, 1);
+        assert_eq!(
+            MessageType::from_u8(frame.msg_type),
+            Some(MessageType::Result)
+        );
+        wait_until("the slot to be returned", || slots.available_permits() == 1).await;
+    }
+
+    /// A tool that panics inside its blocking closure.
+    struct PanicTool;
+    impl Tool for PanicTool {
+        fn name(&self) -> &str {
+            "test.panic"
+        }
+        fn description(&self) -> &str {
+            "always panics, for tests"
+        }
+        fn input_schema(&self) -> JsonValue {
+            serde_json::json!({})
+        }
+        fn invoke(&self, _args: JsonValue) -> Result<JsonValue, RegistryToolError> {
+            panic!("deliberate test panic")
+        }
+    }
+
+    /// A panic in a tool must not leak its blocking slot or wedge the
+    /// connection: the client gets INTERNAL_ERROR, the slot comes back, and
+    /// later requests still run.
+    #[tokio::test]
+    async fn a_panicking_tool_releases_its_permits_and_reports_an_internal_error() {
+        let registry = registry_with(vec![Box::new(PanicTool), Box::new(NoopTool)]);
+        let config = ConnectionConfig::default().with_max_blocking_tasks(1);
+        let slots = Arc::clone(&config.blocking_slots);
+        let (mut client, _dir) = connected_pair_with_registry(registry, config).await;
+        do_hello(&mut client).await;
+
+        send_invoke(&mut client, 1, "test.panic", Some(5_000)).await;
+        assert_eq!(
+            recv_error_frame(&mut client).await,
+            (1, ErrorCode::InternalError)
+        );
+        wait_until_within(
+            "the panicked tool's slot to be returned",
+            Duration::from_secs(2),
+            || slots.available_permits() == 1,
+        )
+        .await;
+
+        send_raw(
+            &mut client,
+            Frame {
+                msg_type: MessageType::Ping as u8,
+                correlation_id: 2,
+                payload: codec::encode(&Ping {}).unwrap(),
+            },
+        )
+        .await;
+        let pong = recv_within(&mut client).await;
+        assert_eq!(MessageType::from_u8(pong.msg_type), Some(MessageType::Pong));
+        assert_eq!(pong.correlation_id, 2);
+
+        // The single slot is usable again, so a normal call still succeeds.
+        send_invoke(&mut client, 3, "system.noop", Some(5_000)).await;
+        let frame = recv_within(&mut client).await;
+        assert_eq!(frame.correlation_id, 3);
+        assert_eq!(
+            MessageType::from_u8(frame.msg_type),
+            Some(MessageType::Result)
+        );
+    }
+
+    /// Polls `cond` until it holds, failing after `max`. Unlike `wait_until`,
+    /// the bound is set by the caller, so tests can assert a tight deadline.
+    async fn wait_until_within(what: &str, max: Duration, cond: impl Fn() -> bool) {
+        tokio::time::timeout(max, async {
+            while !cond() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out after {max:?} waiting for: {what}"));
+    }
+
+    /// Limitation under test: a Unix socket cannot tell a half-close from a
+    /// full close until a write fails. After a clean EOF the connection keeps
+    /// draining, so the first failed write (here, A's RESULT after the peer
+    /// is gone) must cancel the rest of the connection's in-flight work.
+    #[tokio::test]
+    async fn write_failure_after_clean_eof_cancels_remaining_in_flight_work() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::AsyncWriteExt;
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        // A finishes once released, so its RESULT is the first write.
+        let gate_a = Gate::default();
+        let finished_a = Arc::new(AtomicBool::new(false));
+        // B is cooperative and never released: only cancellation can end it.
+        let gate_b = Gate::default();
+        let finished_b = Arc::new(AtomicBool::new(false));
+        let registry = registry_with(vec![
+            gate_tool("test.a", &gate_a, &finished_a, &started_tx),
+            coop_gate_tool("test.b", &gate_b, &finished_b, &started_tx),
+        ]);
+        let config = ConnectionConfig::default();
+        let slots = Arc::clone(&config.blocking_slots);
+        let total = slots.available_permits();
+        let (mut client, _dir) = connected_pair_with_registry(registry, config).await;
+        do_hello(&mut client).await;
+
+        send_invoke(&mut client, 1, "test.a", Some(10_000)).await;
+        send_invoke(&mut client, 2, "test.b", Some(10_000)).await;
+        next_signal(&mut started_rx).await;
+        next_signal(&mut started_rx).await;
+
+        // Clean half-close: the server reads EOF and keeps both requests.
+        client.shutdown().await.unwrap();
+        // The test runtime is single-threaded: sleep so the server reads the
+        // EOF first. Otherwise the failing write ends `serve_reads` through
+        // the select's drop, and the test would not exercise the writer's
+        // own cancellation.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Then the peer disappears completely, and only now does A finish.
+        drop(client);
+        gate_a.open();
+
+        wait_until_within(
+            "B to observe the cancellation",
+            Duration::from_secs(2),
+            || finished_b.load(Ordering::SeqCst),
+        )
+        .await;
+        wait_until_within("both slots to be returned", Duration::from_secs(2), || {
+            slots.available_permits() == total
+        })
+        .await;
+    }
+
+    /// Shutdown must cancel a request whose connection is half-closed. The
+    /// test client keeps reading after its write side is closed, so it
+    /// receives the terminal `ERROR(Cancelled)` that the drain delivers.
+    #[tokio::test]
+    async fn shutdown_cancels_half_closed_connections() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::AsyncWriteExt;
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let gate = Gate::default(); // never opened: only shutdown can end it
+        let finished = Arc::new(AtomicBool::new(false));
+        let registry = registry_with(vec![coop_gate_tool(
+            "test.coop",
+            &gate,
+            &finished,
+            &started_tx,
+        )]);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let config = ConnectionConfig {
+            shutdown: shutdown_rx,
+            ..Default::default()
+        };
+        let (mut client, _dir) = connected_pair_with_registry(registry, config).await;
+        do_hello(&mut client).await;
+
+        send_invoke(&mut client, 1, "test.coop", Some(10_000)).await;
+        next_signal(&mut started_rx).await;
+        client.shutdown().await.unwrap();
+        // Give the server time to read the EOF, so shutdown hits the
+        // half-closed state rather than the still-reading one.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        shutdown_tx.send(true).unwrap();
+        wait_until_within(
+            "the half-closed request to stop",
+            Duration::from_secs(2),
+            || finished.load(Ordering::SeqCst),
+        )
+        .await;
+        assert_eq!(
+            recv_error_frame(&mut client).await,
+            (1, ErrorCode::Cancelled)
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_signal_cancels_in_flight_requests_and_closes_cleanly() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let gate = Gate::default(); // never opened: only shutdown can end the tool
+        let finished = Arc::new(AtomicBool::new(false));
+        let registry = registry_with(vec![coop_gate_tool(
+            "test.coop",
+            &gate,
+            &finished,
+            &started_tx,
+        )]);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let config = ConnectionConfig {
+            shutdown: shutdown_rx,
+            ..Default::default()
+        };
+        let (mut client, _dir) = connected_pair_with_registry(registry, config).await;
+        do_hello(&mut client).await;
+
+        send_invoke(&mut client, 1, "test.coop", Some(10_000)).await;
+        next_signal(&mut started_rx).await;
+
+        shutdown_tx.send(true).unwrap();
+        // The tool's safety is 30s, so only the shutdown's cancellation can stop it in time.
+        wait_until_within(
+            "the cooperative tool to stop after shutdown",
+            Duration::from_secs(2),
+            || finished.load(Ordering::SeqCst),
+        )
+        .await;
+        assert_eq!(
+            recv_error_frame(&mut client).await,
+            (1, ErrorCode::Cancelled)
+        );
+
+        // After its terminal frame the connection closes: a clean EOF, not a hang.
+        let after = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_frame(&mut client, FrameLimits::default()),
+        )
+        .await
+        .expect("connection did not close after shutdown")
+        .expect("read after shutdown failed");
+        assert!(after.is_none(), "expected EOF after the terminal frame");
     }
 }

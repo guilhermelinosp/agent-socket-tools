@@ -1,0 +1,7 @@
+run 1 main exit=0
+run 1 tip exit=0
+run 2 main exit=0
+run 2 tip exit=0
+run 3 main exit=0
+run 3 tip exit=0
+ALLDONE

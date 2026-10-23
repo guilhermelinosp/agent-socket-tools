@@ -54,7 +54,7 @@ fn note_failures(phase: &str, cell: &Cell) {
         eprintln!(
             "  WARNING: {} {phase} errors; first: {}",
             cell.errors,
-            cell.first_error.as_deref().unwrap_or("unknown")
+            cell.first_error().unwrap_or("unknown")
         );
     }
 }
@@ -170,10 +170,13 @@ async fn startup_once(proto: &str, fixtures: &Path, sockets: &Path) -> Result<f6
 /// `system.info`. AST `ping` is reported as a separate, non-comparable row.
 pub async fn noop_and_info(cfg: &Config, p: &mut Persistent) -> Vec<Entry> {
     let mut out = Vec::new();
-    for (scenario, op) in [
-        ("noop_sequential", Op::noop()),
-        ("info_sequential", Op::info()),
+    for (name, scenario, op) in [
+        ("noop", "noop_sequential", Op::noop()),
+        ("info", "info_sequential", Op::info()),
     ] {
+        if !cfg.wants(name) {
+            continue;
+        }
         let params = json!({ "tool": op_tool(&op), "iterations": cfg.iterations, "connection": "persistent" });
         out.push(Entry::new(
             scenario,
@@ -206,20 +209,23 @@ pub async fn noop_and_info(cfg: &Config, p: &mut Persistent) -> Vec<Entry> {
         ));
     }
 
-    let mut runs = Vec::with_capacity(cfg.repeats);
-    for r in 1..=cfg.repeats {
-        progress("noop_sequential", AST_PING, r, cfg.repeats);
-        let _ = ping_sequential(&p.ast, cfg.warmup).await;
-        let cell = ping_sequential(&p.ast, cfg.iterations).await;
-        runs.push(Run::from_cell(&cell, cfg.raw));
+    // The AST ping floor belongs to the no-op scenario's table.
+    if cfg.wants("noop") {
+        let mut runs = Vec::with_capacity(cfg.repeats);
+        for r in 1..=cfg.repeats {
+            progress("noop_sequential", AST_PING, r, cfg.repeats);
+            let _ = ping_sequential(&p.ast, cfg.warmup).await;
+            let cell = ping_sequential(&p.ast, cfg.iterations).await;
+            runs.push(Run::from_cell(&cell, cfg.raw));
+        }
+        out.push(Entry::new(
+            "noop_sequential",
+            AST_PING,
+            json!({ "op": "ping", "note": "protocol floor, not comparable to tool calls" }),
+            runs,
+            cfg.raw,
+        ));
     }
-    out.push(Entry::new(
-        "noop_sequential",
-        AST_PING,
-        json!({ "op": "ping", "note": "protocol floor, not comparable to tool calls" }),
-        runs,
-        cfg.raw,
-    ));
     out
 }
 
@@ -376,7 +382,7 @@ async fn run_group(mode: BatchMode, p: &mut Persistent) -> Result<(), String> {
         BatchMode::AstSequential => {
             let mut ast = AstHandle(p.ast.clone());
             let cell = sequential(&mut ast, &Op::noop(), GROUP).await;
-            match cell.first_error {
+            match cell.first_error().map(str::to_owned) {
                 Some(e) => Err(e),
                 None => Ok(()),
             }
@@ -408,7 +414,7 @@ async fn run_group(mode: BatchMode, p: &mut Persistent) -> Result<(), String> {
                 .mcp_real
                 .pipelined(GROUP, GROUP, "system.noop", &json!({}), Expect::Empty)
                 .await;
-            match cell.first_error {
+            match cell.first_error().map(str::to_owned) {
                 Some(e) if cell.errors > 0 => Err(e),
                 _ => Ok(()),
             }
@@ -763,7 +769,11 @@ async fn measure_cpu<T: Target>(cfg: &Config, target: &mut T, pid: u32) -> Vec<R
                 run.extra
                     .insert("server_cpu_us_per_op".to_string(), json!(per_op));
             }
-            _ => run.errors += 1,
+            _ => {
+                run.errors += 1;
+                run.error_samples
+                    .push("server CPU time unavailable (ps failed or no successful calls)".into());
+            }
         }
         runs.push(run);
     }
