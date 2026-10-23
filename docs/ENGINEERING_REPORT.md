@@ -66,7 +66,7 @@ Concurrency 1: AST 43,545 vs MCP 32,485 ops/s (1.34×). Differences under ~7% ar
 
 ## (f) CI
 
-Remote CI for the previously merged `main` commit fa4061d: all 7 jobs passed (run 39869107197: fmt, audit, clippy and test on Linux and macOS, Python interop). The hardening stack (branches hardening/lifecycle → hardening/filesystem-bench → hardening/lifecycle-fixes → hardening/inflight-release, tip 34f06ed) was validated locally only (fmt, clippy -D warnings, 240 Rust tests, Python interop tests from the earlier iteration); its remote CI result is not yet observed.
+Remote CI for the merged `main` commit fa4061d: all 7 jobs passed (run 39869107197). Remote CI for the hardening stack (tip 746c084, draft PR #1): all 7 jobs passed (run 39877014145): cargo fmt --check, cargo audit, clippy and test on Linux and macOS (the Linux test job also runs the quick ast-bench smoke test), and Python SDK interop against the real ast-server. Benchmarks are not run in CI; the numbers in this report come from local release runs on one machine.
 
 ## (g) Remaining risks and next steps
 
