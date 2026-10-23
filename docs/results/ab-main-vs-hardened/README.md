@@ -6,15 +6,19 @@ Three rounds, alternating `main-N` and `tip-N` (`run-ab.sh`). Files: `<side>-<ro
 
 ## What each side is
 
-- **main**: `ast-bench` and the server binaries built from commit fa4061d. The client
-  is a separate binary from the tip client (sha256 differs), so the two sides do not share
-  one client binary.
-- **tip**: `ast-bench` and the server binaries of the hardened branch, built from the
-  working tree while HEAD was 13a577d.
+- **main**: the server binaries built from commit fa4061d (worktree build).
+- **tip**: the server binaries of the hardened branch, built into `target/release` at the
+  state of hardening/lifecycle-fixes (13a577d).
 
-Differences therefore reflect the build of client and servers together, not server code
-alone. The `git_rev` field inside each JSON is `git rev-parse` of the repository the run
-was started from; it reads 13a577d for all six runs and does not identify the binaries.
+Both sides ran the same ast-bench client binary: the harness binary was copied from
+`target/release` immediately before the runs, with no rebuild in between. The copy in the
+scratchpad was not preserved in this repository, and `target/release/ast-bench` has been
+rebuilt since, so its current hash cannot be used to verify this; the claim rests on the
+order of operations, not on a stored hash.
+
+Differences therefore reflect the server builds only. The `git_rev` field inside each JSON
+is `git rev-parse` of the repository the run was started from; it reads 13a577d for all six
+runs and does not identify the binaries.
 
 `run-ab.sh` uses absolute paths from the original development machine
 (`SCR` = scratchpad, `TIP` = repository checkout). Edit them before reusing it.
