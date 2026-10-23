@@ -208,3 +208,5 @@ The interpretation and the target-by-target verdicts are in the
 ["MCP comparison"](AST_PROTOCOL.md#mcp-comparison) section of `docs/AST_PROTOCOL.md`.
 
 Wire-path optimization run (commit `26fe02d`, same machine and toolchain): [`results/bench-2026-10-22-wire-opt.md`](results/bench-2026-10-22-wire-opt.md) and [`results/bench-2026-10-22-wire-opt.json`](results/bench-2026-10-22-wire-opt.json). Allocator calls per call are measured by `alloc-probe` (`cargo run --release --bin alloc-probe`, client and server in one process, sequential), not by `ast-bench`; raw data in [`results/alloc-baseline.json`](results/alloc-baseline.json) and [`results/alloc-after-wire.json`](results/alloc-after-wire.json).
+
+Final release run (commit `34f06ed`, zero errors in every cell): [`results/2026-10-22-34f06ed/`](results/2026-10-22-34f06ed/) (`bench.md`, `bench.json`, `alloc.md`, `alloc.json`, `ENV.txt`). The pre-fix run that retains one error is in [`results/2026-10-22-13a577d/`](results/2026-10-22-13a577d/). An index of every file in `docs/results/` and how to reproduce a run is in [`results/README.md`](results/README.md).

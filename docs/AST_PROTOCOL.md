@@ -580,6 +580,15 @@ Two changes to `src/ast/wire.rs` and the connection setup: frames with payloads 
 
 Reading: sequential single-call latency did not change beyond noise. In this run AST `system.noop` p50 was 32.7 µs against 32.1 µs for the real MCP server (30.9 µs in the earlier run), i.e. parity within noise, not a measured win. The gains are in concurrent and multiplexed cells, where per-frame syscalls matter: AST on one connection now reaches 2.8× the throughput of a pipelined MCP connection at C=4 (124,545 vs 43,803 ops/s; 2.1× before). One cell moved the wrong way — C=64 with one connection per caller, 411.0 → 457.8 µs (+11%) — and was not re-run, so it is reported as unexplained rather than as noise. The −2 allocator calls were not attributed to the read or the write side. Raw results: `docs/results/bench-2026-10-22-wire-opt.{md,json}`, `docs/results/alloc-baseline.json`, `docs/results/alloc-after-wire.json`.
 
+### Final comparison (commit 34f06ed)
+
+The full table, methodology and objective status are in [ENGINEERING_REPORT.md](ENGINEERING_REPORT.md); raw data are in `docs/results/2026-10-22-34f06ed/`. This subsection supersedes the targets table above. The numbers in the earlier subsections are historical and dated.
+
+- Sequential latency: parity with the real MCP server (`system.noop` p50 30.1 vs 31.0 µs), not the 2× target. AST `ping`, which does no tool work, costs 19.2 µs.
+- Concurrent throughput: 2.8× (C=4), 2.7× (C=16) and 3.1× (C=64) the real MCP server, with lower p99 at C=16 and C=64.
+- Server CPU per `system.noop`: 23.0 vs 42.0 µs (−45%).
+- Startup is slower (5.67 vs 3.17 ms); peak RSS is a tie (9,184 vs 9,392 KiB).
+
 ## Cross-language interoperability
 
 This document, plus [Framing](#framing), [Serialization](#serialization),
