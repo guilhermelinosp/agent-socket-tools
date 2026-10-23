@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::BufReader;
 use tokio::net::UnixStream;
-use tokio::sync::{mpsc, watch, Notify, Semaphore};
+use tokio::sync::{mpsc, watch, Notify, OwnedSemaphorePermit, Semaphore};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerPolicy {
@@ -253,7 +253,7 @@ pub async fn run_connection(
     // One buffered read half per connection, shared by the handshake and the
     // steady-state loop, so bytes buffered after HELLO are never lost.
     let read_half = BufReader::with_capacity(READ_BUF_CAPACITY, read_half);
-    let (tx, mut rx) = mpsc::channel::<Frame>(64);
+    let (tx, mut rx) = mpsc::channel::<Outgoing>(64);
     let write_timeout = config.write_timeout;
     // Owned here, not by `serve_reads`, so the writer can cancel in-flight
     // work after a failed write even once `serve_reads` has returned (a
@@ -264,7 +264,13 @@ pub async fn run_connection(
 
     let mut writer_task = tokio::spawn(async move {
         let mut write_half = write_half;
-        while let Some(frame) = rx.recv().await {
+        while let Some(Outgoing { frame, permit }) = rx.recv().await {
+            // The request's in-flight slot is returned here, just before its
+            // terminal frame starts going out, so a client that reads the
+            // terminal and immediately sends its next request always finds the
+            // slot free. Bounded: a permit stays held while its frame waits in
+            // the channel, so a slow reader still caps queued requests.
+            drop(permit);
             match tokio::time::timeout(write_timeout, wire::write_frame(&mut write_half, &frame))
                 .await
             {
@@ -365,9 +371,17 @@ async fn wait_until_continuously_idle(
 /// Capacity of the buffered read half of each accepted connection.
 const READ_BUF_CAPACITY: usize = 8 * 1024;
 
+/// A frame queued for the connection's writer, plus the in-flight permit of
+/// the request it terminates (`None` for everything else). The writer drops
+/// the permit as it dequeues the frame, before writing it.
+struct Outgoing {
+    frame: Frame,
+    permit: Option<OwnedSemaphorePermit>,
+}
+
 async fn serve_reads(
     mut read_half: BufReader<tokio::net::unix::OwnedReadHalf>,
-    tx: mpsc::Sender<Frame>,
+    tx: mpsc::Sender<Outgoing>,
     registry: Arc<ToolRegistry>,
     config: ConnectionConfig,
     cancellations: Cancellations,
@@ -829,7 +843,7 @@ fn spawn_invoke(
     permit: tokio::sync::OwnedSemaphorePermit,
     in_flight: Arc<Mutex<std::collections::HashSet<u64>>>,
     cancellations: Cancellations,
-    tx: mpsc::Sender<Frame>,
+    tx: mpsc::Sender<Outgoing>,
     max_frame_len: u32,
     stream_chunk_bytes: usize,
 ) {
@@ -848,7 +862,7 @@ fn spawn_invoke(
         // in-progress disk-to-wire transfer, which can meaningfully take
         // a while for a large stream.
         tokio::spawn(async move {
-            let _permit = permit;
+            let mut permit = Some(permit);
             let deadline = effective_deadline(invoke.deadline_ms, default_deadline, max_deadline);
             let started = Instant::now();
 
@@ -873,11 +887,20 @@ fn spawn_invoke(
                         cancel_notify,
                         &blocking_slots,
                         max_frame_len,
+                        &mut permit,
                     )
                     .await;
                 }
                 Err((code, message)) => {
-                    let _ = send_error(&tx, correlation_id, code, &message, max_frame_len).await;
+                    let _ = send_error_with(
+                        &tx,
+                        correlation_id,
+                        code,
+                        &message,
+                        max_frame_len,
+                        permit.take(),
+                    )
+                    .await;
                 }
             }
 
@@ -894,7 +917,8 @@ fn spawn_invoke(
     }
 
     tokio::spawn(async move {
-        let _permit = permit; // held for this task's whole lifetime
+        // Held until the terminal frame is queued; the writer releases it.
+        let mut permit = Some(permit);
         let deadline = effective_deadline(invoke.deadline_ms, default_deadline, max_deadline);
 
         let response = run_invoke(
@@ -918,15 +942,17 @@ fn spawn_invoke(
 
         match response {
             Ok(value) if wants_stream => {
-                send_streamed_result(&tx, correlation_id, value, stream_chunk_bytes).await;
+                send_streamed_result(&tx, correlation_id, value, stream_chunk_bytes, &mut permit)
+                    .await;
             }
             Ok(value) => {
-                if send(
+                if send_with(
                     &tx,
                     MessageType::Result,
                     correlation_id,
                     &InvokeResult { value },
                     max_frame_len,
+                    permit.take(),
                 )
                 .await
                 .is_err()
@@ -935,9 +961,16 @@ fn spawn_invoke(
                 }
             }
             Err((code, message)) => {
-                if send_error(&tx, correlation_id, code, &message, max_frame_len)
-                    .await
-                    .is_err()
+                if send_error_with(
+                    &tx,
+                    correlation_id,
+                    code,
+                    &message,
+                    max_frame_len,
+                    permit.take(),
+                )
+                .await
+                .is_err()
                 {
                     tracing::debug!(correlation_id, "response could not be delivered: the connection's outgoing channel is closed or the response failed to encode");
                 }
@@ -1020,7 +1053,7 @@ async fn run_invoke_streaming(
 /// rather than each getting a fresh one.
 #[allow(clippy::too_many_arguments)]
 async fn send_raw_streamed_result(
-    tx: &mpsc::Sender<Frame>,
+    tx: &mpsc::Sender<Outgoing>,
     correlation_id: u64,
     opened: crate::tools::StreamingToolOpen,
     chunk_bytes: usize,
@@ -1029,16 +1062,18 @@ async fn send_raw_streamed_result(
     cancel_notify: Arc<Notify>,
     blocking_slots: &Arc<Semaphore>,
     max_frame_len: u32,
+    permit: &mut Option<OwnedSemaphorePermit>,
 ) {
     // Clients enforce `total_bytes` exactly, so a stream whose size is
     // unknown cannot be sent: refuse it before STREAM_START goes out.
     let Some(total_bytes) = opened.reader.total_bytes_hint() else {
-        let _ = send_error(
+        let _ = send_error_with(
             tx,
             correlation_id,
             ErrorCode::InternalError,
             "streaming tool did not report a size",
             max_frame_len,
+            permit.take(),
         )
         .await;
         return;
@@ -1073,12 +1108,13 @@ async fn send_raw_streamed_result(
     loop {
         let remaining = deadline.saturating_sub(started.elapsed());
         if remaining.is_zero() {
-            let _ = send_error(
+            let _ = send_error_with(
                 tx,
                 correlation_id,
                 ErrorCode::DeadlineExceeded,
                 "the tool did not complete within the configured deadline",
                 max_frame_len,
+                permit.take(),
             )
             .await;
             return;
@@ -1089,12 +1125,13 @@ async fn send_raw_streamed_result(
         // STREAM_START has already gone out, so it can only be reported as
         // an ERROR, not retracted.
         let Ok(blocking_permit) = Arc::clone(blocking_slots).try_acquire_owned() else {
-            let _ = send_error(
+            let _ = send_error_with(
                 tx,
                 correlation_id,
                 ErrorCode::ResourceExhausted,
                 blocking_slots_exhausted_message(),
                 max_frame_len,
+                permit.take(),
             )
             .await;
             return;
@@ -1109,36 +1146,36 @@ async fn send_raw_streamed_result(
             result = read_task => match result {
                 Ok(pair) => pair,
                 Err(join_err) => {
-                    let _ = send_error(
+                    let _ = send_error_with(
                         tx,
                         correlation_id,
                         ErrorCode::InternalError,
                         &format!("the streaming reader task panicked: {join_err}"),
                         max_frame_len,
-                    )
+                     permit.take(),)
                     .await;
                     return;
                 }
             },
             _ = tokio::time::sleep(remaining) => {
-                let _ = send_error(
+                let _ = send_error_with(
                     tx,
                     correlation_id,
                     ErrorCode::DeadlineExceeded,
                     "the tool did not complete within the configured deadline",
                     max_frame_len,
-                )
+                 permit.take(),)
                 .await;
                 return;
             }
             _ = cancel_notify.notified() => {
-                let _ = send_error(
+                let _ = send_error_with(
                     tx,
                     correlation_id,
                     ErrorCode::Cancelled,
                     "the request was cancelled",
                     max_frame_len,
-                )
+                 permit.take(),)
                 .await;
                 return;
             }
@@ -1163,13 +1200,28 @@ async fn send_raw_streamed_result(
             Ok(None) => break, // exhausted
             Err(tool_err) => {
                 let (code, message) = tool_error_to_code(tool_err);
-                let _ = send_error(tx, correlation_id, code, &message, max_frame_len).await;
+                let _ = send_error_with(
+                    tx,
+                    correlation_id,
+                    code,
+                    &message,
+                    max_frame_len,
+                    permit.take(),
+                )
+                .await;
                 return;
             }
         }
     }
 
-    let _ = send_raw(tx, MessageType::StreamEnd, correlation_id, &StreamEnd {}).await;
+    let _ = send_raw_with(
+        tx,
+        MessageType::StreamEnd,
+        correlation_id,
+        &StreamEnd {},
+        permit.take(),
+    )
+    .await;
 }
 
 /// Sends an already-computed, successful result as
@@ -1181,10 +1233,11 @@ async fn send_raw_streamed_result(
 /// buffering the whole result in memory on the server's behalf beyond
 /// what's already needed to have computed `value` in the first place.
 async fn send_streamed_result(
-    tx: &mpsc::Sender<Frame>,
+    tx: &mpsc::Sender<Outgoing>,
     correlation_id: u64,
     value: serde_json::Value,
     chunk_bytes: usize,
+    permit: &mut Option<OwnedSemaphorePermit>,
 ) {
     let encoded = match codec::encode(&value) {
         Ok(bytes) => bytes,
@@ -1231,7 +1284,14 @@ async fn send_streamed_result(
         }
     }
 
-    let _ = send_raw(tx, MessageType::StreamEnd, correlation_id, &StreamEnd {}).await;
+    let _ = send_raw_with(
+        tx,
+        MessageType::StreamEnd,
+        correlation_id,
+        &StreamEnd {},
+        permit.take(),
+    )
+    .await;
 }
 
 /// Reserved margin, in bytes, subtracted from `max_batch_output_bytes`
@@ -1256,12 +1316,13 @@ fn spawn_batch(
     permit: tokio::sync::OwnedSemaphorePermit,
     in_flight: Arc<Mutex<std::collections::HashSet<u64>>>,
     cancellations: Cancellations,
-    tx: mpsc::Sender<Frame>,
+    tx: mpsc::Sender<Outgoing>,
     max_frame_len: u32,
     max_batch_output_bytes: usize,
 ) {
     tokio::spawn(async move {
-        let _permit = permit; // held for the whole batch's lifetime
+        // The whole batch's slot, returned by the writer with its BATCH_RESULT.
+        let mut permit = Some(permit);
 
         // Sequential, in array order, never concurrently with each other
         // — see `Batch`'s doc comment for why. Each call still goes
@@ -1379,12 +1440,13 @@ fn spawn_batch(
             .unwrap_or_else(|p| p.into_inner())
             .remove(&correlation_id);
 
-        if send(
+        if send_with(
             &tx,
             MessageType::BatchResult,
             correlation_id,
             &BatchResult { results },
             max_frame_len,
+            permit.take(),
         )
         .await
         .is_err()
@@ -1502,10 +1564,22 @@ fn tool_error_to_code(err: ToolError) -> (ErrorCode, String) {
 /// oversized one (a short, fixed string that can never itself trigger
 /// the check it's replacing).
 async fn send_raw<T: serde::Serialize>(
-    tx: &mpsc::Sender<Frame>,
+    tx: &mpsc::Sender<Outgoing>,
     msg_type: MessageType,
     correlation_id: u64,
     payload: &T,
+) -> Result<(), ()> {
+    send_raw_with(tx, msg_type, correlation_id, payload, None).await
+}
+
+/// Like [`send_raw`], but the queued frame carries `permit`, the in-flight
+/// slot of the request it terminates. Only terminal frames pass one.
+async fn send_raw_with<T: serde::Serialize>(
+    tx: &mpsc::Sender<Outgoing>,
+    msg_type: MessageType,
+    correlation_id: u64,
+    payload: &T,
+    permit: Option<OwnedSemaphorePermit>,
 ) -> Result<(), ()> {
     let bytes = codec::encode(payload).map_err(|_| ())?;
     let frame = Frame {
@@ -1513,7 +1587,7 @@ async fn send_raw<T: serde::Serialize>(
         correlation_id,
         payload: bytes,
     };
-    tx.send(frame).await.map_err(|_| ())
+    tx.send(Outgoing { frame, permit }).await.map_err(|_| ())
 }
 
 /// Encodes `payload` and enqueues it — unless the resulting frame would
@@ -1524,11 +1598,24 @@ async fn send_raw<T: serde::Serialize>(
 /// `RESULT`/`ERROR` (a tool's own result or error, e.g.
 /// `filesystem.read`'s file contents) all go through it.
 async fn send<T: serde::Serialize>(
-    tx: &mpsc::Sender<Frame>,
+    tx: &mpsc::Sender<Outgoing>,
     msg_type: MessageType,
     correlation_id: u64,
     payload: &T,
     max_frame_len: u32,
+) -> Result<(), ()> {
+    send_with(tx, msg_type, correlation_id, payload, max_frame_len, None).await
+}
+
+/// Like [`send`], with the terminal-frame `permit` described on
+/// [`send_raw_with`]. The `RESULT_TOO_LARGE` substitute carries it too.
+async fn send_with<T: serde::Serialize>(
+    tx: &mpsc::Sender<Outgoing>,
+    msg_type: MessageType,
+    correlation_id: u64,
+    payload: &T,
+    max_frame_len: u32,
+    permit: Option<OwnedSemaphorePermit>,
 ) -> Result<(), ()> {
     let bytes = codec::encode(payload).map_err(|_| ())?;
     if (wire::HEADER_LEN as u64 + bytes.len() as u64) > max_frame_len as u64 {
@@ -1536,18 +1623,18 @@ async fn send<T: serde::Serialize>(
             code: ErrorCode::ResultTooLarge,
             message: "the response exceeded the configured maximum frame size".to_string(),
         };
-        return send_raw(tx, MessageType::Error, correlation_id, &substitute).await;
+        return send_raw_with(tx, MessageType::Error, correlation_id, &substitute, permit).await;
     }
     let frame = Frame {
         msg_type: msg_type as u8,
         correlation_id,
         payload: bytes,
     };
-    tx.send(frame).await.map_err(|_| ())
+    tx.send(Outgoing { frame, permit }).await.map_err(|_| ())
 }
 
 async fn send_error(
-    tx: &mpsc::Sender<Frame>,
+    tx: &mpsc::Sender<Outgoing>,
     correlation_id: u64,
     code: ErrorCode,
     message: &str,
@@ -1562,6 +1649,29 @@ async fn send_error(
             message: message.to_string(),
         },
         max_frame_len,
+    )
+    .await
+}
+
+/// Terminal ERROR that carries the request's in-flight `permit`.
+async fn send_error_with(
+    tx: &mpsc::Sender<Outgoing>,
+    correlation_id: u64,
+    code: ErrorCode,
+    message: &str,
+    max_frame_len: u32,
+    permit: Option<OwnedSemaphorePermit>,
+) -> Result<(), ()> {
+    send_with(
+        tx,
+        MessageType::Error,
+        correlation_id,
+        &ErrorPayload {
+            code,
+            message: message.to_string(),
+        },
+        max_frame_len,
+        permit,
     )
     .await
 }
@@ -2204,6 +2314,13 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn client_at_the_advertised_limit_is_never_rejected() {
+        // Sanity regression for the in-flight permit, not a reproduction: the
+        // race it guards against (permit released only after the terminal
+        // frame is already on its way) shows up only under load. Before the
+        // permit moved onto the terminal frame, the 4 x 40-repeat concurrency
+        // stress (`ast-bench --only concurrency --concurrency-levels 64
+        // --repeats 40`) refused one request in 320k with RESOURCE_EXHAUSTED
+        // from the in-flight limit, while this sequential loop never did.
         // max_in_flight = 1 is the limit the client is told about; blocking
         // slots are left at their default so only the in-flight permit matters.
         let config = ConnectionConfig {
@@ -2215,6 +2332,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn client_at_the_blocking_limit_is_never_rejected() {
+        // Sanity regression for the blocking-slot permit. The blocking permit
+        // is released inside the blocking closure, before any terminal frame
+        // is queued, so this path has no in-flight race; the load-only race
+        // that does exist is described on the in-flight test above.
         // Isolates the blocking-slot permit: one blocking slot, in-flight
         // limit left at its default.
         let config = ConnectionConfig::default().with_max_blocking_tasks(1);
@@ -2225,6 +2346,11 @@ mod tests {
     async fn slow_reader_cannot_make_the_server_accept_unbounded_requests() {
         // Large results fill the socket buffer as soon as the client stops
         // reading, so the server's writer stalls and the output queue fills.
+        // Bound: a frame keeps its in-flight permit while it waits in the
+        // output channel, so a stalled writer caps accepted requests at about
+        // max_in_flight plus the frames the writer already dequeued. Measured
+        // `accepted` on this test: 16 before the permit moved onto the
+        // terminal frame, 8 after.
         let registry = registry_with(vec![Box::new(BigResultTool {
             result_bytes: 256 * 1024,
         })]);
@@ -2280,6 +2406,7 @@ mod tests {
         .await
         .expect("every request must receive exactly one terminal frame");
         sender.abort();
+        eprintln!("SLOW_READER accepted={accepted} refused={refused}");
 
         assert_eq!(accepted + refused, REQUESTS);
         assert!(refused > 0, "a slow reader must eventually hit the limit");

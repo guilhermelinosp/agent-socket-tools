@@ -706,6 +706,14 @@ Defaults are for `ast-server`. Values marked *fixed* are constants in the code a
 | Client streamed result | client `max_stream_bytes` | 256 MiB | The client rejects the stream. |
 | Registered tools | `--tools` (comma-separated) | `system.info,system.noop,filesystem.read` | Not a limit, but the attack-surface setting. Unknown names fail at startup with exit code 2. Unlisted tools are not registered, so `INVOKE` answers `ToolNotFound`. `filesystem.read` is built only when listed, but `--read-dir` stays required. |
 
+### In-flight slots and flow control
+
+A request occupies one in-flight slot (`--max-in-flight-per-connection`) until the server starts writing its terminal frame: `RESULT`, `ERROR`, `BATCH_RESULT`, or the final `STREAM_END` or `ERROR` of a stream. The connection's writer returns the slot just before it writes that frame. A request refused for exceeding the limit receives an `ERROR` that does not take a slot.
+
+Consequently, a client that never has more than `max-in-flight` requests without a received terminal frame is never refused with `RESOURCE_EXHAUSTED` for the in-flight limit, even when it sends its next request right after reading a response.
+
+The outgoing queue per connection (64 frames) bounds what waits to be written. A queued terminal frame keeps its slot until the writer dequeues it, and a task blocked on a full queue keeps its slot too. A slow reader therefore cannot make the server accept an unbounded number of requests. Intermediate stream frames (`STREAM_START`, `STREAM_CHUNK`) take no slot.
+
 ## Known limitations
 
 - Streaming: the Rust client's `invoke_stream` still preallocates up to the declared `total_bytes` (after checking it against `max_stream_bytes`, default 256 MiB) per in-flight stream; a hostile server can therefore make a client reserve that much per concurrent stream. The incremental `StreamHandle` API does not preallocate, and the Python client's `invoke_stream` does not either.
