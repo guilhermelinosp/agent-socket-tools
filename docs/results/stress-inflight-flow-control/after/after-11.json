@@ -1,0 +1,1996 @@
+{
+  "config": {
+    "batch_group_size": 20,
+    "concurrency_levels": [
+      64
+    ],
+    "cpu_ops": 20000,
+    "debug_build": false,
+    "iterations": 500,
+    "json_out": "/private/tmp/claude-501/-Users-guilhermelino/f84e6164-55df-4b35-9aa2-00ff48d4e49f/scratchpad/after-11.json",
+    "only": [
+      "concurrency"
+    ],
+    "payload_sizes_bytes": {
+      "large": 524288,
+      "medium": 16384,
+      "tiny": 2
+    },
+    "quick": false,
+    "raw": false,
+    "repeats": 40,
+    "request_timeout_s": 10,
+    "scenarios_run": [
+      "concurrency"
+    ],
+    "total_ops": 2000,
+    "warmup": 100
+  },
+  "environment": {
+    "ast_bench_version": "0.1.0",
+    "build_profile": "release",
+    "cpu_model": "Apple M3 Pro",
+    "crate_versions": {
+      "rmcp": "3.6.0",
+      "rmp-serde": "1.3.1",
+      "serde_json": "1.0.154",
+      "tokio": "1.54.1"
+    },
+    "git_rev": "51638cb",
+    "logical_cpus": 11,
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13) (Homebrew)",
+    "uname": "Darwin Guilhermes-MacBook-Pro.local 27.0.0 Darwin Kernel Version 27.0.0: Tue Aug 11 21:06:24 PDT 2026; root:xnu-13432.1.9~1/RELEASE_ARM64_T6030 arm64"
+  },
+  "results": [
+    {
+      "error_samples": [],
+      "params": {
+        "concurrency": 64,
+        "connections": 1,
+        "model": "ast: 1 multiplexed connection",
+        "tool": "system.noop",
+        "total_ops": 2000
+      },
+      "protocol": "ast",
+      "runs": [
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 432.75,
+          "p95_us": 741.5409999999999,
+          "p99_us": 932.2090000000001,
+          "throughput_ops_s": 139372.82229965157
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 447.0,
+          "p95_us": 763.542,
+          "p99_us": 925.5409999999999,
+          "throughput_ops_s": 132683.54662324023
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 447.333,
+          "p95_us": 755.875,
+          "p99_us": 935.542,
+          "throughput_ops_s": 134243.9548269092
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 450.25,
+          "p95_us": 757.0,
+          "p99_us": 967.2090000000001,
+          "throughput_ops_s": 131435.9070543097
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 456.917,
+          "p95_us": 783.4159999999999,
+          "p99_us": 1002.2919999999999,
+          "throughput_ops_s": 132515.42164783855
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 441.875,
+          "p95_us": 743.375,
+          "p99_us": 972.75,
+          "throughput_ops_s": 135088.35622799536
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 431.416,
+          "p95_us": 769.959,
+          "p99_us": 998.583,
+          "throughput_ops_s": 132533.71326331137
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 453.5,
+          "p95_us": 757.083,
+          "p99_us": 920.667,
+          "throughput_ops_s": 131820.6909051962
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 442.542,
+          "p95_us": 772.5,
+          "p99_us": 1009.9169999999999,
+          "throughput_ops_s": 132066.96085462644
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 440.375,
+          "p95_us": 782.5,
+          "p99_us": 1023.5419999999999,
+          "throughput_ops_s": 132830.4284757622
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 453.875,
+          "p95_us": 796.625,
+          "p99_us": 1015.9590000000001,
+          "throughput_ops_s": 130461.01661747199
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 436.708,
+          "p95_us": 790.125,
+          "p99_us": 976.958,
+          "throughput_ops_s": 137097.41600846767
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 448.04200000000003,
+          "p95_us": 833.0,
+          "p99_us": 1013.0829999999999,
+          "throughput_ops_s": 129459.26483319982
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 441.709,
+          "p95_us": 861.75,
+          "p99_us": 1051.625,
+          "throughput_ops_s": 130239.07009303954
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 448.70799999999997,
+          "p95_us": 765.5840000000001,
+          "p99_us": 970.5,
+          "throughput_ops_s": 132033.89970374893
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 435.083,
+          "p95_us": 766.208,
+          "p99_us": 980.0,
+          "throughput_ops_s": 134514.06189825974
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 543.792,
+          "p95_us": 969.917,
+          "p99_us": 1180.959,
+          "throughput_ops_s": 108950.02086665275
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 526.208,
+          "p95_us": 905.834,
+          "p99_us": 1121.2920000000001,
+          "throughput_ops_s": 112103.43829092478
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 538.0,
+          "p95_us": 957.7080000000001,
+          "p99_us": 1180.833,
+          "throughput_ops_s": 109725.82260077632
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 561.042,
+          "p95_us": 943.125,
+          "p99_us": 1155.2920000000001,
+          "throughput_ops_s": 107604.49580191821
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 541.542,
+          "p95_us": 961.458,
+          "p99_us": 1204.083,
+          "throughput_ops_s": 111308.73977858799
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 543.375,
+          "p95_us": 988.167,
+          "p99_us": 1179.0,
+          "throughput_ops_s": 109039.85663003492
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 489.54200000000003,
+          "p95_us": 884.0,
+          "p99_us": 1146.291,
+          "throughput_ops_s": 120741.34704117896
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 456.417,
+          "p95_us": 795.2080000000001,
+          "p99_us": 995.9159999999999,
+          "throughput_ops_s": 130194.21200799444
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 424.20799999999997,
+          "p95_us": 784.958,
+          "p99_us": 1000.5000000000001,
+          "throughput_ops_s": 135918.80808447787
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 430.08299999999997,
+          "p95_us": 784.708,
+          "p99_us": 988.709,
+          "throughput_ops_s": 134929.62273272694
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 433.959,
+          "p95_us": 758.0,
+          "p99_us": 999.334,
+          "throughput_ops_s": 135801.13878760953
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 442.084,
+          "p95_us": 779.958,
+          "p99_us": 972.584,
+          "throughput_ops_s": 134251.46117612201
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 433.541,
+          "p95_us": 783.667,
+          "p99_us": 1026.0829999999999,
+          "throughput_ops_s": 135663.72868773696
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 433.041,
+          "p95_us": 764.7090000000001,
+          "p99_us": 998.1670000000001,
+          "throughput_ops_s": 135025.27200503484
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 420.166,
+          "p95_us": 780.5419999999999,
+          "p99_us": 967.875,
+          "throughput_ops_s": 138641.37552208875
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 408.083,
+          "p95_us": 761.625,
+          "p99_us": 966.5840000000001,
+          "throughput_ops_s": 141247.08748505605
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 423.45799999999997,
+          "p95_us": 803.334,
+          "p99_us": 1035.5410000000002,
+          "throughput_ops_s": 139686.7524576138
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 422.04200000000003,
+          "p95_us": 743.25,
+          "p99_us": 998.3329999999999,
+          "throughput_ops_s": 140141.4812337944
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 405.66700000000003,
+          "p95_us": 763.458,
+          "p99_us": 1018.875,
+          "throughput_ops_s": 142422.66218006797
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 410.958,
+          "p95_us": 723.5,
+          "p99_us": 983.5,
+          "throughput_ops_s": 142638.5187617436
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 434.208,
+          "p95_us": 793.375,
+          "p99_us": 1027.458,
+          "throughput_ops_s": 135394.7179135674
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 422.25,
+          "p95_us": 745.125,
+          "p99_us": 1025.834,
+          "throughput_ops_s": 138758.80251153433
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 420.66700000000003,
+          "p95_us": 782.542,
+          "p99_us": 1032.75,
+          "throughput_ops_s": 136691.77740181464
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 406.167,
+          "p95_us": 746.125,
+          "p99_us": 970.0,
+          "throughput_ops_s": 141695.33222277256
+        }
+      ],
+      "scenario": "concurrency",
+      "summary": {
+        "errors_total": 0,
+        "ops_total": 80000,
+        "p50_us_max": 561.042,
+        "p50_us_median": 441.04200000000003,
+        "p50_us_min": 405.66700000000003,
+        "p95_us_max": 988.167,
+        "p95_us_median": 781.521,
+        "p95_us_min": 723.5,
+        "p99_us_max": 1204.083,
+        "p99_us_median": 999.917,
+        "p99_us_min": 920.667,
+        "throughput_ops_s_max": 142638.5187617436,
+        "throughput_ops_s_median": 134247.7080015156,
+        "throughput_ops_s_min": 107604.49580191821
+      }
+    },
+    {
+      "error_samples": [],
+      "params": {
+        "concurrency": 64,
+        "connections": 64,
+        "model": "ast: C connections (1 in flight each)",
+        "tool": "system.noop",
+        "total_ops": 2000
+      },
+      "protocol": "ast",
+      "runs": [
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 417.083,
+          "p95_us": 775.4580000000001,
+          "p99_us": 1084.375,
+          "throughput_ops_s": 142242.45225987697
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 406.375,
+          "p95_us": 760.5,
+          "p99_us": 955.167,
+          "throughput_ops_s": 141046.21026463795
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 417.709,
+          "p95_us": 757.125,
+          "p99_us": 945.75,
+          "throughput_ops_s": 139757.93087824303
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 415.125,
+          "p95_us": 762.417,
+          "p99_us": 1030.042,
+          "throughput_ops_s": 139093.74306269956
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 427.541,
+          "p95_us": 788.542,
+          "p99_us": 1048.125,
+          "throughput_ops_s": 136038.22674171443
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 432.584,
+          "p95_us": 773.5,
+          "p99_us": 999.5,
+          "throughput_ops_s": 137207.54383540913
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 426.584,
+          "p95_us": 785.0409999999999,
+          "p99_us": 1031.75,
+          "throughput_ops_s": 137713.7791243125
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 408.125,
+          "p95_us": 764.666,
+          "p99_us": 991.8749999999999,
+          "throughput_ops_s": 142179.66690005458
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 417.791,
+          "p95_us": 756.333,
+          "p99_us": 988.7080000000001,
+          "throughput_ops_s": 139503.2554130925
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 409.042,
+          "p95_us": 790.042,
+          "p99_us": 1055.0,
+          "throughput_ops_s": 140178.7278780445
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 433.5,
+          "p95_us": 766.416,
+          "p99_us": 948.625,
+          "throughput_ops_s": 136468.7017561816
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 403.83299999999997,
+          "p95_us": 750.4169999999999,
+          "p99_us": 981.458,
+          "throughput_ops_s": 142733.52542886965
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 408.45799999999997,
+          "p95_us": 730.375,
+          "p99_us": 949.7909999999999,
+          "throughput_ops_s": 141970.66786622416
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 415.458,
+          "p95_us": 762.333,
+          "p99_us": 1006.5,
+          "throughput_ops_s": 138899.74043111005
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 438.459,
+          "p95_us": 735.75,
+          "p99_us": 893.2919999999999,
+          "throughput_ops_s": 139078.83774318718
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 442.875,
+          "p95_us": 782.583,
+          "p99_us": 968.125,
+          "throughput_ops_s": 133891.580890699
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 454.66700000000003,
+          "p95_us": 762.417,
+          "p99_us": 899.333,
+          "throughput_ops_s": 129009.01979462797
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 453.875,
+          "p95_us": 825.0,
+          "p99_us": 1005.958,
+          "throughput_ops_s": 129313.13453551012
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 464.041,
+          "p95_us": 809.375,
+          "p99_us": 1013.5409999999999,
+          "throughput_ops_s": 127903.47278393163
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 452.83299999999997,
+          "p95_us": 803.583,
+          "p99_us": 966.0,
+          "throughput_ops_s": 131672.07070790196
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 453.625,
+          "p95_us": 799.9580000000001,
+          "p99_us": 966.208,
+          "throughput_ops_s": 124702.2111198458
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 451.25,
+          "p95_us": 816.208,
+          "p99_us": 1041.166,
+          "throughput_ops_s": 131618.6321178287
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 437.75,
+          "p95_us": 791.375,
+          "p99_us": 1014.25,
+          "throughput_ops_s": 136604.24922543683
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 427.0,
+          "p95_us": 777.542,
+          "p99_us": 1001.9169999999999,
+          "throughput_ops_s": 135988.50897099194
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 438.541,
+          "p95_us": 789.708,
+          "p99_us": 1058.583,
+          "throughput_ops_s": 134489.946876471
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 438.0,
+          "p95_us": 799.125,
+          "p99_us": 1011.1250000000001,
+          "throughput_ops_s": 134128.41078488994
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 430.5,
+          "p95_us": 773.2909999999999,
+          "p99_us": 994.2499999999999,
+          "throughput_ops_s": 135733.93271628235
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 431.75,
+          "p95_us": 818.791,
+          "p99_us": 1016.7909999999999,
+          "throughput_ops_s": 133628.06338994618
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 500.49999999999994,
+          "p95_us": 884.583,
+          "p99_us": 1149.0,
+          "throughput_ops_s": 117663.49710621337
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 535.4580000000001,
+          "p95_us": 959.3330000000001,
+          "p99_us": 1159.459,
+          "throughput_ops_s": 111005.75431629225
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 539.9590000000001,
+          "p95_us": 1008.209,
+          "p99_us": 1246.292,
+          "throughput_ops_s": 107758.62068965517
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 534.25,
+          "p95_us": 972.541,
+          "p99_us": 1204.917,
+          "throughput_ops_s": 109332.93244591437
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 552.75,
+          "p95_us": 1004.8340000000001,
+          "p99_us": 1241.5,
+          "throughput_ops_s": 106371.90020315969
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 543.333,
+          "p95_us": 975.5,
+          "p99_us": 1270.5,
+          "throughput_ops_s": 108288.10049135725
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 528.7090000000001,
+          "p95_us": 910.292,
+          "p99_us": 1102.5,
+          "throughput_ops_s": 113771.84910143846
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 513.0840000000001,
+          "p95_us": 919.7909999999999,
+          "p99_us": 1111.583,
+          "throughput_ops_s": 115547.10572409963
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 527.875,
+          "p95_us": 949.375,
+          "p99_us": 1202.958,
+          "throughput_ops_s": 111401.47906629741
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 518.708,
+          "p95_us": 910.083,
+          "p99_us": 1149.0,
+          "throughput_ops_s": 114360.5910658533
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 497.5,
+          "p95_us": 924.458,
+          "p99_us": 1173.667,
+          "throughput_ops_s": 115839.34496093927
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 546.375,
+          "p95_us": 976.5830000000001,
+          "p99_us": 1202.541,
+          "throughput_ops_s": 107618.73373107424
+        }
+      ],
+      "scenario": "concurrency",
+      "summary": {
+        "errors_total": 0,
+        "ops_total": 80000,
+        "p50_us_max": 552.75,
+        "p50_us_median": 438.5,
+        "p50_us_min": 403.83299999999997,
+        "p95_us_max": 1008.209,
+        "p95_us_median": 790.7085,
+        "p95_us_min": 730.375,
+        "p99_us_max": 1270.5,
+        "p99_us_median": 1015.5205,
+        "p99_us_min": 893.2919999999999,
+        "throughput_ops_s_max": 142733.52542886965,
+        "throughput_ops_s_median": 134009.99583779447,
+        "throughput_ops_s_min": 106371.90020315969
+      }
+    },
+    {
+      "error_samples": [],
+      "params": {
+        "concurrency": 64,
+        "connections": 64,
+        "model": "legacy: C connections (1 in flight each)",
+        "tool": "system.noop",
+        "total_ops": 2000
+      },
+      "protocol": "legacy",
+      "runs": [
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 528.166,
+          "p95_us": 819.292,
+          "p99_us": 1076.416,
+          "throughput_ops_s": 128658.38509796243
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 511.41700000000003,
+          "p95_us": 823.209,
+          "p99_us": 1016.917,
+          "throughput_ops_s": 131304.67608777716
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 514.667,
+          "p95_us": 851.958,
+          "p99_us": 1047.8329999999999,
+          "throughput_ops_s": 129839.92101058565
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 533.334,
+          "p95_us": 836.9169999999999,
+          "p99_us": 1148.917,
+          "throughput_ops_s": 125900.64600880475
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 497.75000000000006,
+          "p95_us": 835.4159999999999,
+          "p99_us": 1025.4170000000001,
+          "throughput_ops_s": 131167.25477691466
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 465.834,
+          "p95_us": 782.5,
+          "p99_us": 906.542,
+          "throughput_ops_s": 134452.27203163502
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 518.667,
+          "p95_us": 796.0,
+          "p99_us": 1008.667,
+          "throughput_ops_s": 130682.65351127954
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 481.16700000000003,
+          "p95_us": 873.5,
+          "p99_us": 1222.9160000000002,
+          "throughput_ops_s": 130308.72025304391
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 423.45799999999997,
+          "p95_us": 779.2909999999999,
+          "p99_us": 953.083,
+          "throughput_ops_s": 138766.82226821725
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 387.333,
+          "p95_us": 697.125,
+          "p99_us": 907.875,
+          "throughput_ops_s": 150145.92306898267
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 405.95799999999997,
+          "p95_us": 758.792,
+          "p99_us": 984.5419999999999,
+          "throughput_ops_s": 143147.2717024684
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 407.25,
+          "p95_us": 746.583,
+          "p99_us": 889.458,
+          "throughput_ops_s": 143769.4007820768
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 396.333,
+          "p95_us": 743.75,
+          "p99_us": 897.334,
+          "throughput_ops_s": 146050.69784849067
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 412.291,
+          "p95_us": 744.584,
+          "p99_us": 903.125,
+          "throughput_ops_s": 144235.96657966112
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 391.79200000000003,
+          "p95_us": 767.708,
+          "p99_us": 936.541,
+          "throughput_ops_s": 145562.6111370536
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 400.54100000000005,
+          "p95_us": 707.2909999999999,
+          "p99_us": 840.5,
+          "throughput_ops_s": 148598.9864657529
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 458.125,
+          "p95_us": 844.792,
+          "p99_us": 1015.7919999999999,
+          "throughput_ops_s": 126272.92579672534
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 501.20899999999995,
+          "p95_us": 920.5,
+          "p99_us": 1125.458,
+          "throughput_ops_s": 116492.97660931699
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 503.70899999999995,
+          "p95_us": 882.7909999999999,
+          "p99_us": 1104.042,
+          "throughput_ops_s": 117466.25062470022
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 524.292,
+          "p95_us": 932.042,
+          "p99_us": 1116.5420000000001,
+          "throughput_ops_s": 112333.51821558207
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 519.792,
+          "p95_us": 898.25,
+          "p99_us": 1070.875,
+          "throughput_ops_s": 116487.89463623335
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 497.33299999999997,
+          "p95_us": 928.708,
+          "p99_us": 1105.125,
+          "throughput_ops_s": 116925.1628679825
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 513.583,
+          "p95_us": 950.7909999999999,
+          "p99_us": 1153.75,
+          "throughput_ops_s": 113392.8846305073
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 412.5,
+          "p95_us": 759.75,
+          "p99_us": 942.708,
+          "throughput_ops_s": 141027.15435548968
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 401.958,
+          "p95_us": 749.833,
+          "p99_us": 892.5,
+          "throughput_ops_s": 143490.89087539274
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 411.791,
+          "p95_us": 753.792,
+          "p99_us": 910.5,
+          "throughput_ops_s": 144218.6389178468
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 402.709,
+          "p95_us": 747.875,
+          "p99_us": 917.375,
+          "throughput_ops_s": 144892.10066378693
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 409.0,
+          "p95_us": 744.708,
+          "p99_us": 920.8340000000001,
+          "throughput_ops_s": 143291.71592617925
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 419.083,
+          "p95_us": 748.625,
+          "p99_us": 969.2919999999999,
+          "throughput_ops_s": 141822.18532954442
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 420.5,
+          "p95_us": 771.958,
+          "p99_us": 932.3340000000001,
+          "throughput_ops_s": 140261.88717740556
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 402.667,
+          "p95_us": 775.5830000000001,
+          "p99_us": 996.5,
+          "throughput_ops_s": 142956.272821182
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 418.042,
+          "p95_us": 757.875,
+          "p99_us": 898.917,
+          "throughput_ops_s": 139358.66307102735
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 416.0,
+          "p95_us": 743.75,
+          "p99_us": 905.958,
+          "throughput_ops_s": 142292.62734941134
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 401.541,
+          "p95_us": 744.6659999999999,
+          "p99_us": 907.583,
+          "throughput_ops_s": 144240.30434704217
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 411.20799999999997,
+          "p95_us": 736.625,
+          "p99_us": 949.208,
+          "throughput_ops_s": 142543.2117964771
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 410.25,
+          "p95_us": 741.9580000000001,
+          "p99_us": 972.416,
+          "throughput_ops_s": 142867.77630163616
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 415.79200000000003,
+          "p95_us": 734.458,
+          "p99_us": 894.916,
+          "throughput_ops_s": 143428.72682335204
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 401.959,
+          "p95_us": 755.542,
+          "p99_us": 988.875,
+          "throughput_ops_s": 143522.21454777048
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 410.708,
+          "p95_us": 716.167,
+          "p99_us": 889.791,
+          "throughput_ops_s": 145454.54545454544
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 411.04200000000003,
+          "p95_us": 760.375,
+          "p99_us": 946.2090000000001,
+          "throughput_ops_s": 142129.1573133837
+        }
+      ],
+      "scenario": "concurrency",
+      "summary": {
+        "errors_total": 0,
+        "ops_total": 80000,
+        "p50_us_max": 533.334,
+        "p50_us_median": 415.896,
+        "p50_us_min": 387.333,
+        "p95_us_max": 950.7909999999999,
+        "p95_us_median": 760.0625,
+        "p95_us_min": 697.125,
+        "p99_us_max": 1222.9160000000002,
+        "p99_us_median": 951.1455,
+        "p99_us_min": 840.5,
+        "throughput_ops_s_max": 150145.92306898267,
+        "throughput_ops_s_median": 141975.67132146406,
+        "throughput_ops_s_min": 112333.51821558207
+      }
+    },
+    {
+      "error_samples": [],
+      "params": {
+        "concurrency": 64,
+        "connections": 1,
+        "model": "mcp-server (real): 1 process, 1 stdio, pipelined",
+        "tool": "system.noop",
+        "total_ops": 2000
+      },
+      "protocol": "mcp-server",
+      "runs": [
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 1411.708,
+          "p95_us": 1478.1670000000001,
+          "p99_us": 1502.75,
+          "throughput_ops_s": 45493.10292714452
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 1399.875,
+          "p95_us": 1486.166,
+          "p99_us": 1510.417,
+          "throughput_ops_s": 45493.70623007874
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 1413.167,
+          "p95_us": 1465.7920000000001,
+          "p99_us": 1488.375,
+          "throughput_ops_s": 45306.868745570835
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 1410.5,
+          "p95_us": 1497.0,
+          "p99_us": 1521.833,
+          "throughput_ops_s": 45167.41618982673
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 1422.083,
+          "p95_us": 1511.875,
+          "p99_us": 1611.833,
+          "throughput_ops_s": 44783.931525368695
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 1428.625,
+          "p95_us": 1493.834,
+          "p99_us": 1510.583,
+          "throughput_ops_s": 44788.988215188605
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 1409.291,
+          "p95_us": 1479.0,
+          "p99_us": 1514.25,
+          "throughput_ops_s": 45202.55048158684
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 1692.333,
+          "p95_us": 2386.25,
+          "p99_us": 2485.083,
+          "throughput_ops_s": 36374.96220414084
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 1562.9579999999999,
+          "p95_us": 2097.042,
+          "p99_us": 2211.25,
+          "throughput_ops_s": 38958.793517848935
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 1458.292,
+          "p95_us": 1923.125,
+          "p99_us": 2095.458,
+          "throughput_ops_s": 41836.55533031916
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 1476.0,
+          "p95_us": 1882.833,
+          "p99_us": 2043.0,
+          "throughput_ops_s": 42302.75020754787
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 1463.833,
+          "p95_us": 1852.625,
+          "p99_us": 2025.7919999999997,
+          "throughput_ops_s": 42286.9117060701
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 1426.8329999999999,
+          "p95_us": 1575.459,
+          "p99_us": 1694.625,
+          "throughput_ops_s": 44501.14186592442
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 1409.875,
+          "p95_us": 1478.375,
+          "p99_us": 1509.0,
+          "throughput_ops_s": 45210.93659790053
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 1417.75,
+          "p95_us": 1500.208,
+          "p99_us": 1649.0,
+          "throughput_ops_s": 44929.432709750254
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 1415.375,
+          "p95_us": 1493.958,
+          "p99_us": 1513.5839999999998,
+          "throughput_ops_s": 45218.64594483027
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 1437.666,
+          "p95_us": 1524.959,
+          "p99_us": 1547.083,
+          "throughput_ops_s": 44353.027925775204
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 1405.167,
+          "p95_us": 1496.1670000000001,
+          "p99_us": 1531.125,
+          "throughput_ops_s": 45431.78619474308
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 1438.625,
+          "p95_us": 1979.583,
+          "p99_us": 2120.459,
+          "throughput_ops_s": 41717.61865403318
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 1400.2089999999998,
+          "p95_us": 1481.1670000000001,
+          "p99_us": 1511.584,
+          "throughput_ops_s": 45429.20628225956
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 1394.875,
+          "p95_us": 1511.458,
+          "p99_us": 1580.25,
+          "throughput_ops_s": 45689.569484777225
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 1166.8329999999999,
+          "p95_us": 1629.875,
+          "p99_us": 1679.7920000000001,
+          "throughput_ops_s": 51480.93533549212
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 1411.25,
+          "p95_us": 1494.75,
+          "p99_us": 1572.291,
+          "throughput_ops_s": 45304.81612621306
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 1406.625,
+          "p95_us": 1479.0420000000001,
+          "p99_us": 1497.5839999999998,
+          "throughput_ops_s": 45264.5721029101
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 1422.416,
+          "p95_us": 1496.8329999999999,
+          "p99_us": 1514.25,
+          "throughput_ops_s": 44945.29382435258
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 1411.625,
+          "p95_us": 1545.25,
+          "p99_us": 1630.333,
+          "throughput_ops_s": 44914.802234511415
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 1404.4170000000001,
+          "p95_us": 1485.083,
+          "p99_us": 1516.0,
+          "throughput_ops_s": 45381.27326329158
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 1414.292,
+          "p95_us": 1487.25,
+          "p99_us": 1510.25,
+          "throughput_ops_s": 45063.73736150871
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 1408.7920000000001,
+          "p95_us": 1485.416,
+          "p99_us": 1505.542,
+          "throughput_ops_s": 45236.28858689344
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 1421.084,
+          "p95_us": 1483.666,
+          "p99_us": 1553.0,
+          "throughput_ops_s": 45037.098634443646
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 1419.125,
+          "p95_us": 1504.583,
+          "p99_us": 1534.125,
+          "throughput_ops_s": 44962.00710399712
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 1411.542,
+          "p95_us": 1483.875,
+          "p99_us": 1499.292,
+          "throughput_ops_s": 45270.16419126391
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 1416.791,
+          "p95_us": 1499.0,
+          "p99_us": 1532.2910000000002,
+          "throughput_ops_s": 45046.440064303795
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 1402.2920000000001,
+          "p95_us": 1458.083,
+          "p99_us": 1487.208,
+          "throughput_ops_s": 45578.28843590856
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 1422.625,
+          "p95_us": 1484.1660000000002,
+          "p99_us": 1504.125,
+          "throughput_ops_s": 44926.06786567753
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 1420.375,
+          "p95_us": 1547.584,
+          "p99_us": 1693.3339999999998,
+          "throughput_ops_s": 44668.448773988435
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 1407.291,
+          "p95_us": 1489.041,
+          "p99_us": 1536.375,
+          "throughput_ops_s": 45343.20521414213
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 1427.125,
+          "p95_us": 1482.625,
+          "p99_us": 1518.9170000000001,
+          "throughput_ops_s": 44971.189994126085
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 1415.2920000000001,
+          "p95_us": 1468.5410000000002,
+          "p99_us": 1490.084,
+          "throughput_ops_s": 45204.976995639256
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 1421.834,
+          "p95_us": 1518.7079999999999,
+          "p99_us": 1557.0829999999999,
+          "throughput_ops_s": 44701.145241106016
+        }
+      ],
+      "scenario": "concurrency",
+      "summary": {
+        "errors_total": 0,
+        "ops_total": 80000,
+        "p50_us_max": 1692.333,
+        "p50_us_median": 1415.3335000000002,
+        "p50_us_min": 1166.8329999999999,
+        "p95_us_max": 2386.25,
+        "p95_us_median": 1495.4585000000002,
+        "p95_us_min": 1458.083,
+        "p99_us_max": 2485.083,
+        "p99_us_median": 1531.708,
+        "p99_us_min": 1487.208,
+        "throughput_ops_s_max": 51480.93533549212,
+        "throughput_ops_s_median": 45055.088712906254,
+        "throughput_ops_s_min": 36374.96220414084
+      }
+    },
+    {
+      "error_samples": [],
+      "params": {
+        "concurrency": 64,
+        "connections": 1,
+        "model": "mcp-like-server (synthetic, sequential server): 1 stdio, pipelined",
+        "tool": "system.noop",
+        "total_ops": 2000
+      },
+      "protocol": "mcp-like-server",
+      "runs": [
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 129.375,
+          "p95_us": 141.167,
+          "p99_us": 147.0,
+          "throughput_ops_s": 483417.8025373634
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 128.333,
+          "p95_us": 140.75,
+          "p99_us": 146.25,
+          "throughput_ops_s": 483198.81480994704
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 130.792,
+          "p95_us": 143.792,
+          "p99_us": 149.125,
+          "throughput_ops_s": 479046.7353204511
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 130.167,
+          "p95_us": 140.0,
+          "p99_us": 144.875,
+          "throughput_ops_s": 480538.2027871216
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 132.833,
+          "p95_us": 145.209,
+          "p99_us": 152.625,
+          "throughput_ops_s": 469984.5539576342
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 128.708,
+          "p95_us": 137.958,
+          "p99_us": 145.16600000000003,
+          "throughput_ops_s": 485731.63327261695
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 128.167,
+          "p95_us": 141.25,
+          "p99_us": 165.583,
+          "throughput_ops_s": 483198.69806942786
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 127.875,
+          "p95_us": 140.709,
+          "p99_us": 142.58399999999997,
+          "throughput_ops_s": 485780.83074837213
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 126.54100000000001,
+          "p95_us": 135.416,
+          "p99_us": 140.875,
+          "throughput_ops_s": 494493.5668859416
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 127.083,
+          "p95_us": 138.333,
+          "p99_us": 153.70800000000003,
+          "throughput_ops_s": 489865.8992100913
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 127.875,
+          "p95_us": 143.708,
+          "p99_us": 152.375,
+          "throughput_ops_s": 485064.0296645758
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 127.12499999999999,
+          "p95_us": 140.291,
+          "p99_us": 142.125,
+          "throughput_ops_s": 488003.2930462215
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 127.45899999999999,
+          "p95_us": 145.625,
+          "p99_us": 154.583,
+          "throughput_ops_s": 483792.93662312534
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 125.95799999999998,
+          "p95_us": 132.708,
+          "p99_us": 139.25,
+          "throughput_ops_s": 497424.83164656576
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 126.625,
+          "p95_us": 139.5,
+          "p99_us": 143.708,
+          "throughput_ops_s": 491164.0809742927
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 126.625,
+          "p95_us": 139.125,
+          "p99_us": 143.083,
+          "throughput_ops_s": 488858.0691035101
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 125.66699999999999,
+          "p95_us": 136.792,
+          "p99_us": 148.708,
+          "throughput_ops_s": 495519.7581070749
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 124.833,
+          "p95_us": 137.667,
+          "p99_us": 139.791,
+          "throughput_ops_s": 499916.6389004633
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 125.542,
+          "p95_us": 138.292,
+          "p99_us": 144.333,
+          "throughput_ops_s": 494875.93089255574
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 126.74999999999999,
+          "p95_us": 135.458,
+          "p99_us": 138.625,
+          "throughput_ops_s": 494875.93089255574
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 125.95799999999998,
+          "p95_us": 135.75,
+          "p99_us": 144.04199999999997,
+          "throughput_ops_s": 496452.4747287074
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 126.417,
+          "p95_us": 140.208,
+          "p99_us": 143.875,
+          "throughput_ops_s": 489216.8054778584
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 129.583,
+          "p95_us": 142.834,
+          "p99_us": 148.292,
+          "throughput_ops_s": 480475.74786650756
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 125.91699999999999,
+          "p95_us": 140.333,
+          "p99_us": 145.584,
+          "throughput_ops_s": 490777.5536014975
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 127.167,
+          "p95_us": 135.625,
+          "p99_us": 139.20800000000003,
+          "throughput_ops_s": 490401.3739084892
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 125.33299999999998,
+          "p95_us": 144.04199999999997,
+          "p99_us": 147.792,
+          "throughput_ops_s": 491606.91799087136
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 124.49999999999999,
+          "p95_us": 134.916,
+          "p99_us": 140.708,
+          "throughput_ops_s": 500026.1263651026
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 126.625,
+          "p95_us": 139.458,
+          "p99_us": 148.625,
+          "throughput_ops_s": 490416.4052134207
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 125.666,
+          "p95_us": 142.875,
+          "p99_us": 150.625,
+          "throughput_ops_s": 488196.86440917925
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 125.75,
+          "p95_us": 142.333,
+          "p99_us": 166.0,
+          "throughput_ops_s": 489700.9763413216
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 124.375,
+          "p95_us": 136.75,
+          "p99_us": 139.833,
+          "throughput_ops_s": 501179.77719551825
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 126.833,
+          "p95_us": 139.334,
+          "p99_us": 142.083,
+          "throughput_ops_s": 492272.4304548278
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 124.709,
+          "p95_us": 137.625,
+          "p99_us": 139.292,
+          "throughput_ops_s": 498577.0610677127
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 125.66699999999999,
+          "p95_us": 133.333,
+          "p99_us": 137.958,
+          "throughput_ops_s": 497698.1460744058
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 128.125,
+          "p95_us": 142.125,
+          "p99_us": 148.708,
+          "throughput_ops_s": 484002.74139152723
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 125.16599999999998,
+          "p95_us": 132.375,
+          "p99_us": 136.041,
+          "throughput_ops_s": 499594.0798101543
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 126.04200000000002,
+          "p95_us": 140.958,
+          "p99_us": 146.125,
+          "throughput_ops_s": 489391.46129353996
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 124.49999999999999,
+          "p95_us": 138.292,
+          "p99_us": 147.041,
+          "throughput_ops_s": 496801.83816680126
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 125.833,
+          "p95_us": 138.041,
+          "p99_us": 139.333,
+          "throughput_ops_s": 492211.73373707826
+        },
+        {
+          "error_samples": [],
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 127.37499999999999,
+          "p95_us": 141.5,
+          "p99_us": 147.0,
+          "throughput_ops_s": 485834.87687122345
+        }
+      ],
+      "scenario": "concurrency",
+      "summary": {
+        "errors_total": 0,
+        "ops_total": 80000,
+        "p50_us_max": 132.833,
+        "p50_us_median": 126.625,
+        "p50_us_min": 124.375,
+        "p95_us_max": 145.625,
+        "p95_us_median": 139.47899999999998,
+        "p95_us_min": 132.375,
+        "p99_us_max": 166.0,
+        "p99_us_median": 145.02050000000003,
+        "p99_us_min": 136.041,
+        "throughput_ops_s_max": 501179.77719551825,
+        "throughput_ops_s_median": 490133.63655929023,
+        "throughput_ops_s_min": 469984.5539576342
+      }
+    }
+  ]
+}

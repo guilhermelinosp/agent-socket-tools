@@ -1,0 +1,144 @@
+starting persistent servers
+sequential latency
+[noop_sequential] legacy repeat 1/7
+[noop_sequential] legacy repeat 2/7
+[noop_sequential] legacy repeat 3/7
+[noop_sequential] legacy repeat 4/7
+[noop_sequential] legacy repeat 5/7
+[noop_sequential] legacy repeat 6/7
+[noop_sequential] legacy repeat 7/7
+[noop_sequential] ast repeat 1/7
+[noop_sequential] ast repeat 2/7
+[noop_sequential] ast repeat 3/7
+[noop_sequential] ast repeat 4/7
+[noop_sequential] ast repeat 5/7
+[noop_sequential] ast repeat 6/7
+[noop_sequential] ast repeat 7/7
+[noop_sequential] mcp-server repeat 1/7
+[noop_sequential] mcp-server repeat 2/7
+[noop_sequential] mcp-server repeat 3/7
+[noop_sequential] mcp-server repeat 4/7
+[noop_sequential] mcp-server repeat 5/7
+[noop_sequential] mcp-server repeat 6/7
+[noop_sequential] mcp-server repeat 7/7
+[noop_sequential] mcp-like-server repeat 1/7
+[noop_sequential] mcp-like-server repeat 2/7
+[noop_sequential] mcp-like-server repeat 3/7
+[noop_sequential] mcp-like-server repeat 4/7
+[noop_sequential] mcp-like-server repeat 5/7
+[noop_sequential] mcp-like-server repeat 6/7
+[noop_sequential] mcp-like-server repeat 7/7
+[noop_sequential] ast-ping repeat 1/7
+[noop_sequential] ast-ping repeat 2/7
+[noop_sequential] ast-ping repeat 3/7
+[noop_sequential] ast-ping repeat 4/7
+[noop_sequential] ast-ping repeat 5/7
+[noop_sequential] ast-ping repeat 6/7
+[noop_sequential] ast-ping repeat 7/7
+concurrency
+[concurrency] ast: 1 multiplexed connection repeat 1/7
+[concurrency] ast: 1 multiplexed connection repeat 2/7
+[concurrency] ast: 1 multiplexed connection repeat 3/7
+[concurrency] ast: 1 multiplexed connection repeat 4/7
+[concurrency] ast: 1 multiplexed connection repeat 5/7
+[concurrency] ast: 1 multiplexed connection repeat 6/7
+[concurrency] ast: 1 multiplexed connection repeat 7/7
+[concurrency] ast: C connections (1 in flight each) repeat 1/7
+[concurrency] ast: C connections (1 in flight each) repeat 2/7
+[concurrency] ast: C connections (1 in flight each) repeat 3/7
+[concurrency] ast: C connections (1 in flight each) repeat 4/7
+[concurrency] ast: C connections (1 in flight each) repeat 5/7
+[concurrency] ast: C connections (1 in flight each) repeat 6/7
+[concurrency] ast: C connections (1 in flight each) repeat 7/7
+[concurrency] legacy: C connections (1 in flight each) repeat 1/7
+[concurrency] legacy: C connections (1 in flight each) repeat 2/7
+[concurrency] legacy: C connections (1 in flight each) repeat 3/7
+[concurrency] legacy: C connections (1 in flight each) repeat 4/7
+[concurrency] legacy: C connections (1 in flight each) repeat 5/7
+[concurrency] legacy: C connections (1 in flight each) repeat 6/7
+[concurrency] legacy: C connections (1 in flight each) repeat 7/7
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 1/7
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 2/7
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 3/7
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 4/7
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 5/7
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 6/7
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 7/7
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 1/7
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 2/7
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 3/7
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 4/7
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 5/7
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 6/7
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 7/7
+[concurrency] ast: 1 multiplexed connection repeat 1/7
+[concurrency] ast: 1 multiplexed connection repeat 2/7
+[concurrency] ast: 1 multiplexed connection repeat 3/7
+[concurrency] ast: 1 multiplexed connection repeat 4/7
+[concurrency] ast: 1 multiplexed connection repeat 5/7
+[concurrency] ast: 1 multiplexed connection repeat 6/7
+[concurrency] ast: 1 multiplexed connection repeat 7/7
+[concurrency] ast: C connections (1 in flight each) repeat 1/7
+[concurrency] ast: C connections (1 in flight each) repeat 2/7
+[concurrency] ast: C connections (1 in flight each) repeat 3/7
+[concurrency] ast: C connections (1 in flight each) repeat 4/7
+[concurrency] ast: C connections (1 in flight each) repeat 5/7
+[concurrency] ast: C connections (1 in flight each) repeat 6/7
+[concurrency] ast: C connections (1 in flight each) repeat 7/7
+[concurrency] legacy: C connections (1 in flight each) repeat 1/7
+[concurrency] legacy: C connections (1 in flight each) repeat 2/7
+[concurrency] legacy: C connections (1 in flight each) repeat 3/7
+[concurrency] legacy: C connections (1 in flight each) repeat 4/7
+[concurrency] legacy: C connections (1 in flight each) repeat 5/7
+[concurrency] legacy: C connections (1 in flight each) repeat 6/7
+[concurrency] legacy: C connections (1 in flight each) repeat 7/7
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 1/7
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 2/7
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 3/7
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 4/7
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 5/7
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 6/7
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 7/7
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 1/7
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 2/7
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 3/7
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 4/7
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 5/7
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 6/7
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 7/7
+[concurrency] ast: 1 multiplexed connection repeat 1/7
+[concurrency] ast: 1 multiplexed connection repeat 2/7
+[concurrency] ast: 1 multiplexed connection repeat 3/7
+[concurrency] ast: 1 multiplexed connection repeat 4/7
+[concurrency] ast: 1 multiplexed connection repeat 5/7
+[concurrency] ast: 1 multiplexed connection repeat 6/7
+[concurrency] ast: 1 multiplexed connection repeat 7/7
+[concurrency] ast: C connections (1 in flight each) repeat 1/7
+[concurrency] ast: C connections (1 in flight each) repeat 2/7
+[concurrency] ast: C connections (1 in flight each) repeat 3/7
+[concurrency] ast: C connections (1 in flight each) repeat 4/7
+[concurrency] ast: C connections (1 in flight each) repeat 5/7
+[concurrency] ast: C connections (1 in flight each) repeat 6/7
+[concurrency] ast: C connections (1 in flight each) repeat 7/7
+[concurrency] legacy: C connections (1 in flight each) repeat 1/7
+[concurrency] legacy: C connections (1 in flight each) repeat 2/7
+[concurrency] legacy: C connections (1 in flight each) repeat 3/7
+[concurrency] legacy: C connections (1 in flight each) repeat 4/7
+[concurrency] legacy: C connections (1 in flight each) repeat 5/7
+[concurrency] legacy: C connections (1 in flight each) repeat 6/7
+[concurrency] legacy: C connections (1 in flight each) repeat 7/7
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 1/7
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 2/7
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 3/7
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 4/7
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 5/7
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 6/7
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 7/7
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 1/7
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 2/7
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 3/7
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 4/7
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 5/7
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 6/7
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 7/7
+wrote JSON results to /private/tmp/claude-501/-Users-guilhermelino/f84e6164-55df-4b35-9aa2-00ff48d4e49f/scratchpad/ab/main-2.json

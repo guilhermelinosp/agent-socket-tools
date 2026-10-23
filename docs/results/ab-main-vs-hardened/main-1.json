@@ -1,0 +1,1739 @@
+{
+  "config": {
+    "batch_group_size": 20,
+    "concurrency_levels": [
+      4,
+      16,
+      64
+    ],
+    "cpu_ops": 20000,
+    "debug_build": false,
+    "iterations": 500,
+    "json_out": "/private/tmp/claude-501/-Users-guilhermelino/f84e6164-55df-4b35-9aa2-00ff48d4e49f/scratchpad/ab/main-1.json",
+    "only": [
+      "noop",
+      "concurrency"
+    ],
+    "payload_sizes_bytes": {
+      "large": 524288,
+      "medium": 16384,
+      "tiny": 2
+    },
+    "quick": false,
+    "raw": false,
+    "repeats": 7,
+    "request_timeout_s": 10,
+    "scenarios_run": [
+      "noop",
+      "concurrency"
+    ],
+    "total_ops": 2000,
+    "warmup": 100
+  },
+  "environment": {
+    "ast_bench_version": "0.1.0",
+    "build_profile": "release",
+    "cpu_model": "Apple M3 Pro",
+    "crate_versions": {
+      "rmcp": "3.6.0",
+      "rmp-serde": "1.3.1",
+      "serde_json": "1.0.154",
+      "tokio": "1.54.1"
+    },
+    "git_rev": "13a577d",
+    "logical_cpus": 11,
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13) (Homebrew)",
+    "uname": "Darwin Guilhermes-MacBook-Pro.local 27.0.0 Darwin Kernel Version 27.0.0: Tue Aug 11 21:06:24 PDT 2026; root:xnu-13432.1.9~1/RELEASE_ARM64_T6030 arm64"
+  },
+  "results": [
+    {
+      "params": {
+        "connection": "persistent",
+        "iterations": 500,
+        "tool": "system.noop"
+      },
+      "protocol": "legacy",
+      "runs": [
+        {
+          "errors": 0,
+          "ops": 500,
+          "p50_us": 54.541,
+          "p95_us": 88.959,
+          "p99_us": 101.25,
+          "throughput_ops_s": 17665.425670513312
+        },
+        {
+          "errors": 0,
+          "ops": 500,
+          "p50_us": 37.0,
+          "p95_us": 47.166000000000004,
+          "p99_us": 53.792,
+          "throughput_ops_s": 26651.208965466696
+        },
+        {
+          "errors": 0,
+          "ops": 500,
+          "p50_us": 26.291,
+          "p95_us": 32.459,
+          "p99_us": 40.458,
+          "throughput_ops_s": 37802.655621436345
+        },
+        {
+          "errors": 0,
+          "ops": 500,
+          "p50_us": 20.75,
+          "p95_us": 27.084,
+          "p99_us": 35.416000000000004,
+          "throughput_ops_s": 47582.41822033572
+        },
+        {
+          "errors": 0,
+          "ops": 500,
+          "p50_us": 21.916,
+          "p95_us": 27.166,
+          "p99_us": 36.625,
+          "throughput_ops_s": 44715.88776956079
+        },
+        {
+          "errors": 0,
+          "ops": 500,
+          "p50_us": 22.125,
+          "p95_us": 27.166999999999998,
+          "p99_us": 35.25,
+          "throughput_ops_s": 44468.983417693955
+        },
+        {
+          "errors": 0,
+          "ops": 500,
+          "p50_us": 21.625,
+          "p95_us": 27.166999999999998,
+          "p99_us": 36.5,
+          "throughput_ops_s": 44602.70276321773
+        }
+      ],
+      "scenario": "noop_sequential",
+      "summary": {
+        "errors_total": 0,
+        "ops_total": 3500,
+        "p50_us_max": 54.541,
+        "p50_us_median": 22.125,
+        "p50_us_min": 20.75,
+        "p95_us_max": 88.959,
+        "p95_us_median": 27.166999999999998,
+        "p95_us_min": 27.084,
+        "p99_us_max": 101.25,
+        "p99_us_median": 36.625,
+        "p99_us_min": 35.25,
+        "throughput_ops_s_max": 47582.41822033572,
+        "throughput_ops_s_median": 44468.983417693955,
+        "throughput_ops_s_min": 17665.425670513312
+      }
+    },
+    {
+      "params": {
+        "connection": "persistent",
+        "iterations": 500,
+        "tool": "system.noop"
+      },
+      "protocol": "ast",
+      "runs": [
+        {
+          "errors": 0,
+          "ops": 500,
+          "p50_us": 29.416999999999998,
+          "p95_us": 40.833,
+          "p99_us": 46.333,
+          "throughput_ops_s": 33106.55344225389
+        },
+        {
+          "errors": 0,
+          "ops": 500,
+          "p50_us": 30.083,
+          "p95_us": 41.375,
+          "p99_us": 47.583999999999996,
+          "throughput_ops_s": 32595.231695707607
+        },
+        {
+          "errors": 0,
+          "ops": 500,
+          "p50_us": 29.833000000000002,
+          "p95_us": 41.334,
+          "p99_us": 44.625,
+          "throughput_ops_s": 33125.83530934462
+        },
+        {
+          "errors": 0,
+          "ops": 500,
+          "p50_us": 29.875,
+          "p95_us": 40.083000000000006,
+          "p99_us": 46.292,
+          "throughput_ops_s": 32843.328390193456
+        },
+        {
+          "errors": 0,
+          "ops": 500,
+          "p50_us": 29.791,
+          "p95_us": 42.041,
+          "p99_us": 46.417,
+          "throughput_ops_s": 32667.728367838623
+        },
+        {
+          "errors": 0,
+          "ops": 500,
+          "p50_us": 29.583000000000002,
+          "p95_us": 40.25,
+          "p99_us": 45.167,
+          "throughput_ops_s": 33094.31734829267
+        },
+        {
+          "errors": 0,
+          "ops": 500,
+          "p50_us": 29.541,
+          "p95_us": 41.542,
+          "p99_us": 46.041999999999994,
+          "throughput_ops_s": 33001.575099176334
+        }
+      ],
+      "scenario": "noop_sequential",
+      "summary": {
+        "errors_total": 0,
+        "ops_total": 3500,
+        "p50_us_max": 30.083,
+        "p50_us_median": 29.791,
+        "p50_us_min": 29.416999999999998,
+        "p95_us_max": 42.041,
+        "p95_us_median": 41.334,
+        "p95_us_min": 40.083000000000006,
+        "p99_us_max": 47.583999999999996,
+        "p99_us_median": 46.292,
+        "p99_us_min": 44.625,
+        "throughput_ops_s_max": 33125.83530934462,
+        "throughput_ops_s_median": 33001.575099176334,
+        "throughput_ops_s_min": 32595.231695707607
+      }
+    },
+    {
+      "params": {
+        "connection": "persistent",
+        "iterations": 500,
+        "tool": "system.noop"
+      },
+      "protocol": "mcp-server",
+      "runs": [
+        {
+          "errors": 0,
+          "ops": 500,
+          "p50_us": 30.667,
+          "p95_us": 34.875,
+          "p99_us": 36.916,
+          "throughput_ops_s": 32359.755569939105
+        },
+        {
+          "errors": 0,
+          "ops": 500,
+          "p50_us": 30.583000000000002,
+          "p95_us": 34.25,
+          "p99_us": 36.25,
+          "throughput_ops_s": 32624.74135105057
+        },
+        {
+          "errors": 0,
+          "ops": 500,
+          "p50_us": 30.542,
+          "p95_us": 34.791,
+          "p99_us": 38.167,
+          "throughput_ops_s": 32484.05503916375
+        },
+        {
+          "errors": 0,
+          "ops": 500,
+          "p50_us": 30.375,
+          "p95_us": 34.666000000000004,
+          "p99_us": 37.0,
+          "throughput_ops_s": 32771.57393676725
+        },
+        {
+          "errors": 0,
+          "ops": 500,
+          "p50_us": 30.540999999999997,
+          "p95_us": 34.375,
+          "p99_us": 35.958999999999996,
+          "throughput_ops_s": 32815.39698426502
+        },
+        {
+          "errors": 0,
+          "ops": 500,
+          "p50_us": 30.333,
+          "p95_us": 35.083999999999996,
+          "p99_us": 90.333,
+          "throughput_ops_s": 31749.476816246282
+        },
+        {
+          "errors": 0,
+          "ops": 500,
+          "p50_us": 30.458,
+          "p95_us": 34.167,
+          "p99_us": 36.375,
+          "throughput_ops_s": 32836.048885521515
+        }
+      ],
+      "scenario": "noop_sequential",
+      "summary": {
+        "errors_total": 0,
+        "ops_total": 3500,
+        "p50_us_max": 30.667,
+        "p50_us_median": 30.540999999999997,
+        "p50_us_min": 30.333,
+        "p95_us_max": 35.083999999999996,
+        "p95_us_median": 34.666000000000004,
+        "p95_us_min": 34.167,
+        "p99_us_max": 90.333,
+        "p99_us_median": 36.916,
+        "p99_us_min": 35.958999999999996,
+        "throughput_ops_s_max": 32836.048885521515,
+        "throughput_ops_s_median": 32624.74135105057,
+        "throughput_ops_s_min": 31749.476816246282
+      }
+    },
+    {
+      "params": {
+        "connection": "persistent",
+        "iterations": 500,
+        "tool": "system.noop"
+      },
+      "protocol": "mcp-like-server",
+      "runs": [
+        {
+          "errors": 0,
+          "ops": 500,
+          "p50_us": 13.040999999999999,
+          "p95_us": 15.125,
+          "p99_us": 17.166,
+          "throughput_ops_s": 74635.2203604881
+        },
+        {
+          "errors": 0,
+          "ops": 500,
+          "p50_us": 13.083,
+          "p95_us": 15.75,
+          "p99_us": 17.541999999999998,
+          "throughput_ops_s": 74243.18354771052
+        },
+        {
+          "errors": 0,
+          "ops": 500,
+          "p50_us": 13.125,
+          "p95_us": 15.125,
+          "p99_us": 17.334,
+          "throughput_ops_s": 74658.43393184013
+        },
+        {
+          "errors": 0,
+          "ops": 500,
+          "p50_us": 13.166,
+          "p95_us": 15.208,
+          "p99_us": 17.583000000000002,
+          "throughput_ops_s": 73913.46832002225
+        },
+        {
+          "errors": 0,
+          "ops": 500,
+          "p50_us": 13.125,
+          "p95_us": 15.375000000000002,
+          "p99_us": 17.875,
+          "throughput_ops_s": 74324.57542086291
+        },
+        {
+          "errors": 0,
+          "ops": 500,
+          "p50_us": 13.208,
+          "p95_us": 15.208,
+          "p99_us": 16.541999999999998,
+          "throughput_ops_s": 74049.85154485762
+        },
+        {
+          "errors": 0,
+          "ops": 500,
+          "p50_us": 13.125,
+          "p95_us": 14.833,
+          "p99_us": 15.917,
+          "throughput_ops_s": 74770.54788118959
+        }
+      ],
+      "scenario": "noop_sequential",
+      "summary": {
+        "errors_total": 0,
+        "ops_total": 3500,
+        "p50_us_max": 13.208,
+        "p50_us_median": 13.125,
+        "p50_us_min": 13.040999999999999,
+        "p95_us_max": 15.75,
+        "p95_us_median": 15.208,
+        "p95_us_min": 14.833,
+        "p99_us_max": 17.875,
+        "p99_us_median": 17.334,
+        "p99_us_min": 15.917,
+        "throughput_ops_s_max": 74770.54788118959,
+        "throughput_ops_s_median": 74324.57542086291,
+        "throughput_ops_s_min": 73913.46832002225
+      }
+    },
+    {
+      "params": {
+        "note": "protocol floor, not comparable to tool calls",
+        "op": "ping"
+      },
+      "protocol": "ast-ping",
+      "runs": [
+        {
+          "errors": 0,
+          "ops": 500,
+          "p50_us": 19.375,
+          "p95_us": 27.583,
+          "p99_us": 32.708,
+          "throughput_ops_s": 50375.72228710615
+        },
+        {
+          "errors": 0,
+          "ops": 500,
+          "p50_us": 19.084,
+          "p95_us": 25.709,
+          "p99_us": 33.292,
+          "throughput_ops_s": 51319.769997107614
+        },
+        {
+          "errors": 0,
+          "ops": 500,
+          "p50_us": 18.916,
+          "p95_us": 25.916,
+          "p99_us": 31.75,
+          "throughput_ops_s": 52139.90513039982
+        },
+        {
+          "errors": 0,
+          "ops": 500,
+          "p50_us": 19.042,
+          "p95_us": 25.708,
+          "p99_us": 32.709,
+          "throughput_ops_s": 51368.983407818356
+        },
+        {
+          "errors": 0,
+          "ops": 500,
+          "p50_us": 19.333,
+          "p95_us": 26.417,
+          "p99_us": 32.583999999999996,
+          "throughput_ops_s": 50660.060054461595
+        },
+        {
+          "errors": 0,
+          "ops": 500,
+          "p50_us": 18.75,
+          "p95_us": 25.791,
+          "p99_us": 32.666999999999994,
+          "throughput_ops_s": 52065.02922149764
+        },
+        {
+          "errors": 0,
+          "ops": 500,
+          "p50_us": 19.125,
+          "p95_us": 26.208000000000002,
+          "p99_us": 32.417,
+          "throughput_ops_s": 51297.83523135324
+        }
+      ],
+      "scenario": "noop_sequential",
+      "summary": {
+        "errors_total": 0,
+        "ops_total": 3500,
+        "p50_us_max": 19.375,
+        "p50_us_median": 19.084,
+        "p50_us_min": 18.75,
+        "p95_us_max": 27.583,
+        "p95_us_median": 25.916,
+        "p95_us_min": 25.708,
+        "p99_us_max": 33.292,
+        "p99_us_median": 32.666999999999994,
+        "p99_us_min": 31.75,
+        "throughput_ops_s_max": 52139.90513039982,
+        "throughput_ops_s_median": 51319.769997107614,
+        "throughput_ops_s_min": 50375.72228710615
+      }
+    },
+    {
+      "params": {
+        "concurrency": 4,
+        "connections": 1,
+        "model": "ast: 1 multiplexed connection",
+        "tool": "system.noop",
+        "total_ops": 2000
+      },
+      "protocol": "ast",
+      "runs": [
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 30.625,
+          "p95_us": 49.084,
+          "p99_us": 62.875,
+          "throughput_ops_s": 123422.82599023057
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 29.75,
+          "p95_us": 45.167,
+          "p99_us": 54.208,
+          "throughput_ops_s": 128756.403699738
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 29.0,
+          "p95_us": 46.375,
+          "p99_us": 56.625,
+          "throughput_ops_s": 131070.1880857199
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 28.833,
+          "p95_us": 45.541000000000004,
+          "p99_us": 53.583,
+          "throughput_ops_s": 131503.24648639763
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 28.291999999999998,
+          "p95_us": 42.792,
+          "p99_us": 53.291000000000004,
+          "throughput_ops_s": 136111.13474151643
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 28.583000000000002,
+          "p95_us": 44.708,
+          "p99_us": 53.041000000000004,
+          "throughput_ops_s": 132685.74727518208
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 29.833000000000002,
+          "p95_us": 48.375,
+          "p99_us": 56.458,
+          "throughput_ops_s": 126669.8008997736
+        }
+      ],
+      "scenario": "concurrency",
+      "summary": {
+        "errors_total": 0,
+        "ops_total": 14000,
+        "p50_us_max": 30.625,
+        "p50_us_median": 29.0,
+        "p50_us_min": 28.291999999999998,
+        "p95_us_max": 49.084,
+        "p95_us_median": 45.541000000000004,
+        "p95_us_min": 42.792,
+        "p99_us_max": 62.875,
+        "p99_us_median": 54.208,
+        "p99_us_min": 53.041000000000004,
+        "throughput_ops_s_max": 136111.13474151643,
+        "throughput_ops_s_median": 131070.1880857199,
+        "throughput_ops_s_min": 123422.82599023057
+      }
+    },
+    {
+      "params": {
+        "concurrency": 4,
+        "connections": 4,
+        "model": "ast: C connections (1 in flight each)",
+        "tool": "system.noop",
+        "total_ops": 2000
+      },
+      "protocol": "ast",
+      "runs": [
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 30.166,
+          "p95_us": 50.458999999999996,
+          "p99_us": 61.16700000000001,
+          "throughput_ops_s": 126574.94033890186
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 28.875,
+          "p95_us": 48.0,
+          "p99_us": 57.292,
+          "throughput_ops_s": 131278.81980340998
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 29.709,
+          "p95_us": 50.25,
+          "p99_us": 65.167,
+          "throughput_ops_s": 127005.63327136094
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 29.916999999999998,
+          "p95_us": 49.666999999999994,
+          "p99_us": 60.667,
+          "throughput_ops_s": 127944.39229644256
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 29.958,
+          "p95_us": 49.458,
+          "p99_us": 60.667,
+          "throughput_ops_s": 126577.2714686919
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 29.791,
+          "p95_us": 52.667,
+          "p99_us": 63.0,
+          "throughput_ops_s": 125620.90487627064
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 29.040999999999997,
+          "p95_us": 48.5,
+          "p99_us": 60.334,
+          "throughput_ops_s": 131252.620540602
+        }
+      ],
+      "scenario": "concurrency",
+      "summary": {
+        "errors_total": 0,
+        "ops_total": 14000,
+        "p50_us_max": 30.166,
+        "p50_us_median": 29.791,
+        "p50_us_min": 28.875,
+        "p95_us_max": 52.667,
+        "p95_us_median": 49.666999999999994,
+        "p95_us_min": 48.0,
+        "p99_us_max": 65.167,
+        "p99_us_median": 60.667,
+        "p99_us_min": 57.292,
+        "throughput_ops_s_max": 131278.81980340998,
+        "throughput_ops_s_median": 127005.63327136094,
+        "throughput_ops_s_min": 125620.90487627064
+      }
+    },
+    {
+      "params": {
+        "concurrency": 4,
+        "connections": 4,
+        "model": "legacy: C connections (1 in flight each)",
+        "tool": "system.noop",
+        "total_ops": 2000
+      },
+      "protocol": "legacy",
+      "runs": [
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 28.167,
+          "p95_us": 49.084,
+          "p99_us": 59.292,
+          "throughput_ops_s": 132464.9549059489
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 28.625,
+          "p95_us": 49.333,
+          "p99_us": 62.24999999999999,
+          "throughput_ops_s": 132115.30072216867
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 27.667,
+          "p95_us": 45.958000000000006,
+          "p99_us": 56.125,
+          "throughput_ops_s": 136448.14428135936
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 28.708000000000002,
+          "p95_us": 49.25,
+          "p99_us": 59.375,
+          "throughput_ops_s": 130632.14790537556
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 26.5,
+          "p95_us": 46.75,
+          "p99_us": 55.625,
+          "throughput_ops_s": 141791.17704400845
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 33.292,
+          "p95_us": 66.584,
+          "p99_us": 83.75,
+          "throughput_ops_s": 106575.01215621231
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 35.375,
+          "p95_us": 66.083,
+          "p99_us": 84.792,
+          "throughput_ops_s": 105032.82091846265
+        }
+      ],
+      "scenario": "concurrency",
+      "summary": {
+        "errors_total": 0,
+        "ops_total": 14000,
+        "p50_us_max": 35.375,
+        "p50_us_median": 28.625,
+        "p50_us_min": 26.5,
+        "p95_us_max": 66.584,
+        "p95_us_median": 49.25,
+        "p95_us_min": 45.958000000000006,
+        "p99_us_max": 84.792,
+        "p99_us_median": 59.375,
+        "p99_us_min": 55.625,
+        "throughput_ops_s_max": 141791.17704400845,
+        "throughput_ops_s_median": 132115.30072216867,
+        "throughput_ops_s_min": 105032.82091846265
+      }
+    },
+    {
+      "params": {
+        "concurrency": 4,
+        "connections": 1,
+        "model": "mcp-server (real): 1 process, 1 stdio, pipelined",
+        "tool": "system.noop",
+        "total_ops": 2000
+      },
+      "protocol": "mcp-server",
+      "runs": [
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 85.125,
+          "p95_us": 115.792,
+          "p99_us": 150.5,
+          "throughput_ops_s": 43881.421428943635
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 84.917,
+          "p95_us": 110.542,
+          "p99_us": 143.625,
+          "throughput_ops_s": 44255.98769683542
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 85.459,
+          "p95_us": 112.958,
+          "p99_us": 131.833,
+          "throughput_ops_s": 43949.081648779684
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 88.667,
+          "p95_us": 119.25,
+          "p99_us": 148.583,
+          "throughput_ops_s": 42286.6506329783
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 84.375,
+          "p95_us": 104.375,
+          "p99_us": 115.375,
+          "throughput_ops_s": 45117.78527981272
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 83.833,
+          "p95_us": 104.834,
+          "p99_us": 119.833,
+          "throughput_ops_s": 45415.53866768658
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 85.25,
+          "p95_us": 105.29100000000001,
+          "p99_us": 117.042,
+          "throughput_ops_s": 44644.766503853156
+        }
+      ],
+      "scenario": "concurrency",
+      "summary": {
+        "errors_total": 0,
+        "ops_total": 14000,
+        "p50_us_max": 88.667,
+        "p50_us_median": 85.125,
+        "p50_us_min": 83.833,
+        "p95_us_max": 119.25,
+        "p95_us_median": 110.542,
+        "p95_us_min": 104.375,
+        "p99_us_max": 150.5,
+        "p99_us_median": 131.833,
+        "p99_us_min": 115.375,
+        "throughput_ops_s_max": 45415.53866768658,
+        "throughput_ops_s_median": 44255.98769683542,
+        "throughput_ops_s_min": 42286.6506329783
+      }
+    },
+    {
+      "params": {
+        "concurrency": 4,
+        "connections": 1,
+        "model": "mcp-like-server (synthetic, sequential server): 1 stdio, pipelined",
+        "tool": "system.noop",
+        "total_ops": 2000
+      },
+      "protocol": "mcp-like-server",
+      "runs": [
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 8.709000000000001,
+          "p95_us": 16.917,
+          "p99_us": 21.25,
+          "throughput_ops_s": 342600.21227509156
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 8.833,
+          "p95_us": 17.666,
+          "p99_us": 20.583,
+          "throughput_ops_s": 343242.0446791305
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 8.417,
+          "p95_us": 17.333000000000002,
+          "p99_us": 19.417,
+          "throughput_ops_s": 348143.9575264372
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 8.417,
+          "p95_us": 17.25,
+          "p99_us": 20.417,
+          "throughput_ops_s": 347934.5215065286
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 7.832999999999999,
+          "p95_us": 16.166,
+          "p99_us": 19.417,
+          "throughput_ops_s": 366155.1113605848
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 7.958000000000001,
+          "p95_us": 15.957999999999998,
+          "p99_us": 18.292,
+          "throughput_ops_s": 364824.7637212418
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 8.417,
+          "p95_us": 17.875,
+          "p99_us": 20.375,
+          "throughput_ops_s": 343180.73287275044
+        }
+      ],
+      "scenario": "concurrency",
+      "summary": {
+        "errors_total": 0,
+        "ops_total": 14000,
+        "p50_us_max": 8.833,
+        "p50_us_median": 8.417,
+        "p50_us_min": 7.832999999999999,
+        "p95_us_max": 17.875,
+        "p95_us_median": 17.25,
+        "p95_us_min": 15.957999999999998,
+        "p99_us_max": 21.25,
+        "p99_us_median": 20.375,
+        "p99_us_min": 18.292,
+        "throughput_ops_s_max": 366155.1113605848,
+        "throughput_ops_s_median": 347934.5215065286,
+        "throughput_ops_s_min": 342600.21227509156
+      }
+    },
+    {
+      "params": {
+        "concurrency": 16,
+        "connections": 1,
+        "model": "ast: 1 multiplexed connection",
+        "tool": "system.noop",
+        "total_ops": 2000
+      },
+      "protocol": "ast",
+      "runs": [
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 122.08299999999998,
+          "p95_us": 257.25,
+          "p99_us": 361.083,
+          "throughput_ops_s": 115084.45299956693
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 116.25,
+          "p95_us": 248.667,
+          "p99_us": 332.375,
+          "throughput_ops_s": 121442.73729015226
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 115.91600000000001,
+          "p95_us": 261.292,
+          "p99_us": 362.125,
+          "throughput_ops_s": 118628.35959221501
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 114.542,
+          "p95_us": 253.625,
+          "p99_us": 349.75,
+          "throughput_ops_s": 120127.33497507358
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 119.208,
+          "p95_us": 257.33299999999997,
+          "p99_us": 334.959,
+          "throughput_ops_s": 118159.66324495975
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 115.959,
+          "p95_us": 252.91700000000003,
+          "p99_us": 365.375,
+          "throughput_ops_s": 119014.85454153246
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 117.792,
+          "p95_us": 256.875,
+          "p99_us": 351.29200000000003,
+          "throughput_ops_s": 118281.37400138732
+        }
+      ],
+      "scenario": "concurrency",
+      "summary": {
+        "errors_total": 0,
+        "ops_total": 14000,
+        "p50_us_max": 122.08299999999998,
+        "p50_us_median": 116.25,
+        "p50_us_min": 114.542,
+        "p95_us_max": 261.292,
+        "p95_us_median": 256.875,
+        "p95_us_min": 248.667,
+        "p99_us_max": 365.375,
+        "p99_us_median": 351.29200000000003,
+        "p99_us_min": 332.375,
+        "throughput_ops_s_max": 121442.73729015226,
+        "throughput_ops_s_median": 118628.35959221501,
+        "throughput_ops_s_min": 115084.45299956693
+      }
+    },
+    {
+      "params": {
+        "concurrency": 16,
+        "connections": 16,
+        "model": "ast: C connections (1 in flight each)",
+        "tool": "system.noop",
+        "total_ops": 2000
+      },
+      "protocol": "ast",
+      "runs": [
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 116.375,
+          "p95_us": 260.541,
+          "p99_us": 365.208,
+          "throughput_ops_s": 117018.37416660246
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 112.459,
+          "p95_us": 256.208,
+          "p99_us": 333.083,
+          "throughput_ops_s": 123861.37336004445
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 109.25,
+          "p95_us": 248.08399999999997,
+          "p99_us": 362.542,
+          "throughput_ops_s": 126732.00673225765
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 111.792,
+          "p95_us": 242.25,
+          "p99_us": 356.709,
+          "throughput_ops_s": 126840.1734539372
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 107.0,
+          "p95_us": 244.625,
+          "p99_us": 338.5,
+          "throughput_ops_s": 129104.78996845453
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 113.459,
+          "p95_us": 251.666,
+          "p99_us": 338.834,
+          "throughput_ops_s": 123770.67101712326
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 108.333,
+          "p95_us": 237.583,
+          "p99_us": 355.541,
+          "throughput_ops_s": 128724.63939562238
+        }
+      ],
+      "scenario": "concurrency",
+      "summary": {
+        "errors_total": 0,
+        "ops_total": 14000,
+        "p50_us_max": 116.375,
+        "p50_us_median": 111.792,
+        "p50_us_min": 107.0,
+        "p95_us_max": 260.541,
+        "p95_us_median": 248.08399999999997,
+        "p95_us_min": 237.583,
+        "p99_us_max": 365.208,
+        "p99_us_median": 355.541,
+        "p99_us_min": 333.083,
+        "throughput_ops_s_max": 129104.78996845453,
+        "throughput_ops_s_median": 126732.00673225765,
+        "throughput_ops_s_min": 117018.37416660246
+      }
+    },
+    {
+      "params": {
+        "concurrency": 16,
+        "connections": 16,
+        "model": "legacy: C connections (1 in flight each)",
+        "tool": "system.noop",
+        "total_ops": 2000
+      },
+      "protocol": "legacy",
+      "runs": [
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 111.667,
+          "p95_us": 260.792,
+          "p99_us": 349.542,
+          "throughput_ops_s": 122601.29794316093
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 109.125,
+          "p95_us": 248.792,
+          "p99_us": 368.209,
+          "throughput_ops_s": 123850.83455027099
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 110.084,
+          "p95_us": 254.583,
+          "p99_us": 363.042,
+          "throughput_ops_s": 124645.86551533775
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 107.667,
+          "p95_us": 245.125,
+          "p99_us": 349.708,
+          "throughput_ops_s": 125505.2842744891
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 110.708,
+          "p95_us": 264.959,
+          "p99_us": 380.084,
+          "throughput_ops_s": 122633.87142623437
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 113.375,
+          "p95_us": 269.875,
+          "p99_us": 399.792,
+          "throughput_ops_s": 119044.07606916461
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 112.833,
+          "p95_us": 263.41700000000003,
+          "p99_us": 364.375,
+          "throughput_ops_s": 120998.84790946962
+        }
+      ],
+      "scenario": "concurrency",
+      "summary": {
+        "errors_total": 0,
+        "ops_total": 14000,
+        "p50_us_max": 113.375,
+        "p50_us_median": 110.708,
+        "p50_us_min": 107.667,
+        "p95_us_max": 269.875,
+        "p95_us_median": 260.792,
+        "p95_us_min": 245.125,
+        "p99_us_max": 399.792,
+        "p99_us_median": 364.375,
+        "p99_us_min": 349.542,
+        "throughput_ops_s_max": 125505.2842744891,
+        "throughput_ops_s_median": 122633.87142623437,
+        "throughput_ops_s_min": 119044.07606916461
+      }
+    },
+    {
+      "params": {
+        "concurrency": 16,
+        "connections": 1,
+        "model": "mcp-server (real): 1 process, 1 stdio, pipelined",
+        "tool": "system.noop",
+        "total_ops": 2000
+      },
+      "protocol": "mcp-server",
+      "runs": [
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 345.459,
+          "p95_us": 377.167,
+          "p99_us": 392.83299999999997,
+          "throughput_ops_s": 45781.563160198755
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 348.25,
+          "p95_us": 389.25,
+          "p99_us": 416.333,
+          "throughput_ops_s": 45256.719078397604
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 351.042,
+          "p95_us": 383.45799999999997,
+          "p99_us": 404.91700000000003,
+          "throughput_ops_s": 45110.3229335243
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 348.041,
+          "p95_us": 378.792,
+          "p99_us": 395.667,
+          "throughput_ops_s": 45422.285308729595
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 347.666,
+          "p95_us": 380.167,
+          "p99_us": 394.041,
+          "throughput_ops_s": 45425.12236392337
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 346.542,
+          "p95_us": 379.91700000000003,
+          "p99_us": 392.958,
+          "throughput_ops_s": 45659.45054056452
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 349.45799999999997,
+          "p95_us": 381.334,
+          "p99_us": 397.0,
+          "throughput_ops_s": 45331.94315374329
+        }
+      ],
+      "scenario": "concurrency",
+      "summary": {
+        "errors_total": 0,
+        "ops_total": 14000,
+        "p50_us_max": 351.042,
+        "p50_us_median": 348.041,
+        "p50_us_min": 345.459,
+        "p95_us_max": 389.25,
+        "p95_us_median": 380.167,
+        "p95_us_min": 377.167,
+        "p99_us_max": 416.333,
+        "p99_us_median": 395.667,
+        "p99_us_min": 392.83299999999997,
+        "throughput_ops_s_max": 45781.563160198755,
+        "throughput_ops_s_median": 45422.285308729595,
+        "throughput_ops_s_min": 45110.3229335243
+      }
+    },
+    {
+      "params": {
+        "concurrency": 16,
+        "connections": 1,
+        "model": "mcp-like-server (synthetic, sequential server): 1 stdio, pipelined",
+        "tool": "system.noop",
+        "total_ops": 2000
+      },
+      "protocol": "mcp-like-server",
+      "runs": [
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 31.25,
+          "p95_us": 38.958999999999996,
+          "p99_us": 43.667,
+          "throughput_ops_s": 466345.47899043665
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 31.583,
+          "p95_us": 37.958,
+          "p99_us": 41.417,
+          "throughput_ops_s": 467485.34258144005
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 31.583,
+          "p95_us": 38.541000000000004,
+          "p99_us": 41.875,
+          "throughput_ops_s": 464814.5819771399
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 30.875,
+          "p95_us": 37.833,
+          "p99_us": 41.958,
+          "throughput_ops_s": 477483.66110597155
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 31.0,
+          "p95_us": 37.375,
+          "p99_us": 44.25,
+          "throughput_ops_s": 475115.8094785604
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 31.374999999999996,
+          "p95_us": 37.416000000000004,
+          "p99_us": 38.958999999999996,
+          "throughput_ops_s": 474674.23107521306
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 31.167,
+          "p95_us": 38.166,
+          "p99_us": 41.916000000000004,
+          "throughput_ops_s": 470496.01807457505
+        }
+      ],
+      "scenario": "concurrency",
+      "summary": {
+        "errors_total": 0,
+        "ops_total": 14000,
+        "p50_us_max": 31.583,
+        "p50_us_median": 31.25,
+        "p50_us_min": 30.875,
+        "p95_us_max": 38.958999999999996,
+        "p95_us_median": 37.958,
+        "p95_us_min": 37.375,
+        "p99_us_max": 44.25,
+        "p99_us_median": 41.916000000000004,
+        "p99_us_min": 38.958999999999996,
+        "throughput_ops_s_max": 477483.66110597155,
+        "throughput_ops_s_median": 470496.01807457505,
+        "throughput_ops_s_min": 464814.5819771399
+      }
+    },
+    {
+      "params": {
+        "concurrency": 64,
+        "connections": 1,
+        "model": "ast: 1 multiplexed connection",
+        "tool": "system.noop",
+        "total_ops": 2000
+      },
+      "protocol": "ast",
+      "runs": [
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 457.5,
+          "p95_us": 840.875,
+          "p99_us": 1030.25,
+          "throughput_ops_s": 127127.06623593475
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 495.37500000000006,
+          "p95_us": 860.5,
+          "p99_us": 1158.791,
+          "throughput_ops_s": 120998.54045510577
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 472.334,
+          "p95_us": 884.75,
+          "p99_us": 1230.208,
+          "throughput_ops_s": 120550.31459714225
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 480.20799999999997,
+          "p95_us": 895.5,
+          "p99_us": 1273.25,
+          "throughput_ops_s": 119619.90774314616
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 468.959,
+          "p95_us": 849.375,
+          "p99_us": 1186.0,
+          "throughput_ops_s": 126688.85748694408
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 501.99999999999994,
+          "p95_us": 895.4590000000001,
+          "p99_us": 1224.5,
+          "throughput_ops_s": 119086.9035487778
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 474.625,
+          "p95_us": 917.7919999999999,
+          "p99_us": 1221.375,
+          "throughput_ops_s": 123267.19452555598
+        }
+      ],
+      "scenario": "concurrency",
+      "summary": {
+        "errors_total": 0,
+        "ops_total": 14000,
+        "p50_us_max": 501.99999999999994,
+        "p50_us_median": 474.625,
+        "p50_us_min": 457.5,
+        "p95_us_max": 917.7919999999999,
+        "p95_us_median": 884.75,
+        "p95_us_min": 840.875,
+        "p99_us_max": 1273.25,
+        "p99_us_median": 1221.375,
+        "p99_us_min": 1030.25,
+        "throughput_ops_s_max": 127127.06623593475,
+        "throughput_ops_s_median": 120998.54045510577,
+        "throughput_ops_s_min": 119086.9035487778
+      }
+    },
+    {
+      "params": {
+        "concurrency": 64,
+        "connections": 64,
+        "model": "ast: C connections (1 in flight each)",
+        "tool": "system.noop",
+        "total_ops": 2000
+      },
+      "protocol": "ast",
+      "runs": [
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 463.125,
+          "p95_us": 910.875,
+          "p99_us": 1248.7920000000001,
+          "throughput_ops_s": 123236.50107419095
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 463.041,
+          "p95_us": 849.666,
+          "p99_us": 1067.0420000000001,
+          "throughput_ops_s": 127598.1454630342
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 456.5,
+          "p95_us": 798.292,
+          "p99_us": 994.791,
+          "throughput_ops_s": 130091.17505049001
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 428.583,
+          "p95_us": 772.583,
+          "p99_us": 1022.1659999999999,
+          "throughput_ops_s": 136771.61677112713
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 457.83299999999997,
+          "p95_us": 798.583,
+          "p99_us": 1024.75,
+          "throughput_ops_s": 131616.47538186217
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 431.167,
+          "p95_us": 730.042,
+          "p99_us": 896.417,
+          "throughput_ops_s": 139455.01815634608
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 436.5,
+          "p95_us": 759.2919999999999,
+          "p99_us": 944.75,
+          "throughput_ops_s": 135229.17423386587
+        }
+      ],
+      "scenario": "concurrency",
+      "summary": {
+        "errors_total": 0,
+        "ops_total": 14000,
+        "p50_us_max": 463.125,
+        "p50_us_median": 456.5,
+        "p50_us_min": 428.583,
+        "p95_us_max": 910.875,
+        "p95_us_median": 798.292,
+        "p95_us_min": 730.042,
+        "p99_us_max": 1248.7920000000001,
+        "p99_us_median": 1022.1659999999999,
+        "p99_us_min": 896.417,
+        "throughput_ops_s_max": 139455.01815634608,
+        "throughput_ops_s_median": 131616.47538186217,
+        "throughput_ops_s_min": 123236.50107419095
+      }
+    },
+    {
+      "params": {
+        "concurrency": 64,
+        "connections": 64,
+        "model": "legacy: C connections (1 in flight each)",
+        "tool": "system.noop",
+        "total_ops": 2000
+      },
+      "protocol": "legacy",
+      "runs": [
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 462.667,
+          "p95_us": 804.542,
+          "p99_us": 1008.875,
+          "throughput_ops_s": 129587.52808161733
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 449.334,
+          "p95_us": 768.333,
+          "p99_us": 965.8340000000001,
+          "throughput_ops_s": 133863.95219129266
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 451.083,
+          "p95_us": 810.375,
+          "p99_us": 1026.708,
+          "throughput_ops_s": 129711.50280958357
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 369.875,
+          "p95_us": 790.3330000000001,
+          "p99_us": 1035.584,
+          "throughput_ops_s": 136811.37958748222
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 426.125,
+          "p95_us": 792.5,
+          "p99_us": 962.25,
+          "throughput_ops_s": 136080.6473791854
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 425.625,
+          "p95_us": 761.791,
+          "p99_us": 920.5409999999999,
+          "throughput_ops_s": 132955.14684995686
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 365.83299999999997,
+          "p95_us": 768.0,
+          "p99_us": 908.541,
+          "throughput_ops_s": 134917.4895228137
+        }
+      ],
+      "scenario": "concurrency",
+      "summary": {
+        "errors_total": 0,
+        "ops_total": 14000,
+        "p50_us_max": 462.667,
+        "p50_us_median": 426.125,
+        "p50_us_min": 365.83299999999997,
+        "p95_us_max": 810.375,
+        "p95_us_median": 790.3330000000001,
+        "p95_us_min": 761.791,
+        "p99_us_max": 1035.584,
+        "p99_us_median": 965.8340000000001,
+        "p99_us_min": 908.541,
+        "throughput_ops_s_max": 136811.37958748222,
+        "throughput_ops_s_median": 133863.95219129266,
+        "throughput_ops_s_min": 129587.52808161733
+      }
+    },
+    {
+      "params": {
+        "concurrency": 64,
+        "connections": 1,
+        "model": "mcp-server (real): 1 process, 1 stdio, pipelined",
+        "tool": "system.noop",
+        "total_ops": 2000
+      },
+      "protocol": "mcp-server",
+      "runs": [
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 1424.375,
+          "p95_us": 1497.625,
+          "p99_us": 1529.334,
+          "throughput_ops_s": 44972.79179825799
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 1450.0839999999998,
+          "p95_us": 1507.459,
+          "p99_us": 1526.916,
+          "throughput_ops_s": 44250.398579933906
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 1444.4589999999998,
+          "p95_us": 1517.6670000000001,
+          "p99_us": 1544.792,
+          "throughput_ops_s": 44161.1994181762
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 1423.667,
+          "p95_us": 1482.75,
+          "p99_us": 1500.166,
+          "throughput_ops_s": 44908.49893342315
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 1411.667,
+          "p95_us": 1486.834,
+          "p99_us": 1509.583,
+          "throughput_ops_s": 45234.58406505927
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 1409.834,
+          "p95_us": 1478.458,
+          "p99_us": 1521.625,
+          "throughput_ops_s": 45312.13045833605
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 1408.1670000000001,
+          "p95_us": 1685.583,
+          "p99_us": 1748.0,
+          "throughput_ops_s": 44012.348808779374
+        }
+      ],
+      "scenario": "concurrency",
+      "summary": {
+        "errors_total": 0,
+        "ops_total": 14000,
+        "p50_us_max": 1450.0839999999998,
+        "p50_us_median": 1423.667,
+        "p50_us_min": 1408.1670000000001,
+        "p95_us_max": 1685.583,
+        "p95_us_median": 1497.625,
+        "p95_us_min": 1478.458,
+        "p99_us_max": 1748.0,
+        "p99_us_median": 1526.916,
+        "p99_us_min": 1500.166,
+        "throughput_ops_s_max": 45312.13045833605,
+        "throughput_ops_s_median": 44908.49893342315,
+        "throughput_ops_s_min": 44012.348808779374
+      }
+    },
+    {
+      "params": {
+        "concurrency": 64,
+        "connections": 1,
+        "model": "mcp-like-server (synthetic, sequential server): 1 stdio, pipelined",
+        "tool": "system.noop",
+        "total_ops": 2000
+      },
+      "protocol": "mcp-like-server",
+      "runs": [
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 128.167,
+          "p95_us": 141.084,
+          "p99_us": 149.5,
+          "throughput_ops_s": 484417.9693876909
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 133.625,
+          "p95_us": 148.458,
+          "p99_us": 162.583,
+          "throughput_ops_s": 469033.912089912
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 130.208,
+          "p95_us": 138.792,
+          "p99_us": 144.333,
+          "throughput_ops_s": 479736.1834779818
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 131.917,
+          "p95_us": 144.167,
+          "p99_us": 150.583,
+          "throughput_ops_s": 472496.7887936992
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 128.792,
+          "p95_us": 139.958,
+          "p99_us": 141.334,
+          "throughput_ops_s": 483437.31667150505
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 128.583,
+          "p95_us": 140.0,
+          "p99_us": 143.417,
+          "throughput_ops_s": 485039.5610391972
+        },
+        {
+          "errors": 0,
+          "ops": 2000,
+          "p50_us": 132.458,
+          "p95_us": 139.708,
+          "p99_us": 144.292,
+          "throughput_ops_s": 477270.0155112755
+        }
+      ],
+      "scenario": "concurrency",
+      "summary": {
+        "errors_total": 0,
+        "ops_total": 14000,
+        "p50_us_max": 133.625,
+        "p50_us_median": 130.208,
+        "p50_us_min": 128.167,
+        "p95_us_max": 148.458,
+        "p95_us_median": 140.0,
+        "p95_us_min": 138.792,
+        "p99_us_max": 162.583,
+        "p99_us_median": 144.333,
+        "p99_us_min": 141.334,
+        "throughput_ops_s_max": 485039.5610391972,
+        "throughput_ops_s_median": 479736.1834779818,
+        "throughput_ops_s_min": 469033.912089912
+      }
+    }
+  ]
+}

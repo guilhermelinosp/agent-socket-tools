@@ -4,15 +4,15 @@
 
 - Workload: local tool execution over persistent connections.
 - Baseline: real MCP server built on rmcp =3.6.0 over stdio, serving the same tools. Release builds, Apple M3 Pro (macOS arm64), rustc 1.99.1.
-- `ast-bench`: 500 iterations × 5 repeats after 100 warmup calls; medians across repeats. Interleaved A/B runs are used for regression checks.
+- `ast-bench`: 500 iterations × 5 repeats after 100 warmup calls; medians across repeats. Interleaved A/B runs are used for regression checks ([raw results](results/ab-main-vs-hardened/README.md)).
 - The synthetic `mcp-like-server` is never used as a comparison baseline.
-- Single machine, single OS. Linux benchmarks were not run; Linux CI runs tests only.
+- Single machine, single OS. Linux CI runs the tests and a quick smoke run of the benchmark harness; no Linux benchmark numbers are recorded.
 
 ## (b) Headline results
 
 | Metric | AST | Real MCP | Result | Source |
 |---|---|---|---|---|
-| Sequential p50 (`system.noop`) | 30.1 µs | 31.0 µs | Tie (within noise) | 34f06ed bench.json; interleaved A/B: 30 vs 31 µs |
+| Sequential p50 (`system.noop`) | 30.1 µs | 31.0 µs | Tie (within noise) | 34f06ed bench.json; [interleaved A/B](results/ab-main-vs-hardened/README.md): 30 vs 31 µs |
 | Sequential p99 (`system.noop`) | 52.0 µs | 55.0 µs | Tie (single run) | 34f06ed |
 | Throughput, concurrency 4 | 120,861 ops/s | 43,333 ops/s | 2.8× | 34f06ed |
 | Throughput, concurrency 16 | 118,738 ops/s | 43,438 ops/s | 2.7× | 34f06ed |
@@ -36,9 +36,9 @@ Concurrency 1: AST 43,545 vs MCP 32,485 ops/s (1.34×). Differences under ~7% ar
 | ≥2× throughput vs real MCP under concurrency | Achieved for C≥4 (2.7–3.1×; 1.34× at C=1) | 34f06ed bench.json |
 | Lower server CPU per call | Achieved (−45%) | 34f06ed bench.json |
 | Lower memory | Not achieved as a win: tie on peak RSS (9.2 vs 9.4 MiB) | 34f06ed bench.json |
-| No unexplained p99 regressions | Achieved; the earlier suspected C=64 per-connection regression was not reproducible as a code effect (interleaved A/B, main vs hardened servers, same client: −10% to +9% p50 swings with a 17% run-to-run spread in `main` itself; cause is run-to-run variance of that cell, mechanism not profiled) | interleaved A/B |
+| No unexplained p99 regressions | Achieved; the earlier suspected C=64 per-connection regression was not reproducible as a code effect (interleaved A/B, 3 rounds, main vs hardened build: round-mean p50 −6.9% for C=64 per-connection, per-round −18.6% to +11.4%, with a 17% run-to-run spread in `main` itself; cause is run-to-run variance of that cell, mechanism not profiled) | [interleaved A/B](results/ab-main-vs-hardened/README.md) |
 | Sequential latency competitive with real MCP | Achieved as parity (not a win; the 2× target for small sequential calls is unmet: AST `ping`, which does no tool work, costs 19.2 µs) | 34f06ed bench.json |
-| Hardening cost | Not measurable: A/B showed −3%…+3% on every AST cell, MCP control −0.6%…+0.3% | interleaved A/B |
+| Hardening cost | Not separable from noise at 3 rounds: round-mean p50 for AST cells other than C=64 ranged −0.2% to +3.8% (per round −3.8% to +9.6%); real-MCP control −0.9% to +0.2% on concurrency cells | [interleaved A/B](results/ab-main-vs-hardened/README.md) |
 
 ## (d) What was fixed in this iteration
 
@@ -49,7 +49,7 @@ Concurrency 1: AST 43,545 vs MCP 32,485 ops/s (1.34×). Differences under ~7% ar
 | Disconnect semantics | Clean FIN drains; errors cancel; first failed write cancels the rest. |
 | Graceful shutdown | Stop accepting, cancel in-flight work including half-closed connections; `--shutdown-grace-secs`. |
 | BATCH | Holds at most one live blocking execution. |
-| Flow control | The in-flight slot is returned by the writer just before the terminal frame is written, fixing a rare RESOURCE_EXHAUSTED for clients at exactly `max_in_flight`: 1 in 320,000 operations before, 0 in 960,000 after — consistent with the fix, not a proof. |
+| Flow control | The in-flight slot is returned by the writer just before the terminal frame is written, fixing a rare RESOURCE_EXHAUSTED for clients at exactly `max_in_flight`: 1 in 320,000 operations before, 0 in 960,000 after — consistent with the fix, not a proof ([stress runs](results/stress-inflight-flow-control/README.md)). |
 | filesystem.read | Descriptor-relative traversal with O_NOFOLLOW on every component; symlinks, `..` and absolute paths refused; FIFOs refused without blocking; bounded read; real race test. |
 | Least privilege | `--tools` allowlist. |
 | Earlier in the session | Write timeout; stream sequence/total validation in both clients; half-close regression; Python client timeouts and caps. |

@@ -1,0 +1,203 @@
+starting persistent servers
+concurrency
+[concurrency] ast: 1 multiplexed connection repeat 1/40
+[concurrency] ast: 1 multiplexed connection repeat 2/40
+[concurrency] ast: 1 multiplexed connection repeat 3/40
+[concurrency] ast: 1 multiplexed connection repeat 4/40
+[concurrency] ast: 1 multiplexed connection repeat 5/40
+[concurrency] ast: 1 multiplexed connection repeat 6/40
+[concurrency] ast: 1 multiplexed connection repeat 7/40
+[concurrency] ast: 1 multiplexed connection repeat 8/40
+[concurrency] ast: 1 multiplexed connection repeat 9/40
+[concurrency] ast: 1 multiplexed connection repeat 10/40
+[concurrency] ast: 1 multiplexed connection repeat 11/40
+[concurrency] ast: 1 multiplexed connection repeat 12/40
+[concurrency] ast: 1 multiplexed connection repeat 13/40
+[concurrency] ast: 1 multiplexed connection repeat 14/40
+[concurrency] ast: 1 multiplexed connection repeat 15/40
+[concurrency] ast: 1 multiplexed connection repeat 16/40
+[concurrency] ast: 1 multiplexed connection repeat 17/40
+[concurrency] ast: 1 multiplexed connection repeat 18/40
+[concurrency] ast: 1 multiplexed connection repeat 19/40
+[concurrency] ast: 1 multiplexed connection repeat 20/40
+[concurrency] ast: 1 multiplexed connection repeat 21/40
+[concurrency] ast: 1 multiplexed connection repeat 22/40
+[concurrency] ast: 1 multiplexed connection repeat 23/40
+[concurrency] ast: 1 multiplexed connection repeat 24/40
+[concurrency] ast: 1 multiplexed connection repeat 25/40
+[concurrency] ast: 1 multiplexed connection repeat 26/40
+[concurrency] ast: 1 multiplexed connection repeat 27/40
+[concurrency] ast: 1 multiplexed connection repeat 28/40
+[concurrency] ast: 1 multiplexed connection repeat 29/40
+[concurrency] ast: 1 multiplexed connection repeat 30/40
+[concurrency] ast: 1 multiplexed connection repeat 31/40
+[concurrency] ast: 1 multiplexed connection repeat 32/40
+[concurrency] ast: 1 multiplexed connection repeat 33/40
+[concurrency] ast: 1 multiplexed connection repeat 34/40
+[concurrency] ast: 1 multiplexed connection repeat 35/40
+[concurrency] ast: 1 multiplexed connection repeat 36/40
+[concurrency] ast: 1 multiplexed connection repeat 37/40
+[concurrency] ast: 1 multiplexed connection repeat 38/40
+[concurrency] ast: 1 multiplexed connection repeat 39/40
+[concurrency] ast: 1 multiplexed connection repeat 40/40
+[concurrency] ast: C connections (1 in flight each) repeat 1/40
+[concurrency] ast: C connections (1 in flight each) repeat 2/40
+[concurrency] ast: C connections (1 in flight each) repeat 3/40
+[concurrency] ast: C connections (1 in flight each) repeat 4/40
+[concurrency] ast: C connections (1 in flight each) repeat 5/40
+[concurrency] ast: C connections (1 in flight each) repeat 6/40
+[concurrency] ast: C connections (1 in flight each) repeat 7/40
+[concurrency] ast: C connections (1 in flight each) repeat 8/40
+[concurrency] ast: C connections (1 in flight each) repeat 9/40
+[concurrency] ast: C connections (1 in flight each) repeat 10/40
+[concurrency] ast: C connections (1 in flight each) repeat 11/40
+[concurrency] ast: C connections (1 in flight each) repeat 12/40
+[concurrency] ast: C connections (1 in flight each) repeat 13/40
+[concurrency] ast: C connections (1 in flight each) repeat 14/40
+[concurrency] ast: C connections (1 in flight each) repeat 15/40
+[concurrency] ast: C connections (1 in flight each) repeat 16/40
+[concurrency] ast: C connections (1 in flight each) repeat 17/40
+[concurrency] ast: C connections (1 in flight each) repeat 18/40
+[concurrency] ast: C connections (1 in flight each) repeat 19/40
+[concurrency] ast: C connections (1 in flight each) repeat 20/40
+[concurrency] ast: C connections (1 in flight each) repeat 21/40
+[concurrency] ast: C connections (1 in flight each) repeat 22/40
+[concurrency] ast: C connections (1 in flight each) repeat 23/40
+[concurrency] ast: C connections (1 in flight each) repeat 24/40
+[concurrency] ast: C connections (1 in flight each) repeat 25/40
+[concurrency] ast: C connections (1 in flight each) repeat 26/40
+[concurrency] ast: C connections (1 in flight each) repeat 27/40
+[concurrency] ast: C connections (1 in flight each) repeat 28/40
+[concurrency] ast: C connections (1 in flight each) repeat 29/40
+[concurrency] ast: C connections (1 in flight each) repeat 30/40
+[concurrency] ast: C connections (1 in flight each) repeat 31/40
+[concurrency] ast: C connections (1 in flight each) repeat 32/40
+[concurrency] ast: C connections (1 in flight each) repeat 33/40
+[concurrency] ast: C connections (1 in flight each) repeat 34/40
+[concurrency] ast: C connections (1 in flight each) repeat 35/40
+[concurrency] ast: C connections (1 in flight each) repeat 36/40
+[concurrency] ast: C connections (1 in flight each) repeat 37/40
+[concurrency] ast: C connections (1 in flight each) repeat 38/40
+[concurrency] ast: C connections (1 in flight each) repeat 39/40
+[concurrency] ast: C connections (1 in flight each) repeat 40/40
+[concurrency] legacy: C connections (1 in flight each) repeat 1/40
+[concurrency] legacy: C connections (1 in flight each) repeat 2/40
+[concurrency] legacy: C connections (1 in flight each) repeat 3/40
+[concurrency] legacy: C connections (1 in flight each) repeat 4/40
+[concurrency] legacy: C connections (1 in flight each) repeat 5/40
+[concurrency] legacy: C connections (1 in flight each) repeat 6/40
+[concurrency] legacy: C connections (1 in flight each) repeat 7/40
+[concurrency] legacy: C connections (1 in flight each) repeat 8/40
+[concurrency] legacy: C connections (1 in flight each) repeat 9/40
+[concurrency] legacy: C connections (1 in flight each) repeat 10/40
+[concurrency] legacy: C connections (1 in flight each) repeat 11/40
+[concurrency] legacy: C connections (1 in flight each) repeat 12/40
+[concurrency] legacy: C connections (1 in flight each) repeat 13/40
+[concurrency] legacy: C connections (1 in flight each) repeat 14/40
+[concurrency] legacy: C connections (1 in flight each) repeat 15/40
+[concurrency] legacy: C connections (1 in flight each) repeat 16/40
+[concurrency] legacy: C connections (1 in flight each) repeat 17/40
+[concurrency] legacy: C connections (1 in flight each) repeat 18/40
+[concurrency] legacy: C connections (1 in flight each) repeat 19/40
+[concurrency] legacy: C connections (1 in flight each) repeat 20/40
+[concurrency] legacy: C connections (1 in flight each) repeat 21/40
+[concurrency] legacy: C connections (1 in flight each) repeat 22/40
+[concurrency] legacy: C connections (1 in flight each) repeat 23/40
+[concurrency] legacy: C connections (1 in flight each) repeat 24/40
+[concurrency] legacy: C connections (1 in flight each) repeat 25/40
+[concurrency] legacy: C connections (1 in flight each) repeat 26/40
+[concurrency] legacy: C connections (1 in flight each) repeat 27/40
+[concurrency] legacy: C connections (1 in flight each) repeat 28/40
+[concurrency] legacy: C connections (1 in flight each) repeat 29/40
+[concurrency] legacy: C connections (1 in flight each) repeat 30/40
+[concurrency] legacy: C connections (1 in flight each) repeat 31/40
+[concurrency] legacy: C connections (1 in flight each) repeat 32/40
+[concurrency] legacy: C connections (1 in flight each) repeat 33/40
+[concurrency] legacy: C connections (1 in flight each) repeat 34/40
+[concurrency] legacy: C connections (1 in flight each) repeat 35/40
+[concurrency] legacy: C connections (1 in flight each) repeat 36/40
+[concurrency] legacy: C connections (1 in flight each) repeat 37/40
+[concurrency] legacy: C connections (1 in flight each) repeat 38/40
+[concurrency] legacy: C connections (1 in flight each) repeat 39/40
+[concurrency] legacy: C connections (1 in flight each) repeat 40/40
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 1/40
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 2/40
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 3/40
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 4/40
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 5/40
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 6/40
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 7/40
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 8/40
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 9/40
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 10/40
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 11/40
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 12/40
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 13/40
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 14/40
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 15/40
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 16/40
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 17/40
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 18/40
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 19/40
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 20/40
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 21/40
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 22/40
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 23/40
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 24/40
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 25/40
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 26/40
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 27/40
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 28/40
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 29/40
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 30/40
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 31/40
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 32/40
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 33/40
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 34/40
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 35/40
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 36/40
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 37/40
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 38/40
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 39/40
+[concurrency] mcp-server (real): 1 process, 1 stdio, pipelined repeat 40/40
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 1/40
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 2/40
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 3/40
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 4/40
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 5/40
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 6/40
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 7/40
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 8/40
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 9/40
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 10/40
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 11/40
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 12/40
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 13/40
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 14/40
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 15/40
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 16/40
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 17/40
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 18/40
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 19/40
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 20/40
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 21/40
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 22/40
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 23/40
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 24/40
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 25/40
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 26/40
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 27/40
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 28/40
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 29/40
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 30/40
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 31/40
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 32/40
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 33/40
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 34/40
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 35/40
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 36/40
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 37/40
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 38/40
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 39/40
+[concurrency] mcp-like-server (synthetic, sequential server): 1 stdio, pipelined repeat 40/40
+wrote JSON results to /private/tmp/claude-501/-Users-guilhermelino/f84e6164-55df-4b35-9aa2-00ff48d4e49f/scratchpad/after-4.json
